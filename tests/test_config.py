@@ -266,3 +266,8 @@ def test_override_rejects_section_key():
 def test_override_rejects_key_below_leaf():
     with pytest.raises(ConfigError, match=r"unknown key 'ppo\.batch_size\.x'"):
         load_config(EXPANSE, {"ppo.batch_size.x": "1"})
+
+
+@pytest.mark.parametrize("path", [EXPANSE, RUNPOD, SMOKE], ids=lambda p: p.stem)
+def test_profile_pins_hf_revision_to_commit_sha(path: Path):
+    assert load_config(path).data.hf_revision == "44eb79992e8c5ed4784dbe6559f8b097d7d03855"

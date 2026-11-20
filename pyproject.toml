@@ -8,9 +8,12 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "huggingface-hub==0.36.2",
+    "numpy==2.2.6",
     "peft==0.21.2",
     "pyserini==2.0.0",
     "pyyaml==6.0.3",
+    "requests==2.34.2",
     "torch==2.10.0",
     "transformers==4.57.6",
     "wandb==0.31.0",

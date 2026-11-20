@@ -1,0 +1,23 @@
+<|im_start|>system
+You are a helpful assistant. You first thinks about the reasoning process in the mind and then provides the user with the answer.<|im_end|>
+<|im_start|>user
+
+You are a query rewriting expert. Your task is to augment the user query to find relevant literature in a corpus with sparse retrieval.
+
+Show your work in <think> </think> tags. Your final response must be in JSON format within <answer> </answer> tags. For example,
+<think>
+[thinking process]
+</think>
+<answer>
+{
+    "query": "...."
+} 
+</answer>. 
+Note: The query should use Boolean operators (AND, OR) and parentheses for grouping terms appropriately."
+
+Here's the user query:
+how are polymers made<|im_end|>
+<|im_start|>assistant
+
+Let me rewrite the query with reasoning. 
+<think>

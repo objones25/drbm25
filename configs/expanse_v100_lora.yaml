@@ -41,7 +41,7 @@ retrieval:
   search_timeout_s: 10
 data:
   hf_dataset: DeepRetrieval/datasets
-  hf_revision: main
+  hf_revision: 44eb79992e8c5ed4784dbe6559f8b097d7d03855
   data_dir: /expanse/lustre/projects/ACCOUNT/USER/drbm25/data
   val_size: 101
 run:
