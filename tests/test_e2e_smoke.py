@@ -1,32 +1,52 @@
 """End to end on CPU: toy index -> train both reward modes in chunks -> eval five sources -> report."""
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
 
+from drbm25.bm25.searcher import Bm25Searcher
+from drbm25.checkpoint import load_best, read_best_meta
+from drbm25.config import ScoringMode, load_config
 from drbm25.data import DEV_FILE, TRAIN_FILE
 from drbm25.eval import report as report_module
 from drbm25.eval import run_eval as run_eval_module
-from drbm25.eval.records import SOURCE_ORIGINAL, SOURCE_UNTRAINED, read_records
+from drbm25.eval.records import SOURCE_ORIGINAL, SOURCE_UNTRAINED, read_header, read_records
 from drbm25.obs.setup import shutdown
-from drbm25.train import EXIT_OK
+from drbm25.ppo.models import LoraPolicyModels
+from drbm25.train import EXIT_OK, build_base, check_layout
 from drbm25.train import main as train_main
 
 pytestmark = [pytest.mark.java, pytest.mark.slow]
 
 REPO = Path(__file__).resolve().parents[1]
 SMOKE = REPO / "configs" / "smoke_cpu.yaml"
-MODES = ("normal", "count_once")
+MODES: tuple[ScoringMode, ...] = ("normal", "count_once")
+
+
+# (query, relevant doc) over the toy index: varied so that per-query nDCGs differ (some 0, some > 0).
+QUERIES = (
+    ("solar efficiency", "docB"),
+    ("efficiency", "docB"),
+    ("solar", "docA"),
+    ("zzqx", "docB"),  # matches no document: always 0
+    ("solar solar solar efficiency", "docB"),
+    ("efficiency solar", "docA"),
+)
 
 
 def _write_data(data_dir: Path) -> None:
-    for name, n in ((TRAIN_FILE, 20), (DEV_FILE, 6)):
+    for name, n in ((TRAIN_FILE, 20), (DEV_FILE, len(QUERIES))):
         path = data_dir / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        rows = [json.dumps({"question": f"solar efficiency {i}", "docs_id": ["docB"]}) for i in range(n)]
+        rows = [
+            json.dumps({"question": QUERIES[i % len(QUERIES)][0], "docs_id": [QUERIES[i % len(QUERIES)][1]]})
+            for i in range(n)
+        ]
         path.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
@@ -68,16 +88,18 @@ def _evaluate(jobs: dict[str, list[str]], evals: Path, sets: list[str]) -> None:
         assert _in_own_process(run_eval_module.main, argv) == 0
 
 
-def _check_rows(rows: list[list[str]]) -> None:
+def _check_rows(rows: list[list[str]], out: Path) -> None:
     assert [r[0] for r in rows] == [SOURCE_ORIGINAL, SOURCE_UNTRAINED, "trained-normal", "trained-count_once"]
     for row in rows:
         assert 0.0 <= float(row[1]) <= 1.0
         assert 0.0 <= float(row[2]) <= 1.0
     for row in rows[:2]:
         assert row[3:] == ["-", "-"]
-    for row in rows[2:]:
-        assert row[3] in {"2", "4"}
-        assert re.match(r"-?\d+\.\d{4} \(val/ndcg_(normal|count_once)\)$", row[4])
+    for row, mode in zip(rows[2:], MODES, strict=True):
+        meta = read_best_meta(out / mode / "best")
+        assert meta.reward_mode == mode
+        assert row[3] == str(meta.step)
+        assert row[4] == f"{meta.score:.4f} (val/ndcg_{mode})"
 
 
 def _check_records(evals: Path, names: list[str]) -> None:
@@ -94,6 +116,58 @@ def _check_provenance(out: Path) -> None:
         assert manifest["seeds"]["run_seed"] == 1234
         assert manifest["seeds"]["split_seed"] == 1234
         assert (out / mode / "best" / "meta.json").is_file()
+
+
+def _ndcg10(doc_ids: tuple[str, ...], relevant: str) -> float:
+    """nDCG@10 with one relevant document (ideal DCG is 1), written out by hand."""
+    return next((1 / math.log2(rank + 2) for rank, d in enumerate(doc_ids[:10]) if d == relevant), 0.0)
+
+
+def _check_original_matches_direct_search(toy_index: Path, normal: float, count_once: float) -> None:
+    searcher = Bm25Searcher(toy_index, k1=0.9, b=0.4, threads=2, timeout_s=30.0)
+    reported_by_mode: dict[ScoringMode, float] = {"normal": normal, "count_once": count_once}
+    for mode, reported in reported_by_mode.items():
+        scores = [_ndcg10(searcher.search(q, mode=mode, k=10).doc_ids, doc) for q, doc in QUERIES]
+        assert any(x == 0.0 for x in scores)
+        assert any(x > 0.0 for x in scores)
+        assert reported == pytest.approx(sum(scores) / len(scores), abs=5e-5)  # the report prints 4 decimals
+
+
+def _check_trained_from_best(tmp_path: Path, evals: Path, out: Path, sets: list[str]) -> None:
+    """Each trained row is scored from that run's best/ policy, and best/ differs from the untrained policy."""
+    overrides = {kv.partition("=")[0]: kv.partition("=")[2] for kv in sets[1::2]}
+    cfg = load_config(SMOKE, overrides)
+    torch.manual_seed(cfg.run.seed)  # as run_eval does before building the model
+    device = torch.device("cpu")
+    base, _ = build_base(cfg, device)
+    untrained = LoraPolicyModels(base, check_layout(cfg, device), gradient_checkpointing=False).actor_state_dict()
+    for mode in MODES:
+        best = out / mode / "best"
+        meta, weights = load_best(best)
+        assert weights.keys() == untrained.keys()
+        assert any(not torch.equal(weights[k], untrained[k]) for k in weights)
+        header = read_header(evals / f"{mode}.jsonl")
+        assert header is not None
+        assert header["source"] == f"trained-{mode}"
+        assert header["checkpoint"] == str(best)
+        assert header["best"]["step"] == meta.step
+        assert header["best"]["selection_metric"] == f"val/ndcg_{mode}"
+        assert header["best"]["val_ndcg_normal"] == meta.val_ndcg_normal
+        assert header["best"]["val_ndcg_count_once"] == meta.val_ndcg_count_once
+        assert header["best"]["config_sha256"] == meta.config_sha256
+
+
+def _check_cis(text: str) -> None:
+    rows = [
+        [c.strip() for c in line.strip("|").split("|")]
+        for line in text.splitlines()
+        if re.match(r"\| (trained|untrained)[^|]* - [^|]*\|", line)
+    ]
+    assert len(rows) >= 4
+    triples = [(float(r[3]), float(r[2]), float(r[4])) for r in rows]  # low, mean, high
+    assert all(math.isfinite(x) for t in triples for x in t)
+    assert all(low <= mean <= high for low, mean, high in triples)
+    assert any(low < high for low, _, high in triples)
 
 
 @pytest.fixture
@@ -131,7 +205,11 @@ def test_e2e_tiny_pipeline(tmp_path: Path, toy_index: Path) -> None:
     assert "Bootstrap: 200 resamples, seed 7" in text
     table = [line for line in text.splitlines() if re.match(r"\| (original|untrained|trained-\w+) \|", line)]
     assert len(table) >= 4
-    _check_rows([[c.strip() for c in line.strip("|").split("|")] for line in table[:4]])
+    rows = [[c.strip() for c in line.strip("|").split("|")] for line in table[:4]]
+    _check_rows(rows, out)
+    _check_original_matches_direct_search(toy_index, float(rows[0][1]), float(rows[0][2]))
+    _check_trained_from_best(tmp_path, evals, out, sets)
+    _check_cis(text)
     _check_records(evals, list(jobs))
     _check_provenance(out)
 
