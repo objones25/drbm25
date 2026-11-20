@@ -58,7 +58,14 @@ cmd=$1
 shift
 case $cmd in
   torchrun)
-    if [[ $* == *memory_check.py* ]]; then exit "${STUB_MEM_RC:-0}"; fi
+    if [[ $* == *memory_check.py* ]]; then
+      # The last --set ppo.micro_batch_size wins (as in drbm25's --set parsing); STUB_MEM_RC_<N> per size.
+      micro=''
+      for arg in "$@"; do [[ $arg == ppo.micro_batch_size=* ]] && micro=${arg#ppo.micro_batch_size=}; done
+      echo "memcheck micro=$micro" >>"$STUB_LOG"
+      rc_var=STUB_MEM_RC_$micro
+      exit "${!rc_var:-${STUB_MEM_RC:-0}}"
+    fi
     if [[ -n ${STUB_TRAIN_SLEEP-} ]]; then
       sleep "$STUB_TRAIN_SLEEP" &
       echo $! >"$STUB_DIR/child_pid"
@@ -473,6 +480,59 @@ chunk_env() { printf '%s\n' "DEADLINE_UNIX=2000000000" "RESERVE_S=3600"; }
   grep -q 'torchrun --nproc_per_node 2 scripts/memory_check.py --config configs/runpod_a100_full.yaml' "$STUB_LOG"
 }
 
+memchecks() { grep '^memcheck micro=' "$STUB_LOG" | sed 's/memcheck micro=//' | tr '\n' ' '; }
+
+@test "smoke_stage keeps micro batch 8 when the memory check passes, and persists it" {
+  SNIPPET='runpod_paths; smoke_stage'
+  run -0 in_lib
+  [[ $(memchecks) == '8 ' ]]
+  [[ $(<"$DRBM25_ROOT/micro_batch") == 8 ]]
+}
+
+@test "smoke_stage falls back from micro batch 8 to 4 when 8 fails the memory check" {
+  SNIPPET='runpod_paths; smoke_stage'
+  run -0 in_lib STUB_MEM_RC_8=1
+  [[ $(memchecks) == '8 4 ' ]]
+  [[ $(<"$DRBM25_ROOT/micro_batch") == 4 ]]
+}
+
+@test "smoke_stage falls back to micro batch 2 after an out-of-memory kill at 8 and a failure at 4" {
+  SNIPPET='runpod_paths; smoke_stage'
+  run -0 in_lib STUB_MEM_RC_8=137 STUB_MEM_RC_4=1
+  [[ $(memchecks) == '8 4 2 ' ]]
+  [[ $(<"$DRBM25_ROOT/micro_batch") == 2 ]]
+}
+
+@test "smoke_stage fails with FAILED when micro batch 2 also fails, and persists nothing" {
+  SNIPPET='runpod_paths; smoke_stage'
+  run -1 --separate-stderr in_lib STUB_MEM_RC=1
+  [[ $(memchecks) == '8 4 2 ' ]]
+  [[ ! -e $DRBM25_ROOT/micro_batch ]]
+  grep -q 'micro batch' "$DRBM25_ROOT/FAILED"
+}
+
+@test "every training chunk gets the persisted micro batch size" {
+  echo 4 >"$DRBM25_ROOT/micro_batch"
+  SNIPPET='run_alternating_chunks 50 50'
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600
+  [[ $(grep '^uv ' "$STUB_LOG" | grep -c 'torchrun.*drbm25.train.*--set ppo.micro_batch_size=4') == 2 ]]
+}
+
+@test "a relaunch on a new pod never retries a larger micro batch than the persisted one" {
+  echo 4 >"$DRBM25_ROOT/micro_batch"
+  SNIPPET='runpod_paths; smoke_stage'
+  run -0 in_lib STUB_MEM_RC_4=1
+  [[ $(memchecks) == '4 2 ' ]]
+  [[ $(<"$DRBM25_ROOT/micro_batch") == 2 ]]
+}
+
+@test "a malformed micro_batch file is an error, not silently ignored" {
+  echo 3 >"$DRBM25_ROOT/micro_batch"
+  SNIPPET='runpod_set_args'
+  run -1 --separate-stderr in_lib
+  [[ $stderr == *micro_batch* ]]
+}
+
 @test "smoke_stage fails when the gpu tests fail" {
   SNIPPET='runpod_paths; smoke_stage'
   run -1 --separate-stderr in_lib STUB_PYTEST_RC=1
@@ -617,20 +677,38 @@ on_exit_env() { printf '%s\n' RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key; }
   [[ $(train_calls | tr '\n' ' ') == 'normal@50 count_once@50 ' ]]
 }
 
-@test "the disk preflight needs 1.2x the last checkpoint size once one exists (C2)" {
+@test "the disk preflight needs 1.2x the last checkpoint plus best/ once both exist (C2)" {
+  local mode
+  for mode in normal count_once; do
+    mkdir -p "$DRBM25_ROOT/runs/$mode/step_000050" "$DRBM25_ROOT/runs/$mode/best"
+    head -c 2097152 /dev/zero >"$DRBM25_ROOT/runs/$mode/step_000050/blob"
+    head -c 1048576 /dev/zero >"$DRBM25_ROOT/runs/$mode/best/blob"
+    echo step_000050 >"$DRBM25_ROOT/runs/$mode/latest"
+  done
+  # 1.2 x (2048 KB + 1024 KB) = 3686 KB: a new checkpoint and a new best/ are written beside the old ones.
+  SNIPPET='rc=0; run_alternating_chunks 100 50 || rc=$?; echo "rc=$rc"'
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_DF_KB=3600
+  [[ $output == *rc=1* ]]
+  [[ -z $(train_calls) ]]
+  grep -q 'normal' "$DRBM25_ROOT/FAILED"
+  rm -f "$DRBM25_ROOT/FAILED"
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_DF_KB=3800
+  [[ $(train_calls | head -1) == normal@100 ]]
+}
+
+@test "before a run has a best/, the disk preflight reserves 7 GiB for one beside the checkpoint (C2)" {
   local mode
   for mode in normal count_once; do
     mkdir -p "$DRBM25_ROOT/runs/$mode/step_000050"
     head -c 2097152 /dev/zero >"$DRBM25_ROOT/runs/$mode/step_000050/blob"
     echo step_000050 >"$DRBM25_ROOT/runs/$mode/latest"
   done
+  # 1.2 x (2048 KB + 7340032 KB) = 8810496 KB
   SNIPPET='rc=0; run_alternating_chunks 100 50 || rc=$?; echo "rc=$rc"'
-  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_DF_KB=2400
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_DF_KB=8810000
   [[ $output == *rc=1* ]]
-  [[ -z $(train_calls) ]]
-  grep -q 'normal' "$DRBM25_ROOT/FAILED"
   rm -f "$DRBM25_ROOT/FAILED"
-  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_DF_KB=2500
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_DF_KB=8811000
   [[ $(train_calls | head -1) == normal@100 ]]
 }
 

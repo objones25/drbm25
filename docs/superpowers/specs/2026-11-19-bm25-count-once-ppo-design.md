@@ -76,7 +76,7 @@ Anti-goals (would make the project a failure even if code runs)
 | Reward: bad format −2; good format & nDCG@10=0 → 0; else 0.1 + nDCG@10. Search k=10 in train and eval | `verl/utils/reward_score/msmarco.py:199-262` |
 | Format: response (after the prompt's `<think>`) must contain exactly one each of `<think>`(from prompt),`</think>`,`<answer>`,`</answer>` in order; `<answer>` is JSON with key `query` | `msmarco.py:61-151` |
 | Prompt: hand-written ChatML string, no chat template; ends with `Let me rewrite the query with reasoning. \n<think>\n` | `data_preprocess/msmarco_sub.py:34-60` |
-| MS-S: 22,416 train, 2,305 dev queries; `{"question","docs_id"}` jsonl; val = first 101 dev rows; test = all dev | HF `DeepRetrieval/datasets` `raw_data/msmarco/msmarco_science/`; `msmarco_sub.py:65-91` |
+| MS-S: 22,416 train, 2,305 dev queries; `{"question","docs_id"}` jsonl; upstream val = first 101 dev rows (we validate on 500 held-out train queries instead, §6.2); test = all dev | HF `DeepRetrieval/datasets` `raw_data/msmarco/msmarco_science/`; `msmarco_sub.py:65-91` |
 | Corpus: 800K passages (`collection_800k.tsv`) = all relevant pids of health/science/tech + random fill, seed 42 | HF `raw_data/msmarco/readme.md`, `get_sub_collection.py` |
 | BM25 k1=0.9, b=0.4 (Pyserini default; upstream never calls `set_bm25`) | pyserini 0.22.1 `_searcher.py:345` |
 | Count-once is buildable: analyze with Pyserini's analyzer, dedupe terms, build a Lucene BooleanQuery of SHOULD TermQuery clauses, pass to `LuceneSearcher.search` | pyserini `_searcher.py:104,139-149`, `querybuilder.py:40-53` |
@@ -134,9 +134,11 @@ pyproject.toml, uv.lock, .python-version
 configs/            expanse_v100_lora.yaml, runpod_a100_full.yaml, smoke_cpu.yaml
 src/drbm25/
   config.py         frozen dataclasses; YAML loaded with yaml.safe_load; validated at load
-  data.py           download MS-S + 800K collection from HF; build prompts; typed Example
+  data.py           download MS-S + 800K collection from HF; typed Example; seeded train/val split
   prompt.py         the upstream sparse prompt, verbatim
   reward.py         pure: parse response → ParsedRewrite | FormatError; nDCG@k; reward()
+  checkpoint.py     atomic resume checkpoints (step_*/latest) and the selected policy (best/)
+  manifest.py       run_manifest.json: seeds, resolved config + sha256, versions, hardware
   bm25/
     index.py        build Lucene index for the 800K collection (Pyserini JsonCollection)
     searcher.py     ScoringMode = Literal["normal","count_once"]; Bm25Searcher.search(q, mode, k)
@@ -166,9 +168,16 @@ tests/
 - Prompt: upstream sparse prompt verbatim (including its stray quote), raw ChatML
   string, no chat template, so our untrained baseline matches upstream's input.
   The prompt ends inside `<think>`.
-- Splits: train = 22,416; in-training validation = first 101 dev rows; final
-  evaluation = all 2,305 dev rows. Training data order fixed by seed and identical
-  across the two runs.
+- Splits (changed 2026-11-20, user decision: "val set should be separate from test
+  set. Maybe split train into val + train."): validation = 500 train queries drawn
+  by `numpy.random.default_rng(data.split_seed).permutation` (`data.split_seed` =
+  1234, separate from `run.seed`); training = the other 21,916 train queries; test
+  (final evaluation) = all 2,305 dev rows, untouched, so the Exp 1 baseline stays
+  valid. Validation and test share no query (by qid and by text; the 22,416 train
+  and 2,305 dev query texts are all distinct). Upstream used the first 101 dev rows
+  for validation; we do not, because validation now selects the reported
+  checkpoint and must not see the test set. Training data order fixed by seed and
+  identical across the two runs.
 
 ### 6.3 BM25 scoring (the experimental variable)
 - One Lucene index of the 800K collection, built once with Pyserini
@@ -232,8 +241,8 @@ A100 / full layout (`configs/runpod_a100_full.yaml`):
 - **Equal progress under any interruption.** The two runs advance in alternating
   chunks of `chunk_steps` (default 50): run normal to step 50, checkpoint, run
   count-once to step 50, checkpoint, and so on. If money or time runs out, both runs
-  stop within one chunk of each other, and evaluation uses the last step both runs
-  reached. On Expanse, where two 2-GPU jobs can run side by side, the two runs go as
+  stop within one chunk of each other; evaluation then scores each run's best
+  validated policy so far. On Expanse, where two 2-GPU jobs can run side by side, the two runs go as
   two concurrent jobs instead, and alternation isn't needed.
 - **Budget guard (RunPod).** The launcher takes the dollar budget and the pod's
   hourly price, and turns them into a wall-clock deadline. The trainer stops at the
@@ -248,19 +257,45 @@ A100 / full layout (`configs/runpod_a100_full.yaml`):
   in $100 (unmeasured; to be confirmed by calibration).
 - Seeds: one seed per run (budget), same seed for both runs. Uncertainty comes from
   paired bootstrap over the 2,305 dev queries, not over seeds — stated as a limitation.
-- Validation every 50 steps on the 101-query split, scored with **both** BM25 modes
-  regardless of which one is the reward.
+- Validation every 50 steps and at the final step on the 500-query validation split
+  (§6.2), greedy, scored with **both** BM25 modes regardless of which one is the
+  reward.
+- **Best-checkpoint selection** (user request 2026-11-20: "1 checkpoint per run,
+  keep the best one"). The selection metric is validation nDCG@10 under the run's
+  own reward mode (`val/ndcg_normal` for the normal run, `val/ndcg_count_once` for
+  the count-once run). When it strictly beats the stored best, `best/` in the run
+  directory is replaced atomically (temp dir, move-aside, rename); ties keep the
+  earlier step. `best/` holds the policy only (LoRA: the actor adapter; full FT:
+  the gathered actor in bf16 with HF names, about 6.8 GB at 3B) and `meta.json`
+  (step, both validation scores, selection metric, reward mode, config sha256,
+  seeds). A resume restores the best-so-far score from `best/meta.json` without
+  re-evaluating. Exp 2 reports each run's `best/` policy, so the two runs may be
+  compared at different steps; the report shows each run's best step and its
+  validation score.
 - Checkpoint every 50 steps (LoRA adapters + optimizer + scaler + RNG + data cursor;
-  full-FT sharded state on A100). Resume is bit-for-bit on data order, so a job can
-  span several 48 h Expanse allocations.
+  full-FT sharded state on A100), keeping one resume checkpoint per run
+  (`keep_ckpts: 1`); `best/` is separate and never pruned. Resume is bit-for-bit on
+  data order, so a job can span several 48 h Expanse allocations.
+- **Reproducibility manifest.** Every training invocation writes
+  `run_manifest.json` (rank 0): every seed and its derivation (`run.seed` for model
+  construction, data order and per-rank sampling and vLLM seeds = `run.seed + rank`;
+  `data.split_seed` for the split), the resolved config and its sha256, git sha and
+  dirty flag, dataset / model revisions, index checksum and size, library versions,
+  CUDA, driver, GPUs, world size, host and start time. A resume appends to
+  `resumed_at` and is refused if a config seed changed. The same dict is the W&B
+  `config.meta`.
 - Final evaluation uses greedy decoding (deterministic), max 350 new tokens.
 
 ### 6.7 Evaluation outputs
 - Exp 1: rows = {original query, untrained rewrite}; columns = {normal, count-once} nDCG@10.
-- Exp 2: rows = {trained-normal, trained-count-once}; same columns.
-- Per-query jsonl with query text, rewrite, analyzed terms, both scores.
-- Paired bootstrap 95% CI (10,000 resamples, fixed seed) for each difference
-  the questions ask about.
+- Exp 2: rows = {trained-normal, trained-count-once}, each run's `best/` policy
+  (§6.6); same columns, plus each run's best step and its validation score.
+- Test set = all 2,305 dev queries for every row (never used for selection).
+- Per-query jsonl with query text, rewrite, analyzed terms, both scores; its first
+  line is a header with the source, checkpoint, eval config sha256 and seed, and for
+  `best/` the step, validation scores, training config sha256 and seeds.
+- Paired bootstrap 95% CI (10,000 resamples, seed `--bootstrap-seed`, default 0,
+  recorded in the report) for each difference the questions ask about.
 - Query statistics per model: analyzed length, unique terms, **repeat ratio**
   (1 − unique/total analyzed terms), share of rewrites with any repeat, format-error
   rate, mean `<think>` length.

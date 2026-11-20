@@ -17,7 +17,9 @@
 #   collect_settings           prompts for what is missing, validates, rewrites the .env
 #   step_done MARKER / mark_done MARKER / mark_failed REASON
 #   terminate_pod              DELETE the pod through the RunPod API, 3 attempts
-#   install_java21, install_uv, sync_deps, prepare_data_stage, download_model, smoke_stage
+#   install_java21, install_uv, sync_deps, prepare_data_stage, download_model
+#   smoke_stage                GPU tests, then the memory check at micro batch 8, 4, 2 (first that
+#                              passes is saved to $DRBM25_ROOT/micro_batch and used by every chunk)
 #   compute_deadline_unix START_UNIX BUDGET_USD PRICE_PER_HOUR   print the deadline (unix seconds)
 #   run_alternating_chunks UNTIL CHUNK   status 0 done, 3 budget stop, 1 failure
 #   eval_stage, train_and_report UNTIL CHUNK
@@ -55,7 +57,11 @@ readonly TRAIN_TIMEOUT_MARGIN_S=1800
 readonly TRAIN_TIMEOUT_MIN_S=900
 readonly EVAL_TIMEOUT_S=7200       # per evaluation command and for the report
 readonly SMOKE_TIMEOUT_S=3600      # per smoke command
-readonly DISK_MIN_KB=94371840      # 90 GiB: needed before the first checkpoint of a run exists
+readonly DISK_MIN_KB=94371840      # 90 GiB before a run's first save: one checkpoint (~74 GB) + best/ (~6.8 GB)
+readonly DISK_BEST_KB=7340032      # 7 GiB: room for a run's first best/ (3B actor in bf16, ~6.8 GB)
+# PPO micro batch sizes tried by the smoke stage, largest first. 8 is the A100 80GB ceiling (per-rank
+# mini-batch 16 / 2 GPUs); the memory check falls back to 4, then 2.
+readonly MICRO_BATCH_CANDIDATES=(8 4 2)
 
 _runpod_log() {
   local now
@@ -83,15 +89,38 @@ runpod_paths() {
   DRBM25_ENV_FILE="$DRBM25_ROOT/.env"
   DRBM25_SPEND_FILE="$DRBM25_ROOT/spend.json"
   DRBM25_FAILED_FILE="$DRBM25_ROOT/FAILED"
+  DRBM25_MICRO_BATCH_FILE="$DRBM25_ROOT/micro_batch"
   RUNPOD_CONFIG=${DRBM25_CONFIG:-$RUNPOD_CONFIG_DEFAULT}
 }
 
 # --set overrides: the config holds /workspace/drbm25 paths; these keep tests and DRBM25_ROOT consistent.
+# The micro batch size chosen by the smoke stage (if any) goes to every training chunk, so it is the
+# same across relaunches and lands in run_manifest.json.
 runpod_set_args() {
+  local micro
   drbm25_set_args
   RUNPOD_SET_ARGS=("${DRBM25_SET_ARGS[@]}")
   if [[ -n ${WANDB_PROJECT-} ]]; then RUNPOD_SET_ARGS+=(--set "run.wandb_project=$WANDB_PROJECT"); fi
   if [[ -n ${WANDB_ENTITY-} ]]; then RUNPOD_SET_ARGS+=(--set "run.wandb_entity=$WANDB_ENTITY"); fi
+  if [[ -f $DRBM25_MICRO_BATCH_FILE ]]; then
+    # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+    micro=$(_saved_micro_batch) || return 1
+    RUNPOD_SET_ARGS+=(--set "ppo.micro_batch_size=$micro")
+  fi
+}
+
+# Prints the saved micro batch size; fails on anything but one of MICRO_BATCH_CANDIDATES.
+_saved_micro_batch() {
+  local micro candidate
+  micro=$(<"$DRBM25_MICRO_BATCH_FILE")
+  for candidate in "${MICRO_BATCH_CANDIDATES[@]}"; do
+    if [[ $micro == "$candidate" ]]; then
+      printf '%s\n' "$micro"
+      return 0
+    fi
+  done
+  _common_log "error: $DRBM25_MICRO_BATCH_FILE holds '$micro', expected one of ${MICRO_BATCH_CANDIDATES[*]}; delete it to re-run the memory check from 8"
+  return 1
 }
 
 _uv() {
@@ -388,15 +417,18 @@ _uv_timeout() {
   _with_timeout "$secs" uv run --no-sync "$@"
 }
 
-# Fails (FAILED marker) when the volume cannot hold the next checkpoint: 1.2 x the last one, or 90 GiB
-# before the first. `df -Pk` and `du -sk` are POSIX.
+# Fails (FAILED marker) when the volume cannot hold what the next chunk writes beside what exists: a new
+# checkpoint next to the last one, and a new best/ next to the current one, so 1.2 x (last checkpoint +
+# best/, or DISK_BEST_KB before the first best/); 90 GiB before the first checkpoint. `df -Pk` and
+# `du -sk` are POSIX.
 _check_disk() {
-  local mode=$1 run_dir=$2 have=$3 need_kb=$DISK_MIN_KB free_kb ckpt used_kb
+  local mode=$1 run_dir=$2 have=$3 need_kb=$DISK_MIN_KB free_kb ckpt used_kb best_kb=$DISK_BEST_KB
   if ((have > 0)); then
     ckpt=$run_dir/$(printf 'step_%06d' "$have")
     if [[ -d $ckpt ]]; then
       used_kb=$(du -sk "$ckpt" | awk '{print $1}')
-      need_kb=$((used_kb * 12 / 10))
+      if [[ -d $run_dir/best ]]; then best_kb=$(du -sk "$run_dir/best" | awk '{print $1}'); fi
+      need_kb=$(((used_kb + best_kb) * 12 / 10))
     fi
   fi
   free_kb=$(df -Pk "$DRBM25_ROOT" | awk 'NR == 2 {print $4}')
@@ -574,6 +606,7 @@ PY
 }
 
 smoke_stage() {
+  local micro saved='' rc tried=''
   runpod_set_args
   _runpod_log "GPU smoke: vLLM and full-model tests, then the 2-GPU memory check"
   # --no-cov: the repo's coverage gate would fail a two-file run.
@@ -582,13 +615,36 @@ smoke_stage() {
     _runpod_log "error: GPU pytest failed"
     return 1
   fi
-  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  if ! _uv_timeout "$SMOKE_TIMEOUT_S" torchrun --nproc_per_node 2 scripts/memory_check.py --config "$RUNPOD_CONFIG" \
-    "${RUNPOD_SET_ARGS[@]}" --ckpt-dir "$DRBM25_ROOT/memcheck"; then
-    _runpod_log "error: memory check failed (exit 1 means an error or under 2 GiB headroom per GPU)"
-    return 1
+  # A size saved by an earlier pod caps the search: a run never moves to a larger micro batch.
+  if [[ -f $DRBM25_MICRO_BATCH_FILE ]]; then
+    # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+    saved=$(_saved_micro_batch) || return 1
   fi
-  rm -rf -- "${DRBM25_ROOT:?}/memcheck"
+  for micro in "${MICRO_BATCH_CANDIDATES[@]}"; do
+    if [[ -n $saved ]] && ((micro > saved)); then continue; fi
+    tried+="$micro "
+    rm -rf -- "${DRBM25_ROOT:?}/memcheck"
+    rc=0
+    # The --set after RUNPOD_SET_ARGS wins over a saved size there (the last --set of a key wins).
+    # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+    _uv_timeout "$SMOKE_TIMEOUT_S" torchrun --nproc_per_node 2 scripts/memory_check.py --config "$RUNPOD_CONFIG" \
+      "${RUNPOD_SET_ARGS[@]}" --set "ppo.micro_batch_size=$micro" --ckpt-dir "$DRBM25_ROOT/memcheck" || rc=$?
+    if ((rc == 0)); then
+      printf '%s\n' "$micro" >"$DRBM25_MICRO_BATCH_FILE.tmp"
+      mv -f -- "$DRBM25_MICRO_BATCH_FILE.tmp" "$DRBM25_MICRO_BATCH_FILE"
+      _runpod_log "memory check passed at micro batch $micro (saved to $DRBM25_MICRO_BATCH_FILE)"
+      rm -rf -- "${DRBM25_ROOT:?}/memcheck"
+      return 0
+    fi
+    if ((TIMEOUT_FIRED)); then
+      _runpod_log "error: memory check timed out at micro batch $micro (a hang, not memory)"
+      return 1
+    fi
+    # Exit 1: an error (an OOM included) or under 2 GiB headroom per GPU; 137: killed (out of memory).
+    _runpod_log "memory check failed at micro batch $micro (status $rc); trying a smaller one"
+  done
+  mark_failed "memory check failed at every micro batch tried (${tried% }); see the log above"
+  return 1
 }
 
 # ---------------------------------------------------------------- budget

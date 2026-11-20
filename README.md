@@ -13,6 +13,29 @@ uv run ruff check .
 uv run pyright
 ```
 
+## What a training run leaves behind
+
+Each run directory `runs/<run>/` holds:
+
+- `step_NNNNNN/` and `latest`: the one resume checkpoint (`run.keep_ckpts: 1`; model, optimizers, scaler,
+  RNG, data cursor). A save writes the new one beside the old one, then deletes the old one.
+- `best/`: the policy with the highest validation score so far, which is what evaluation scores. Every
+  `run.val_every` (50) steps and at `run.total_steps`, the actor rewrites the validation queries
+  greedily; when nDCG@10 under the run's own reward mode (`val/ndcg_normal` or `val/ndcg_count_once`)
+  strictly beats the stored best, `best/` is replaced atomically (ties keep the earlier step).
+  `best/model.safetensors` holds the actor only (LoRA: the actor adapter; full fine-tune: the actor in
+  bf16 with HF names, about 6.8 GB at 3B); `best/meta.json` records the step, both validation scores,
+  the selection metric, the reward mode, the config sha256 and the seeds. A resume keeps the stored best.
+- `run_manifest.json`: every seed with its derivation (`run.seed`: model construction, data order, per-rank
+  sampling and vLLM seeds `run.seed + rank`; `data.split_seed`: the train/validation split), the resolved
+  config and its sha256, git sha and dirty flag, dataset and model revisions, index checksum and size,
+  library versions, CUDA, driver and GPUs, world size, host, start time, and one `resumed_at` entry per
+  resume. A resume with a different `run.seed` or `data.split_seed` is refused. The same dict is the
+  W&B run's `config.meta`.
+
+Splits: validation = `data.val_size` (500) train queries picked by `data.split_seed` (1234); training uses
+the other 21,916; the test set is all 2,305 dev queries (`run_eval` never sees validation queries).
+
 ## Running on SDSC Expanse (2x V100 32GB)
 
 Scripts live in `scripts/expanse/`; the profile is `configs/expanse_v100_lora.yaml` (Qwen2.5-1.5B,
@@ -99,10 +122,12 @@ Everything below is a sequence of commands to run in a login-node shell. Run `sb
    ```
 
 7. Evaluation, once both chains have finished. `eval.sbatch` scores the original queries, the untrained
-   model and both trained runs at the largest step both runs have a complete checkpoint for
-   (`drbm25.eval.report.common_step`) and writes `$DRBM25_ROOT/runs/eval/report.md` and the four
-   `.jsonl` files. To also log the tables to W&B, rerun the report from the login node with `--wandb`
-   (the report does not need Java).
+   model and the `best/` policy of each trained run on all 2,305 dev queries, and writes
+   `$DRBM25_ROOT/runs/eval/report.md` and the four `.jsonl` files. It stops if a run has no `best/`, and
+   warns if a run's latest checkpoint is short of `total_steps`. The report shows each run's best step and
+   validation score, and a reproducibility block (bootstrap resamples and seed, `--bootstrap-seed`, default
+   0; each run's config sha256 and seeds). To also log the tables to W&B, rerun the report from the login
+   node with `--wandb` (the report does not need Java).
 
    ```bash
    sbatch --account="$EXPANSE_ACCOUNT" scripts/expanse/eval.sbatch
@@ -120,7 +145,11 @@ Shell tests: `bats tests/shell/` (needs bats >= 1.5 and bash >= 4 for `mapfile`)
 `configs/runpod_a100_full.yaml` (Qwen2.5-3B, `model.train_mode: full`, `rollout.backend: vllm`) builds
 an FSDP2-sharded fp32 actor and critic, a frozen bf16 reference, and one colocated vLLM 0.19 engine
 per rank. It needs `uv sync --extra vllm`, CUDA, and torchrun (`--nproc_per_node 2`); checkpoints are
-sharded (`step_NNNNNN/dcp/`, written by every rank). Before a long run, measure peak memory per GPU
+sharded (`step_NNNNNN/dcp/`, written by every rank). `ppo.micro_batch_size` is 8, the ceiling (per-rank
+mini-batch 16 / 2 = 8; PPO batch 64 and mini-batch 16 are unchanged). The controller's estimate, not
+measured on a pod: about 46 GiB per GPU of sharded fp32 actor and critic states, 2.9 GiB of reference,
+about 1.3 GiB of activations per 606-token sequence, so micro batch 8 leaves about 19 GiB of headroom
+while vLLM sleeps. The RunPod launcher checks it and falls back to 4, then 2. Before a long run, measure peak memory per GPU
 (sampled through generation) over two PPO steps, a validation pass, a sharded save and a resume
 (synthetic queries, no index or dataset needed; exits 1 when the headroom is under 2 GiB):
 
@@ -138,8 +167,16 @@ keys, installs everything, trains the `normal` and `count_once` runs in alternat
 budget, evaluates, writes the report and terminates the pod (also after a fatal error, a closed terminal or Ctrl-C).
 
 Prices (RunPod API, as of 2026-11-19): 2x A100 SXM 80GB community $2.78/h, secure $4.38/h; 2x A100 PCIe 80GB
-community $2.38/h, secure $4.18/h. $100 buys about 36-42 h on community cloud and 23-24 h on secure. Community
-stock was listed as low.
+community $2.38/h, secure $4.18/h. Community stock was listed as low.
+
+Suggested budget: **$160** (the project's cap). At those prices it buys 57.6 h (SXM community), 67.2 h (PCIe
+community), 38.3 h (PCIe secure) or 36.5 h (SXM secure), one hour of which is reserved for evaluation and
+the report (`RESERVE_S`). Whether 1,751 steps fit is not known in advance: the trainer times the first 10 PPO
+steps and logs `budget/projected_steps` (to `metrics.jsonl`, the log and W&B), computed as steps done +
+(deadline - reserve - now) / mean step time. Read it after the first 10 steps of the first chunk. Each run's projection
+counts only its own step time, but both runs share the clock in alternating chunks, so expect each run to
+reach roughly half of the projected steps beyond those already done (an inference from the alternation, not
+a measurement).
 
 Template and stock: the official "Runpod Pytorch 2.8.0" image `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (host CUDA
    12.8-13.4 allowed). Check GPU stock first: as of 2026-11-20 the RunPod API showed 2x A100 SXM 80GB available only on
@@ -147,12 +184,15 @@ Template and stock: the official "Runpod Pytorch 2.8.0" image `runpod/pytorch:1.
    data center, so confirm that the data center currently has 2x A100 80GB in stock BEFORE creating the volume.
 1. Create a network volume of at least **400 GB** in a data center that has A100 80GB in stock. Size estimate
    (not measured on a pod yet): a full fine-tune checkpoint holds fp32 parameters plus two Adam moments for the
-   actor and the critic, about 74 GB; `run.keep_ckpts` is 1, but a save needs the old checkpoint beside the new one,
-   so each run peaks at 2 checkpoints: 2 runs x 2 x 74 GB = about 296 GB, plus the model cache, dataset, index, venv
-   cache and logs. The launcher refuses to start a chunk with less than 1.2x the last checkpoint (90 GiB before the
-   first one) free. Network volume storage is billed per GB-month: check the current rate in the RunPod console
-   before choosing the size. After the first checkpoint, confirm the real size on the pod with
-   `du -sh /workspace/drbm25/runs/*/step_*` and `df -h /workspace`.
+   actor and the critic, about 74 GB, and `best/` holds the 3B actor in bf16, about 6.8 GB (6.2 GB of parameters
+   plus the tied LM head stored under its own name). Each run keeps one checkpoint and one `best/`: 74 + 6.8 GB.
+   A save writes the new checkpoint beside the old one, so the run being saved peaks at 2 x 74 + 6.8 = about
+   155 GB while the other holds about 81 GB (the runs train in turn): about 236 GB, plus the model cache,
+   dataset, index, venv cache and logs. The launcher refuses to start a chunk unless 1.2 x (last checkpoint +
+   `best/`) is free (7 GiB stands in for a `best/` not written yet; 90 GiB before the first checkpoint).
+   Network volume storage is billed per GB-month: check the current rate in the RunPod console before
+   choosing the size. After the first checkpoint, confirm the real sizes on the pod with
+   `du -sh /workspace/drbm25/runs/*/step_* /workspace/drbm25/runs/*/best` and `df -h /workspace`.
 2. Deploy a pod with 2x A100 80GB and that volume mounted at `/workspace`. Create a RunPod API key with
    `pods:write` (it is used only to terminate the pod).
 3. In the pod, run inside `tmux` so a closed SSH or web terminal cannot interrupt the run:
@@ -173,8 +213,12 @@ Template and stock: the official "Runpod Pytorch 2.8.0" image `runpod/pytorch:1.
    SHA-256 checked, installed into `/workspace/drbm25/bin`; no pip, so Ubuntu 24.04's externally-managed Python does not
    matter), Python 3.12 from `uv python install` (onto the volume, `UV_PYTHON_PREFERENCE=only-managed`, so the image's
    system Python and preinstalled torch are never used), `uv sync --frozen --extra vllm`, dataset and index, model snapshot at the config's pinned revision, GPU smoke test (`pytest
-   -m gpu` on the vLLM and full-model tests, then `scripts/memory_check.py`, which fails with under 2 GiB headroom),
-   training, evaluation, report. Data and model stages leave markers in `/workspace/drbm25/.done/` and are skipped on
+   -m gpu` on the vLLM and full-model tests, then `scripts/memory_check.py` at micro batch 8; if it fails, by
+   exiting 1 for an error, an out-of-memory error or under 2 GiB headroom, or by being killed, it is retried at 4,
+   then 2; the first size that passes is saved to `/workspace/drbm25/micro_batch` and passed as
+   `--set ppo.micro_batch_size=N` to every training chunk, so it is recorded in each run's `run_manifest.json`;
+   if 2 fails too, `FAILED` is written and the pod is terminated; a later pod never retries a size larger than
+   the saved one), training, evaluation of each run's `best/` policy, report. Data and model stages leave markers in `/workspace/drbm25/.done/` and are skipped on
    a re-run; Java, uv, `uv sync` and training run every launch (training resumes from the latest checkpoint), and the
    smoke test runs once per pod. The W&B project and entity you entered are applied to training, evaluation and the
    report.
@@ -184,8 +228,8 @@ Template and stock: the official "Runpod Pytorch 2.8.0" image `runpod/pytorch:1.
    original one. Time before the script starts (pod boot, your typing) is not counted. Training stops at the next
    checkpoint boundary once less than `RESERVE_S` (default 3600 s, an unmeasured estimate for four evaluation runs,
    the report and the terminate call) is left; override with `RESERVE_S=...`. Both runs advance in chunks of
-   `run.chunk_steps` (50), so they stop within one chunk of each other and the evaluation uses the last step both
-   reached.
+   `run.chunk_steps` (50), so they stop within one chunk of each other; the evaluation scores each run's `best/`
+   policy so far.
 6. Hangs: each training chunk runs under GNU `timeout` (time to the deadline plus 30 min), evaluation commands under
    2 h and each smoke command under 1 h. A timeout is a failure: `FAILED` is written and the pod is terminated. A `SIGKILL` before the limit (exit 137, for example
    the out-of-memory killer) is reported as that, not as a timeout.
@@ -195,7 +239,7 @@ Ctrl-C, a closed terminal (SIGHUP) or SIGTERM stops the running command (its pro
 
 `df` on a RunPod network volume may report pooled rather than per-volume space. Set `VOLUME_GB` to the size you created
 (the launcher asks, optional, and saves it in `.env`) and the preflight also requires
-`VOLUME_GB - used` (from `du -sk /workspace/drbm25`) to cover the next checkpoint. On the pod, compare
+`VOLUME_GB - used` (from `du -sk /workspace/drbm25`) to cover the next checkpoint and `best/`. On the pod, compare
 `du -sh /workspace` with the volume size you created.
 
 Terminating the pod releases GPU billing; the network volume keeps all data. Use `--no-terminate` or
@@ -207,9 +251,10 @@ inside tmux. A failure leaves `/workspace/drbm25/FAILED` (and terminates the pod
 stops immediately, before prompting, and does NOT terminate the pod (it is still billing): fix the cause, delete the
 file and run again, or terminate the pod yourself.
 
-Where things are (all under `/workspace/drbm25`): `runs/{normal,count_once}/` (sharded checkpoints, `metrics.jsonl`,
-`train_rank*.log`, `exit_code`), `runs/eval/` (per-query jsonl and `report.md`), `logs/` (the launcher log and
-copies of the run logs, made on exit), `spend.json`, `hf/` (model cache), `indexes/`, `data/`, `.env`.
+Where things are (all under `/workspace/drbm25`): `runs/{normal,count_once}/` (the sharded resume checkpoint,
+`best/`, `run_manifest.json`, `metrics.jsonl`, `train_rank*.log`, `exit_code`), `runs/eval/` (per-query jsonl
+and `report.md`), `logs/` (the launcher log and copies of the run logs, made on exit), `micro_batch` (the
+micro batch size the smoke stage chose), `spend.json`, `hf/` (model cache), `indexes/`, `data/`, `.env`.
 
 Tests: `bats tests/shell/test_runpod_lib.bats` (curl, uv, timeout, df and sleep are PATH shims) and
 `shellcheck scripts/runpod/*.sh`.

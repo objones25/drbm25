@@ -17,7 +17,7 @@ readonly SCRIPT_DIR
 readonly REPO_ROOT=$SCRIPT_DIR/../..
 # Seconds kept free before the deadline for the final evaluation (four scoring runs over the dev
 # queries), the report with its 10,000-resample bootstrap, the log copy and the terminate call.
-# One hour is an unmeasured, deliberately generous estimate (about $3-4.4 of a $100 budget).
+# One hour is an unmeasured, deliberately generous estimate (about $2.4-4.4 of a $160 budget).
 readonly DEFAULT_RESERVE_S=3600
 
 usage() {

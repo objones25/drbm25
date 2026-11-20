@@ -459,8 +459,10 @@ def test_load_best_rejects_a_step_checkpoint(tmp_path: Path) -> None:
 
 def test_keep_one_leaves_one_step_dir_and_never_touches_best(tmp_path: Path) -> None:
     save_best(tmp_path, weights=_weights(1.0), meta=_best_meta(50))
-    for step in (50, 100, 150, 200):
-        _save(tmp_path, step, keep=1)
+    _save(tmp_path, 50, keep=1)
+    _save(tmp_path, 100, keep=1)
+    _save(tmp_path, 150, keep=1)
+    _save(tmp_path, 200, keep=1)
     assert sorted(p.name for p in tmp_path.glob("step_*")) == ["step_000200"]
     found = best_meta(tmp_path)
     assert found is not None
