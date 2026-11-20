@@ -1,10 +1,12 @@
 import math
+from collections.abc import Sequence
 
 import pytest
 import torch
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
 
+from drbm25.config import LoraCfg
 from drbm25.obs.metrics import (
     ActivationProbe,
     explained_variance,
@@ -14,6 +16,7 @@ from drbm25.obs.metrics import (
     snapshot,
     update_ratio,
 )
+from drbm25.ppo.models import LoraPolicyModels
 from drbm25.tiny import build_tiny_qwen2
 
 
@@ -231,3 +234,43 @@ def test_explained_variance_zero_variance_returns_is_zero_not_nan():
 def test_explained_variance_rejects_empty_mask():
     with pytest.raises(ValueError, match="no valid tokens"):
         explained_variance(torch.zeros(1, 2), torch.zeros(1, 2), torch.zeros(1, 2))
+
+
+def _lora_policy() -> LoraPolicyModels:
+    cfg = LoraCfg(rank=4, alpha=8, dropout=0.0, target_modules=("q_proj", "v_proj", "gate_proj"))
+    return LoraPolicyModels(build_tiny_qwen2(), cfg, gradient_checkpointing=False)
+
+
+def _hand_norms(layers: Sequence[nn.Module], prefix: str, group: Sequence[nn.Parameter]) -> dict[str, float]:
+    ids = {id(p) for p in group}
+    out: dict[str, float] = {}
+    for i, layer in enumerate(layers):
+        for name, attr in (("attn", "self_attn"), ("mlp", "mlp")):
+            params = [p for p in getattr(layer, attr).parameters() if id(p) in ids]
+            out[f"{prefix}/layer_{i:02d}/{name}/weight_norm"] = math.sqrt(
+                sum(float(p.detach().pow(2).sum()) for p in params)
+            )
+            if params and all(p.grad is not None for p in params):
+                out[f"{prefix}/layer_{i:02d}/{name}/grad_norm"] = math.sqrt(
+                    sum(float(p.grad.pow(2).sum()) for p in params if p.grad is not None)
+                )
+    return out
+
+
+@pytest.mark.parametrize("backward_both", [False, True])
+@pytest.mark.parametrize("adapter", ["actor", "critic"])
+def test_per_layer_only_selects_exactly_one_lora_adapter(adapter: str, backward_both: bool):
+    policy = _lora_policy()
+    layers = policy.decoder_layers()
+    ids = torch.arange(12).reshape(2, 6)
+    mask = torch.ones_like(ids)
+    [nn.init.normal_(p, std=0.5) for p in [*policy.actor_parameters(), *policy.critic_parameters()]]
+    losses = [policy.actor_logits(ids, mask).sum(), policy.critic_values(ids, mask).sum()]
+    torch.autograd.backward(losses[: 1 + backward_both])
+    group = policy.actor_parameters() if adapter == "actor" else policy.critic_parameters()
+    got = per_layer_grad_and_weight_norms(layers, adapter, only=group)
+    want = {k: v for k, v in _hand_norms(layers, adapter, group).items() if k.endswith("weight_norm") or k in got}
+    assert set(got) == set(want)
+    assert got == pytest.approx(want, rel=1e-5)
+    mixed = per_layer_grad_and_weight_norms(layers, adapter)
+    assert mixed[f"{adapter}/layer_00/attn/weight_norm"] > got[f"{adapter}/layer_00/attn/weight_norm"]

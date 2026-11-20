@@ -10,7 +10,7 @@ near 1e-3 is a healthy step size for Adam-style optimisers.
 """
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from types import TracebackType
 from typing import Self
 
@@ -41,7 +41,9 @@ def _l2(tensors: Sequence[Tensor]) -> float:
     return float(torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(t.detach().float()) for t in tensors])))
 
 
-def per_layer_grad_and_weight_norms(layers: Sequence[nn.Module], prefix: str) -> dict[str, float]:
+def per_layer_grad_and_weight_norms(
+    layers: Sequence[nn.Module], prefix: str, *, only: Collection[nn.Parameter] | None = None
+) -> dict[str, float]:
     """L2 norms of the TRAINABLE parameters under each layer's ``self_attn`` and ``mlp``.
 
     With LoRA these are the LoRA A/B matrices; with full fine-tuning, the full weights.
@@ -50,11 +52,12 @@ def per_layer_grad_and_weight_norms(layers: Sequence[nn.Module], prefix: str) ->
     omitted rather than reported as 0). Layernorm weights sit outside these submodules
     and are not covered.
     """
+    only_ids = None if only is None else {id(p) for p in only}
     out: dict[str, float] = {}
     for i, layer in enumerate(layers):
         for name in _SUBMODULES:
             module = getattr(layer, _ATTR_FOR_SUBMODULE[name])
-            trainable = [p for p in module.parameters() if p.requires_grad]
+            trainable = [p for p in module.parameters() if p.requires_grad and (only_ids is None or id(p) in only_ids)]
             if not trainable:
                 continue
             key = f"{prefix}/layer_{i:02d}/{name}"
@@ -132,7 +135,7 @@ def _activation_stats(hidden: Tensor, key: str) -> dict[str, float]:
 
 
 def snapshot(params: Sequence[nn.Parameter]) -> list[Tensor]:
-    """Detached copies of ``params`` to pass to :func:`update_ratio` after the optimizer step."""
+    """Detached copies of ``params`` (clones every one, so pass only the group needed) to pass to :func:`update_ratio` after the optimizer step."""
     return [p.detach().clone() for p in params]
 
 
