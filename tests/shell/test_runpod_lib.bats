@@ -745,12 +745,17 @@ make_runs() {
   [[ ! -e $DRBM25_ROOT/runs/count_once/UPLOADED.json ]]
 }
 
-@test "a marker that cannot be withdrawn stops the launch with FAILED before any training (fail closed)" {
+@test "an HF outage at invalidation writes MARKER_STALE, warns, removes the local marker, and training proceeds" {
   make_runs
-  SNIPPET='invalidate_uploads 100'
-  run -1 in_lib STUB_PUBLISH_RC_normal=1
-  grep -q 'UPLOADED.json' "$DRBM25_ROOT/FAILED"
-  [[ -z $(train_calls) ]]
+  echo '{}' >"$DRBM25_ROOT/runs/normal/UPLOADED.json"
+  SNIPPET='invalidate_uploads 50 && run_alternating_chunks 50 50'
+  run -0 --separate-stderr in_lib STUB_PUBLISH_RC_normal=1 STUB_INVALIDATE=1 DEADLINE_UNIX=2000000000 RESERVE_S=3600
+  [[ ! -e $DRBM25_ROOT/runs/normal/UPLOADED.json ]]
+  grep -q 'could not withdraw' "$DRBM25_ROOT/runs/normal/MARKER_STALE"
+  [[ ! -e $DRBM25_ROOT/runs/count_once/MARKER_STALE ]]
+  [[ ! -e $DRBM25_ROOT/FAILED ]]
+  [[ $stderr == *WARNING*MARKER_STALE* ]]
+  [[ $(train_calls | tr '\n' ' ') == 'normal@50 count_once@50 ' ]]
 }
 
 @test "run_all.sh withdraws the upload markers after reading total_steps and before training" {

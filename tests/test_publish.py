@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
-from collections.abc import Iterable
+import signal
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,8 +35,10 @@ from drbm25.manifest import write_manifest
 from drbm25.obs.setup import shutdown
 from drbm25.ppo.models import LoraPolicyModels
 from drbm25.publish import (
+    MARKER_STALE_FILE,
     UPLOADED_FILE,
     BaseFiles,
+    InsufficientSpaceError,
     TokenPermissionError,
     VerificationError,
     build_model_card,
@@ -99,6 +103,8 @@ class FakeHub:
     corrupt_storage: set[str] = field(default_factory=set)  # stored bytes damaged; the declared hash stays right
     declared: dict[tuple[str, str], _Declared] = field(default_factory=dict)
     downloads: list[str] = field(default_factory=list)
+    download_dirs: list[Path] = field(default_factory=list)
+    on_download: Callable[[], None] | None = None  # runs after a download-back copy was written
     drop: set[str] = field(default_factory=set)  # paths silently not stored by a commit
     network_failures: int = 0  # the next N create_commit calls raise ConnectionError before doing anything
     commit_error: Exception | None = None  # every create_commit raises this
@@ -159,9 +165,12 @@ class FakeHub:
         assert force_download, "a download-back check must never reuse a local copy"
         assert local_dir is not None
         self.downloads.append(filename)
+        self.download_dirs.append(Path(local_dir))
         target = Path(local_dir) / filename
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(self.root / repo_id / filename, target)
+        if self.on_download is not None:
+            self.on_download()
         return str(target)
 
     def create_commit(
@@ -662,3 +671,68 @@ def test_cli_says_safe_to_delete_only_after_both_runs(
     assert _cli(["--run-dir", str(normal.run_dir), "--invalidate"]) == 0
     assert not (normal.run_dir / UPLOADED_FILE).exists()
     assert not (hub.root / "tester/drbm25-tiny-local-normal" / UPLOADED_FILE).exists()
+
+
+# ---------------------------------------------------------------------------- round 2: stale markers, temp copies, disk
+def test_marker_stale_is_removed_only_after_a_verified_marker(tmp_path: Path) -> None:
+    hub = FakeHub(tmp_path / "hub", drop={"provenance/report.md"})
+    run = _make_run(tmp_path, layout="full", weights={"w": torch.zeros(2)})
+    stale = run.run_dir / MARKER_STALE_FILE
+    stale.write_text("Hub withdrawal failed: network\n")
+    with pytest.raises(VerificationError):
+        _publish(hub, run)
+    assert stale.is_file()  # a failed publish proves nothing about the Hub copy
+    hub.drop = set()
+    _publish(hub, run)
+    assert not stale.exists()
+    assert (run.run_dir / UPLOADED_FILE).is_file()
+
+
+def test_volume_is_not_safe_while_a_run_has_a_stale_marker(tmp_path: Path) -> None:
+    hub = FakeHub(tmp_path / "hub")
+    normal = _make_run(tmp_path, layout="full", weights={"w": torch.zeros(2)}, mode="normal")
+    count_once = _make_run(tmp_path, layout="full", weights={"w": torch.zeros(2)}, mode="count_once")
+    _publish(hub, normal)
+    _publish(hub, count_once)
+    (normal.run_dir / MARKER_STALE_FILE).write_text("x\n")
+    assert not volume_safe(normal.runs_dir)
+
+
+def test_stale_download_dirs_are_swept_at_the_start_of_a_publish(tmp_path: Path) -> None:
+    hub = FakeHub(tmp_path / "hub")
+    run = _make_run(tmp_path, layout="full", weights={"w": torch.zeros(2)})
+    leftover = run.run_dir / ".tmp-download-killed"
+    leftover.mkdir()
+    (leftover / "model.safetensors").write_bytes(b"half a download")
+    _publish(hub, run)
+    assert not leftover.exists()
+
+
+def test_too_little_free_space_for_the_download_back_fails_before_downloading(tmp_path: Path) -> None:
+    hub = FakeHub(tmp_path / "hub")
+    run = _make_run(tmp_path, layout="full", weights={"w": torch.zeros(1000)})
+    size = (run.run_dir / "best" / "model.safetensors").stat().st_size
+    with pytest.raises(InsufficientSpaceError, match=r"model\.safetensors"):
+        _publish(hub, run, free_bytes=lambda _path: int(1.2 * size) - 1)
+    assert hub.downloads == []
+    assert not (run.run_dir / UPLOADED_FILE).exists()
+    _publish(hub, run, free_bytes=lambda _path: int(1.2 * size) + 1)
+    assert (run.run_dir / UPLOADED_FILE).is_file()
+
+
+def test_sigterm_during_the_download_back_removes_the_temp_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hub = FakeHub(tmp_path / "hub", on_download=lambda: os.kill(os.getpid(), signal.SIGTERM))
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: hub)
+    monkeypatch.setattr(publish_module, "hub_base_fetcher", _fake_base_fetcher)
+    run = _make_run(tmp_path, layout="full", weights={"w": torch.zeros(2)})
+    before = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(SystemExit) as stopped:
+        _cli(["--run-dir", str(run.run_dir)])
+    assert stopped.value.code == 128 + signal.SIGTERM
+    assert hub.download_dirs  # the signal arrived while the copy was on disk
+    assert not any(d.exists() for d in hub.download_dirs)
+    assert not list(run.run_dir.glob(".tmp-download-*"))
+    assert not (run.run_dir / UPLOADED_FILE).exists()
+    assert signal.getsignal(signal.SIGTERM) == before  # the CLI restores the previous handler

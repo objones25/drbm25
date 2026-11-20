@@ -209,7 +209,7 @@ running_pod() { # STDOUT: what the pod's exec of the volume check prints
 @test "--status says safe to delete only when both Hub markers match the volume's current best/ (read through the pod)" {
   hub_marker normal 400 aaa
   hub_marker count_once 350 bbb
-  running_pod $'normal aaa\ncount_once bbb\n'
+  running_pod $'normal aaa ok\ncount_once bbb ok\n'
   run -0 bash "$LAUNCH" --status
   [[ $output == *"hfuser/drbm25-qwen2.5-3b-normal: UPLOADED.json for best step 400, matches the volume"* ]]
   [[ $output == *"hfuser/drbm25-qwen2.5-3b-count_once: UPLOADED.json for best step 350, matches the volume"* ]]
@@ -219,7 +219,7 @@ running_pod() { # STDOUT: what the pod's exec of the volume check prints
 @test "--status says no when a Hub marker is for an older best/ than the volume holds" {
   hub_marker normal 400 aaa
   hub_marker count_once 350 bbb
-  running_pod $'normal aaa\ncount_once NEWER\n'
+  running_pod $'normal aaa ok\ncount_once NEWER ok\n'
   run -0 bash "$LAUNCH" --status
   [[ $output == *"count_once: UPLOADED.json for best step 350, STALE"* ]]
   [[ $output == *"safe to delete the volume: no"* ]]
@@ -233,6 +233,16 @@ running_pod() { # STDOUT: what the pod's exec of the volume check prints
   [[ $output == *"normal: UPLOADED.json for best step 400"* ]]
   [[ $output == *"count_once: UPLOADED.json for best step 350"* ]]
   [[ $output == *"safe to delete the volume: unknown"* ]]
+  [[ $output != *"safe to delete the volume: yes"* ]]
+}
+
+@test "--status says no when the volume holds MARKER_STALE for a run (its Hub marker could not be withdrawn)" {
+  hub_marker normal 400 aaa
+  hub_marker count_once 350 bbb
+  running_pod $'normal aaa stale\ncount_once bbb ok\n'
+  run -0 bash "$LAUNCH" --status
+  [[ $output == *"hfuser/drbm25-qwen2.5-3b-normal: no (stale marker could not be withdrawn"* ]]
+  [[ $output == *"safe to delete the volume: no"* ]]
   [[ $output != *"safe to delete the volume: yes"* ]]
 }
 

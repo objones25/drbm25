@@ -90,18 +90,20 @@ readonly CONSOLE_URL=https://console.runpod.io/pods
 # Evaluation, report and uploads are budgeted inside run_all.sh's RESERVE_S (5400 s) before the budget deadline, so this
 # margin is slack for an overrun; keep it >= lib.sh PUBLISH_TIMEOUT_S (a bats test checks this).
 readonly HARD_DEADLINE_MARGIN_S=3600
-# Run inside the pod by --status: the sha256 of each run's best/meta.json, compared with the Hub's UPLOADED.json.
+# Run inside the pod by --status: per run "<mode> <sha256 of best/meta.json, or none> <stale|ok>" (stale: the run
+# has MARKER_STALE, its Hub marker could not be withdrawn before training).
 # shellcheck disable=SC2016 # expanded by the pod's shell, not here
 readonly VOLUME_SHA_SCRIPT='cd /workspace/drbm25/runs 2>/dev/null || exit 0
 for m in normal count_once; do
-  if [ -f "$m/best/meta.json" ]; then echo "$m $(sha256sum "$m/best/meta.json" | cut -d " " -f 1)"; else echo "$m none"; fi
+  s=ok; [ -f "$m/MARKER_STALE" ] && s=stale
+  if [ -f "$m/best/meta.json" ]; then echo "$m $(sha256sum "$m/best/meta.json" | cut -d " " -f 1) $s"; else echo "$m none $s"; fi
 done'
 # Run inside the pod by --logs and --watch (sh -c, fixed text; the line count comes in through env).
 # shellcheck disable=SC2016 # expanded by the pod's shell, not here
 readonly LOG_SCRIPT='cd /workspace/drbm25 2>/dev/null || { echo "no /workspace/drbm25 yet (the pod is still starting)"; exit 0; }
 if [ -f FAILED ]; then echo "FAILED marker: $(cat FAILED)"; fi
 if [ -f PUBLISH_FAILED ]; then echo "PUBLISH_FAILED marker: $(cat PUBLISH_FAILED)"; fi
-for m in normal count_once; do if [ -f "runs/$m/UPLOADED.json" ]; then echo "runs/$m/UPLOADED.json: uploaded and verified"; fi; done
+for m in normal count_once; do if [ -f "runs/$m/UPLOADED.json" ]; then echo "runs/$m/UPLOADED.json: uploaded and verified"; fi; if [ -f "runs/$m/MARKER_STALE" ]; then echo "runs/$m/MARKER_STALE: $(cat "runs/$m/MARKER_STALE")"; fi; done
 if [ -f spend.json ]; then echo "spend so far: $(cat spend.json)"; fi
 for f in "$(ls -t logs/bootstrap-*.log 2>/dev/null | head -n 1)" "$(ls -t logs/run_all-*.log 2>/dev/null | head -n 1)"; do
   [ -n "$f" ] || continue
@@ -281,11 +283,11 @@ runpod_model_slug() {
 }
 
 # Sets VOLUME_SHA_normal and VOLUME_SHA_count_once to the sha256 of each run's best/meta.json on the volume ("none"
-# when a run has no best/), read through the exec API of the running pod POD_ID. Leaves them empty (unknown) when
+# when a run has no best/), and VOLUME_STALE_<mode> to stale or ok (MARKER_STALE present), read through the exec API of the running pod POD_ID. Leaves them empty (unknown) when
 # there is no running pod or the exec call fails; never dies.
 read_volume_best_shas() {
-  local out=$TMP_DIR/exec-vol.json body=$TMP_DIR/exec-vol-body.json mode sha stdout
-  VOLUME_SHA_normal='' VOLUME_SHA_count_once=''
+  local out=$TMP_DIR/exec-vol.json body=$TMP_DIR/exec-vol-body.json mode sha stale stdout
+  VOLUME_SHA_normal='' VOLUME_SHA_count_once='' VOLUME_STALE_normal='' VOLUME_STALE_count_once=''
   if [[ -z ${POD_ID-} || ${POD_STATUS-} != RUNNING ]]; then return 0; fi
   jq -n --arg script "$VOLUME_SHA_SCRIPT" '{command: ["sh", "-c", $script], timeoutSeconds: 20}' >"$body"
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
@@ -294,11 +296,11 @@ read_volume_best_shas() {
     return 0
   fi
   stdout=$(jq -r '.stdout // ""' "$out") || stdout=''
-  while read -r mode sha; do
-    [[ $sha =~ ^([0-9a-f]{64}|none|[A-Za-z0-9]+)$ ]] || continue
+  while read -r mode sha stale; do
+    [[ $sha =~ ^[A-Za-z0-9]+$ && $stale =~ ^(stale|ok)$ ]] || continue
     case $mode in
-      normal) VOLUME_SHA_normal=$sha ;;
-      count_once) VOLUME_SHA_count_once=$sha ;;
+      normal) VOLUME_SHA_normal=$sha VOLUME_STALE_normal=$stale ;;
+      count_once) VOLUME_SHA_count_once=$sha VOLUME_STALE_count_once=$stale ;;
     esac
   done <<<"$stdout"
 }
@@ -308,7 +310,7 @@ read_volume_best_shas() {
 # volume's current best/ (sha256 of best/meta.json). Then: safe to delete the volume yes (both markers match the
 # volume), no (a marker is missing or stale), or unknown (the volume cannot be read: no running pod).
 hf_upload_status() {
-  local slug mode repo out=$TMP_DIR/hf-marker.json step hub_sha volume_sha missing=0 matched=0
+  local slug mode repo out=$TMP_DIR/hf-marker.json step hub_sha volume_sha stale missing=0 matched=0
   slug=$(runpod_model_slug)
   read_volume_best_shas
   printf 'Hugging Face uploads (private repos of %s):\n' "$HF_USER"
@@ -327,8 +329,15 @@ hf_upload_status() {
     fi
     step=$(jq -r '.best_step // "?"' "$out") || die "unexpected UPLOADED.json in $repo"
     hub_sha=$(jq -r '.files["provenance/best_meta.json"].sha256 // ""' "$out") || die "unexpected UPLOADED.json in $repo"
-    if [[ $mode == normal ]]; then volume_sha=$VOLUME_SHA_normal; else volume_sha=$VOLUME_SHA_count_once; fi
-    if [[ -z $volume_sha ]]; then
+    if [[ $mode == normal ]]; then
+      volume_sha=$VOLUME_SHA_normal stale=$VOLUME_STALE_normal
+    else
+      volume_sha=$VOLUME_SHA_count_once stale=$VOLUME_STALE_count_once
+    fi
+    if [[ $stale == stale ]]; then
+      printf '  %s: no (stale marker could not be withdrawn before training; UPLOADED.json says best step %s)\n' "$repo" "$step"
+      missing=$((missing + 1))
+    elif [[ -z $volume_sha ]]; then
       printf '  %s: UPLOADED.json for best step %s (cannot compare with the volume: no running pod)\n' "$repo" "$step"
     elif [[ -n $hub_sha && $volume_sha == "$hub_sha" ]]; then
       printf '  %s: UPLOADED.json for best step %s, matches the volume'"'"'s best/\n' "$repo" "$step"

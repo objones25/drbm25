@@ -45,9 +45,12 @@ import json
 import logging
 import os
 import re
+import shutil
+import signal
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -69,6 +72,11 @@ from drbm25.obs import configure
 logger = logging.getLogger(__name__)
 
 UPLOADED_FILE: Final = "UPLOADED.json"
+# Written by run_all.sh when the Hub's UPLOADED.json could not be withdrawn before training; removed only after a
+# verified new marker is written. While it exists the Hub marker may describe an older best/.
+MARKER_STALE_FILE: Final = "MARKER_STALE"
+_DOWNLOAD_PREFIX: Final = ".tmp-download-"
+_DOWNLOAD_SPACE_FACTOR: Final = 1.2
 DEFAULT_REPO_PREFIX: Final = "drbm25"
 DEFAULT_CODE_URL: Final = "https://github.com/objones25/drbm25"  # scripts/runpod/launch.sh DEFAULT_REPO_URL
 _RUN_MODES: Final = ("normal", "count_once")
@@ -93,6 +101,10 @@ class TokenPermissionError(RuntimeError):
 
 class VerificationError(RuntimeError):
     """The Hub copy of a file is missing or differs from the local file."""
+
+
+class InsufficientSpaceError(RuntimeError):
+    """Not enough free disk space under the run dir to download a weight file back for verification."""
 
 
 # ---------------------------------------------------------------------------- Hub API surface
@@ -545,6 +557,7 @@ def publish_run(
     code_url: str,
     dry_run: bool = False,
     sleep: Callable[[float], None] = time.sleep,
+    free_bytes: Callable[[Path], int] | None = None,
 ) -> PublishResult | None:
     """Upload ``run`` and verify it; write ``UPLOADED.json`` only after verification. None on ``dry_run``.
 
@@ -552,6 +565,7 @@ def publish_run(
     staged or uploaded, so a publish that fails at any later point leaves no marker. The token's write access
     is checked before anything is created or uploaded. A dry run changes nothing, markers included.
     """
+    _sweep_download_dirs(run.run_dir)
     if not dry_run:
         (run.run_dir / UPLOADED_FILE).unlink(missing_ok=True)
     user = check_write_access(_with_retries(api.whoami, sleep=sleep))
@@ -571,7 +585,9 @@ def publish_run(
         revision, uploaded = _commit_missing(api, repo_id, dict(plan), digests, message=message, sleep=sleep)
         tree = _tree(api, repo_id, revision, sleep)
         verify_remote(digests, tree)
-        _verify_downloads(api, repo_id, revision, digests, tree, workdir=run.run_dir, sleep=sleep)
+        _verify_downloads(
+            api, repo_id, revision, digests, tree, workdir=run.run_dir, sleep=sleep, free_bytes=free_bytes or _free_bytes
+        )
     files = {path: {"sha256": d.sha256, "size": d.size} for path, d in sorted(digests.items())}
     marker = {
         "repo_id": repo_id,
@@ -583,8 +599,39 @@ def publish_run(
     }
     _publish_remote_marker(api, marker, sleep=sleep)
     _write_json_atomic(run.run_dir / UPLOADED_FILE, marker)
+    (run.run_dir / MARKER_STALE_FILE).unlink(missing_ok=True)  # the Hub marker is current again
     logger.info("verified %d files in %s at %s; wrote %s", len(files), repo_id, revision, run.run_dir / UPLOADED_FILE)
     return PublishResult(repo_id=repo_id, revision=revision, uploaded=uploaded)
+
+
+def _free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def _sweep_download_dirs(run_dir: Path) -> None:
+    """Delete download-back copies a killed earlier publish left in ``run_dir`` (each up to a full weight file)."""
+    for stale in sorted(run_dir.glob(f"{_DOWNLOAD_PREFIX}*")):
+        if stale.is_dir():
+            shutil.rmtree(stale)
+            logger.warning("removed %s, a download-back copy left by an interrupted publish", stale)
+
+
+@contextmanager
+def _sigterm_raises() -> Iterator[None]:
+    """Turn SIGTERM (GNU ``timeout``, a pod shutdown) into ``SystemExit(143)`` so ``with`` blocks clean up.
+
+    Without it the default action kills the process at once and a download-back copy (a full weight file) is
+    left on the volume. The previous handler is restored on exit. Main thread only (``signal.signal``).
+    """
+
+    def raise_exit(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, raise_exit)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def _repo_id(namespace: str, prefix: str, model_name: str, train_mode: str, reward_mode: str) -> str:
@@ -630,17 +677,28 @@ def _verify_downloads(
     *,
     workdir: Path,
     sleep: Callable[[float], None],
+    free_bytes: Callable[[Path], int],
 ) -> None:
     """Download every LFS file (the weights) back at ``revision`` and compare its sha256 and size with the local file.
 
     The tree's LFS sha256 is the hash the uploading client declared, so it alone does not prove what the Hub
     stores. Each copy goes to its own temp dir under ``workdir`` (the run's volume: /tmp on an Expanse login
-    node is small) with ``force_download``, and is deleted before the next one.
+    node is small) with ``force_download``, and is deleted before the next one. Fails with
+    InsufficientSpaceError before any download unless 1.2 x the largest file is free there.
     """
     remote = _remote_files(tree)
     problems: list[str] = []
-    for path in sorted(p for p in local if (f := remote.get(p)) is not None and f.lfs is not None):
-        with tempfile.TemporaryDirectory(dir=workdir, prefix=".tmp-download-") as tmp:
+    paths = sorted(p for p in local if (f := remote.get(p)) is not None and f.lfs is not None)
+    if paths:
+        largest = max(paths, key=lambda p: local[p].size)
+        needed, free = int(_DOWNLOAD_SPACE_FACTOR * local[largest].size), free_bytes(workdir)
+        if free < needed:
+            raise InsufficientSpaceError(
+                f"{largest}: downloading it back needs {needed} bytes free under {workdir} "
+                f"({_DOWNLOAD_SPACE_FACTOR} x {local[largest].size}), only {free} are free"
+            )
+    for path in paths:
+        with tempfile.TemporaryDirectory(dir=workdir, prefix=_DOWNLOAD_PREFIX) as tmp:
             downloaded = _with_retries(
                 lambda p=path, d=tmp: api.hf_hub_download(repo_id, p, revision=revision, local_dir=d, force_download=True),
                 sleep=sleep,
@@ -697,7 +755,7 @@ def run_uploaded(run_dir: Path) -> bool:
     """True when ``run_dir/UPLOADED.json`` exists and was written for the current best/ (same meta.json)."""
     marker_path = run_dir / UPLOADED_FILE
     meta_path = run_dir / BEST_DIR / "meta.json"
-    if not marker_path.is_file() or not meta_path.is_file():
+    if not marker_path.is_file() or not meta_path.is_file() or (run_dir / MARKER_STALE_FILE).exists():
         return False
     recorded = json.loads(marker_path.read_text(encoding="utf-8"))["files"].get(_BEST_META_IN_REPO)
     return recorded is not None and recorded["sha256"] == digest(meta_path).sha256
@@ -738,20 +796,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure(level="INFO", fmt="json")
     # HfApi reads HF_TOKEN from the environment; the token is never passed around or logged here.
     api: HubApi = HfApi()
-    if ns.invalidate:
-        invalidate_run(api, ns.run_dir, namespace=ns.namespace, repo_prefix=ns.repo_prefix)
-        return 0
-    run = load_run(ns.run_dir, eval_jsonl=ns.eval_jsonl, report=ns.report)
-    result = publish_run(
-        api,
-        run,
-        base_fetcher=hub_base_fetcher,
-        namespace=ns.namespace,
-        repo_prefix=ns.repo_prefix,
-        private=ns.private,
-        code_url=ns.code_url,
-        dry_run=ns.dry_run,
-    )
+    with _sigterm_raises():
+        if ns.invalidate:
+            invalidate_run(api, ns.run_dir, namespace=ns.namespace, repo_prefix=ns.repo_prefix)
+            return 0
+        run = load_run(ns.run_dir, eval_jsonl=ns.eval_jsonl, report=ns.report)
+        result = publish_run(
+            api,
+            run,
+            base_fetcher=hub_base_fetcher,
+            namespace=ns.namespace,
+            repo_prefix=ns.repo_prefix,
+            private=ns.private,
+            code_url=ns.code_url,
+            dry_run=ns.dry_run,
+        )
     if result is not None:
         logger.info("published %s at %s (%d file(s) uploaded now)", result.repo_id, result.revision, len(result.uploaded))
         if volume_safe(ns.run_dir.parent):
@@ -761,4 +820,5 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 

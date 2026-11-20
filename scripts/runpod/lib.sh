@@ -26,7 +26,8 @@
 #   launch_deadline_unix START_UNIX BUDGET_USD PRICE_PER_HOUR    DRBM25_BUDGET_DEADLINE_UNIX, else the above
 #   run_alternating_chunks UNTIL CHUNK   status 0 done, 3 budget stop, 1 failure
 #   eval_stage, train_and_report UNTIL CHUNK
-#   invalidate_uploads TOTAL   withdraw the upload markers of the runs that will train (FAILED if impossible)
+#   invalidate_uploads TOTAL   withdraw the upload markers of the runs that will train (MARKER_STALE if the Hub
+#                              one cannot be withdrawn; training goes on)
 #   publish_stage              upload both runs' best/ to the Hugging Face Hub (python -m drbm25.publish);
 #                              a failure writes PUBLISH_FAILED (not FAILED) and returns 1
 #   spend_begin / spend_record / spend_total   dollars spent, kept in spend.json on the volume
@@ -999,18 +1000,25 @@ train_and_report() {
 # ---------------------------------------------------------------- publish
 
 # A run below TOTAL steps will train, which can replace its best/; its UPLOADED.json (here and in its Hub repo)
-# would then describe an older policy, so both are withdrawn first (python -m drbm25.publish --invalidate).
-# Fail closed: when that is impossible (HF_TOKEN, network) the launch stops with FAILED before any training.
+# would then describe an older policy, so both are withdrawn first. The local one is always removed. When the Hub
+# one cannot be withdrawn (HF outage, token; drbm25.publish --invalidate retries network errors), the run gets
+# runs/<mode>/MARKER_STALE with the reason and training goes on: an HF outage must not cost the training budget.
+# drbm25.publish removes MARKER_STALE only after a verified new marker, and launch.sh --status reports "no" while
+# it exists.
 invalidate_uploads() {
-  local total=${1:?TOTAL} mode have
+  local total=${1:?TOTAL} mode have run_dir
   for mode in normal count_once; do
+    run_dir=$DRBM25_RUNS_DIR/$mode
     # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-    have=$(latest_step "$DRBM25_RUNS_DIR/$mode") || return 1
+    have=$(latest_step "$run_dir") || return 1
     if ((have >= total)); then continue; fi
+    rm -f -- "$run_dir/UPLOADED.json"
     # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-    if ! _uv_timeout "$PUBLISH_TIMEOUT_S" python -m drbm25.publish --run-dir "$DRBM25_RUNS_DIR/$mode" --invalidate; then
-      mark_failed "could not withdraw the $mode run's UPLOADED.json on the Hugging Face Hub before training (HF_TOKEN or network); fix it, then relaunch with --clear-failed"
-      return 1
+    if ! _uv_timeout "$PUBLISH_TIMEOUT_S" python -m drbm25.publish --run-dir "$run_dir" --invalidate; then
+      mkdir -p -- "$run_dir"
+      printf 'could not withdraw the Hugging Face UPLOADED.json of the %s run before training (%s); it may describe an older best/ until the next verified publish\n' \
+        "$mode" "$(date '+%Y-%m-%dT%H:%M:%S')" >"$run_dir/MARKER_STALE"
+      _runpod_log "WARNING: could not withdraw the $mode run's UPLOADED.json on the Hugging Face Hub; wrote $run_dir/MARKER_STALE and training continues. Do not trust that Hub marker until a publish succeeds."
     fi
   done
 }

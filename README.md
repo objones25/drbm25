@@ -112,13 +112,19 @@ best step, or a report whose row for the run disagrees with the eval file.
 Fail closed: a publish first deletes `RUN_DIR/UPLOADED.json` and the repo's `UPLOADED.json`, before anything is
 staged or uploaded, so a publish that fails at any later point leaves no marker. `--invalidate` does only that;
 `run_all.sh` runs it for every run that will train further, before training, because training can replace
-`best/`. If a marker cannot be withdrawn (token, network), that launch stops with `FAILED` before any training.
+`best/`; the local marker is always removed. If the Hub marker cannot be withdrawn (Hugging Face outage, token),
+the run gets `runs/<mode>/MARKER_STALE` with the reason, a `WARNING` is logged and training goes on (an outage
+must not cost training budget). `MARKER_STALE` is removed only after a verified new marker is written; while it
+exists the run does not count as uploaded (`--status` prints `no (stale marker could not be withdrawn ...)`).
 
 Verification: after the commit the repo is listed again and every file is compared with the local copy (LFS files
 by sha256 and size, small files by their git blob id and size). The listed LFS sha256 is the hash the uploading
 client declared, so every LFS file (the weights) is then also downloaded back at the verified revision
 (`hf_hub_download(..., force_download=True)` into a temp dir under `RUN_DIR`, deleted right after) and its sha256
-recomputed. Only if all match is `RUN_DIR/UPLOADED.json` written (repo id, the verified revision, best step, every
+recomputed. Before the first download it checks that 1.2 x the largest weight file is free under `RUN_DIR`, and
+fails otherwise (on RunPod: `PUBLISH_FAILED`, the pod is still terminated). The CLI turns SIGTERM (the stage's
+`timeout`, a pod shutdown) into a clean exit (status 143) so the temp copy is removed, and every publish starts by
+deleting `.tmp-download-*` dirs an earlier killed publish left (logged). Only if all match is `RUN_DIR/UPLOADED.json` written (repo id, the verified revision, best step, every
 file's sha256 and size, time) and a copy without the revision and time committed to the repo. A re-run uploads no
 file whose hash is unchanged (it only withdraws and re-commits the marker, and downloads the weights back again).
 Network errors (connection, timeout, HTTP 5xx/429) are retried up to 4 attempts with waits of 2, 5 and 15 s.
@@ -127,7 +133,8 @@ When is it safe to delete the RunPod volume? `bash scripts/runpod/launch.sh --st
 with its best step and one of:
 - `safe to delete the volume: yes`: both repos hold `UPLOADED.json` and, read through the running pod, each one
   was written for the `best/meta.json` the volume holds now;
-- `no`: a marker is missing, or it is for an older `best/` than the volume holds (publish again);
+- `no`: a marker is missing, it is for an older `best/` than the volume holds, or the run has `MARKER_STALE`
+  (publish again);
 - `unknown`: no running pod, so the volume cannot be compared. Markers are withdrawn at the start of every launch
   that trains, and the pod's own check is in the last `run_all-*.log` ("safe to delete the volume", logged only when
   both `runs/*/UPLOADED.json` match the current `best/meta.json`). Start a pod (or read that log) to be sure.

@@ -137,8 +137,8 @@ main() {
   export DEADLINE_UNIX RESERVE_S
   now=$(date +%s)
   _runpod_log "budget \$$BUDGET_USD at \$$PRICE_PER_HOUR/h: deadline in $(((deadline - now) / 60)) min, reserve $((RESERVE_S / 60)) min for eval and report"
-  # Fail closed: a run that trains further gets a new best/, so its upload markers (local and on the Hub) are
-  # withdrawn first; a marker that cannot be withdrawn stops the launch (FAILED) before any training.
+  # A run that trains further gets a new best/, so its upload markers (local and on the Hub) are withdrawn first;
+  # a Hub marker that cannot be withdrawn leaves runs/<mode>/MARKER_STALE and training goes on.
   invalidate_uploads "$total_steps"
   train_and_report "$total_steps" "$chunk_steps"
   stage publish
