@@ -20,7 +20,7 @@ import pytest
 import requests
 import torch
 from huggingface_hub import CommitOperationAdd, CommitOperationDelete
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 from huggingface_hub.hf_api import RepoFile, RepoFolder
 from peft import PeftModel
 from transformers import AutoModelForCausalLM
@@ -39,6 +39,7 @@ from drbm25.publish import (
     VerificationError,
     build_model_card,
     check_write_access,
+    invalidate_run,
     load_run,
     model_slug,
     publish_run,
@@ -72,6 +73,19 @@ class _Info:
     sha: str | None
 
 
+@dataclass(frozen=True)
+class _Declared:
+    """What the uploading client declared for a file (the Hub's tree reports this, not the stored bytes)."""
+
+    size: int
+    sha256: str
+    blob: str
+
+
+def _declared(data: bytes) -> _Declared:
+    return _Declared(size=len(data), sha256=hashlib.sha256(data).hexdigest(), blob=_git_blob_sha1(data))
+
+
 @dataclass
 class FakeHub:
     """Stores each repo under ``root/<repo_id>/`` so ``from_pretrained(root / repo_id)`` loads what was uploaded."""
@@ -82,6 +96,9 @@ class FakeHub:
     fine_grained: dict[str, Any] | None = None
     lfs_suffixes: tuple[str, ...] = (".safetensors",)
     corrupt: set[str] = field(default_factory=set)  # paths reported with a wrong hash after upload
+    corrupt_storage: set[str] = field(default_factory=set)  # stored bytes damaged; the declared hash stays right
+    declared: dict[tuple[str, str], _Declared] = field(default_factory=dict)
+    downloads: list[str] = field(default_factory=list)
     drop: set[str] = field(default_factory=set)  # paths silently not stored by a commit
     network_failures: int = 0  # the next N create_commit calls raise ConnectionError before doing anything
     commit_error: Exception | None = None  # every create_commit raises this
@@ -111,7 +128,9 @@ class FakeHub:
         if self.info_errors:
             raise self.info_errors.pop(0)
         if not (self.root / repo_id).is_dir():
-            raise FileNotFoundError(repo_id)
+            response = requests.Response()
+            response.status_code = 404
+            raise RepositoryNotFoundError(f"{repo_id} not found", response=response)
         return _Info(sha=self._head())
 
     def list_repo_tree(
@@ -123,14 +142,27 @@ class FakeHub:
         out: list[RepoFile | RepoFolder] = []
         for path in sorted(p for p in base.rglob("*") if p.is_file()):
             rel = path.relative_to(base).as_posix()
-            data = path.read_bytes()
+            meta = self.declared[(repo_id, rel)]
             if rel in self.corrupt:
-                data = data + b"x"
+                meta = _declared(path.read_bytes() + b"x")
             lfs = None
             if rel.endswith(self.lfs_suffixes):
-                lfs = {"size": len(data), "oid": hashlib.sha256(data).hexdigest(), "pointerSize": 134}
-            out.append(RepoFile(path=rel, size=len(data), oid=_git_blob_sha1(data), lfs=lfs))
+                lfs = {"size": meta.size, "oid": meta.sha256, "pointerSize": 134}
+            out.append(RepoFile(path=rel, size=meta.size, oid=meta.blob, lfs=lfs))
         return out
+
+    def hf_hub_download(
+        self, repo_id: str, filename: str, *, revision: str | None = None, local_dir: str | Path | None = None,
+        force_download: bool = False,
+    ) -> str:
+        assert revision == self._head()
+        assert force_download, "a download-back check must never reuse a local copy"
+        assert local_dir is not None
+        self.downloads.append(filename)
+        target = Path(local_dir) / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.root / repo_id / filename, target)
+        return str(target)
 
     def create_commit(
         self,
@@ -152,6 +184,7 @@ class FakeHub:
         for op in operations:
             if isinstance(op, CommitOperationDelete):
                 (self.root / repo_id / op.path_in_repo).unlink()
+                del self.declared[(repo_id, op.path_in_repo)]
                 paths.append(f"-{op.path_in_repo}")
                 continue
             paths.append(op.path_in_repo)
@@ -161,11 +194,15 @@ class FakeHub:
             target.parent.mkdir(parents=True, exist_ok=True)
             src = op.path_or_fileobj
             if isinstance(src, bytes):
-                target.write_bytes(src)
+                data = src
             elif isinstance(src, str | Path):
-                shutil.copyfile(src, target)
+                data = Path(src).read_bytes()
             else:
                 raise TypeError(f"unexpected path_or_fileobj {type(src).__name__}")
+            self.declared[(repo_id, op.path_in_repo)] = _declared(data)
+            if op.path_in_repo in self.corrupt_storage:
+                data = data + b"\0"
+            target.write_bytes(data)
         self.commits.append(paths)
         self.commit_messages.append(commit_message)
         return object()
@@ -399,6 +436,7 @@ def test_publish_uploads_verifies_and_writes_the_marker(tmp_path: Path) -> None:
     assert result.repo_id == "tester/drbm25-tiny-local-normal"
     assert hub.created == [(result.repo_id, True)]
     assert len(hub.commits) == 2  # the files, then UPLOADED.json
+    assert hub.downloads == ["model.safetensors"]  # every LFS (weight) file is downloaded back and hashed
     assert "best step 40" in hub.commit_messages[0]
     assert "a" * 40 in hub.commit_messages[0]
     marker = json.loads((run.run_dir / UPLOADED_FILE).read_text())
@@ -440,7 +478,8 @@ def test_rerun_skips_files_already_on_the_hub(tmp_path: Path) -> None:
     first = _publish(hub, run)
     commits_after_first = len(hub.commits)
     second = _publish(hub, run)
-    assert len(hub.commits) == commits_after_first  # nothing new: no file commit, no marker commit
+    # No file is uploaded again; only the marker is withdrawn at the start and re-committed after verification.
+    assert hub.commits[commits_after_first:] == [[f"-{UPLOADED_FILE}"], [UPLOADED_FILE]]
     assert second.uploaded == []
     assert second.repo_id == first.repo_id
     assert (run.run_dir / UPLOADED_FILE).is_file()
@@ -457,7 +496,7 @@ def test_rerun_uploads_only_the_changed_file(tmp_path: Path) -> None:
     assert result.uploaded == ["provenance/report.md"]
 
 
-def test_a_changed_upload_deletes_the_stale_hub_marker_in_the_same_commit(tmp_path: Path) -> None:
+def test_publish_withdraws_both_markers_before_uploading(tmp_path: Path) -> None:
     hub = FakeHub(tmp_path / "hub")
     run = _make_run(tmp_path, layout="full", weights={"w": torch.zeros(2)})
     first = _publish(hub, run)
@@ -466,8 +505,40 @@ def test_a_changed_upload_deletes_the_stale_hub_marker_in_the_same_commit(tmp_pa
     hub.drop = {"provenance/report.md"}  # this upload never verifies
     with pytest.raises(VerificationError):
         _publish(hub, run)
-    assert hub.commits[2] == ["provenance/report.md", f"-{UPLOADED_FILE}"]
+    assert hub.commits[2] == [f"-{UPLOADED_FILE}"]  # withdrawn before anything was staged or uploaded
     assert not (hub.root / first.repo_id / UPLOADED_FILE).exists()
+    assert not (run.run_dir / UPLOADED_FILE).exists()
+
+
+def test_corrupted_stored_weights_with_a_correct_declared_hash_fail_the_download_check(tmp_path: Path) -> None:
+    hub = FakeHub(tmp_path / "hub", corrupt_storage={"model.safetensors"})
+    run = _make_run(tmp_path, layout="full", weights={"w": torch.zeros(2)})
+    with pytest.raises(VerificationError, match=r"model\.safetensors.*downloaded"):
+        _publish(hub, run)
+    assert not (run.run_dir / UPLOADED_FILE).exists()
+    assert not (hub.root / "tester/drbm25-tiny-local-normal" / UPLOADED_FILE).exists()
+    assert not list(run.run_dir.glob(".tmp-download*"))  # the downloaded copy is removed
+
+
+def test_invalidate_withdraws_the_hub_and_local_markers(tmp_path: Path) -> None:
+    hub = FakeHub(tmp_path / "hub")
+    run = _make_run(tmp_path, layout="full", weights={"w": torch.zeros(2)})
+    result = _publish(hub, run)
+    invalidate_run(hub, run.run_dir, namespace=None, repo_prefix="drbm25", sleep=lambda _s: None)
+    assert not (run.run_dir / UPLOADED_FILE).exists()
+    assert not (hub.root / result.repo_id / UPLOADED_FILE).exists()
+    assert (hub.root / result.repo_id / "model.safetensors").is_file()  # only the marker goes
+
+
+def test_invalidate_without_a_repo_or_a_manifest_changes_nothing(tmp_path: Path) -> None:
+    hub = FakeHub(tmp_path / "hub")
+    run = _make_run(tmp_path, layout="full", weights={"w": torch.zeros(2)})
+    invalidate_run(hub, run.run_dir, namespace=None, repo_prefix="drbm25", sleep=lambda _s: None)  # no repo yet
+    empty = tmp_path / "runs-empty" / "normal"
+    empty.mkdir(parents=True)
+    invalidate_run(hub, empty, namespace=None, repo_prefix="drbm25", sleep=lambda _s: None)  # nothing trained yet
+    assert hub.commits == []
+    assert hub.created == []
 
 
 def test_network_errors_are_retried_a_bounded_number_of_times(tmp_path: Path) -> None:
@@ -587,3 +658,7 @@ def test_cli_says_safe_to_delete_only_after_both_runs(
     assert _cli(["--run-dir", str(count_once.run_dir), "--public"]) == 0
     assert "safe to delete the volume" in capsys.readouterr().out
     assert hub.created[-1] == ("tester/drbm25-tiny-local-count_once", False)
+
+    assert _cli(["--run-dir", str(normal.run_dir), "--invalidate"]) == 0
+    assert not (normal.run_dir / UPLOADED_FILE).exists()
+    assert not (hub.root / "tester/drbm25-tiny-local-normal" / UPLOADED_FILE).exists()

@@ -1,7 +1,7 @@
 """Publish a run's selected policy, with its provenance and results, to the Hugging Face Hub, verified.
 
     python -m drbm25.publish --run-dir DIR [--eval-jsonl F] [--report F] [--namespace N]
-        [--repo-prefix P] [--private | --public] [--code-url URL] [--dry-run]
+        [--repo-prefix P] [--private | --public] [--code-url URL] [--dry-run | --invalidate]
 
 One private model repo per run, ``<namespace>/<prefix>-<model slug>-<reward mode>`` (namespace: the
 ``HF_TOKEN`` owner from ``whoami`` unless ``--namespace``; slug ``qwen2.5-3b`` for a full fine-tune,
@@ -15,10 +15,14 @@ One private model repo per run, ``<namespace>/<prefix>-<model slug>-<reward mode
                 license, which requires it), ``provenance/best_meta.json``, ``provenance/run_manifest.json``,
                 ``provenance/trained-<mode>.jsonl`` (the test-set eval), ``provenance/report.md``.
 
-Resume checkpoints (optimizer state) are never uploaded. Only files whose hash differs from the Hub copy
-are committed, so a re-run uploads nothing new. After the commit the repo tree is read back and every file
-is compared with the local one: LFS files by sha256 and size, regular files by git blob id and size. Only
-when all match is ``UPLOADED.json`` committed to the repo and written to ``<run_dir>/UPLOADED.json``. When
+Resume checkpoints (optimizer state) are never uploaded. Fail closed: a publish first withdraws both
+``UPLOADED.json`` markers (``<run_dir>/`` and the repo's); ``--invalidate`` does only that, and run_all.sh
+runs it before any launch trains a run further. Only files whose hash differs from the Hub copy are committed,
+so a re-run uploads no file again. After the commit the repo tree is read back and every file is compared
+with the local one: LFS files by sha256 and size, regular files by git blob id and size; then every LFS file
+(the weights) is downloaded back and its sha256 recomputed, because the tree's LFS hash is the one the
+uploading client declared. Only when all match is ``UPLOADED.json`` committed to the repo and written to
+``<run_dir>/UPLOADED.json``. When
 both runs of the volume (``normal`` and ``count_once`` beside ``run_dir``) have a current marker, the CLI
 logs "safe to delete the volume".
 
@@ -52,7 +56,7 @@ from typing import Any, Final, Protocol
 import requests
 import yaml
 from huggingface_hub import CommitOperationAdd, CommitOperationDelete
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 from huggingface_hub.hf_api import RepoFile, RepoFolder
 from peft import LoraConfig
 from safetensors.torch import load_file, save_file
@@ -118,6 +122,16 @@ class HubApi(Protocol):
         commit_message: str,
         parent_commit: str | None = ...,
     ) -> object: ...
+
+    def hf_hub_download(
+        self,
+        repo_id: str,
+        filename: str,
+        *,
+        revision: str | None = ...,
+        local_dir: str | Path | None = ...,
+        force_download: bool = ...,
+    ) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -486,26 +500,16 @@ def _commit_missing(
     *,
     message: str,
     sleep: Callable[[float], None],
-    delete_marker: bool = False,
 ) -> tuple[str, list[str]]:
     """Commit the files whose Hub copy differs, re-reading the tree on every attempt, so a retry after a
-    commit whose response was lost uploads nothing twice. Returns (head after, paths committed).
-
-    ``delete_marker``: the same commit removes the repo's UPLOADED.json, so the Hub never shows a
-    verification marker next to files that have not been verified yet.
-    """
+    commit whose response was lost uploads nothing twice. Returns (head after, paths committed)."""
     committed: list[str] = []
     for attempt in range(1, _ATTEMPTS + 1):
         head = _head(api, repo_id, sleep)
-        tree = _tree(api, repo_id, head, sleep)
-        missing = files_to_upload(digests, tree)
+        missing = files_to_upload(digests, _tree(api, repo_id, head, sleep))
         if not missing:
             return head, committed
-        ops: list[CommitOperationAdd | CommitOperationDelete] = [
-            CommitOperationAdd(path_in_repo=p, path_or_fileobj=files[p]) for p in missing
-        ]
-        if delete_marker and UPLOADED_FILE in _remote_files(tree):
-            ops.append(CommitOperationDelete(path_in_repo=UPLOADED_FILE))
+        ops = [CommitOperationAdd(path_in_repo=p, path_or_fileobj=files[p]) for p in missing]
         try:
             api.create_commit(repo_id, ops, commit_message=message, parent_commit=head)
         except (requests.RequestException, HfHubHTTPError) as exc:
@@ -544,11 +548,17 @@ def publish_run(
 ) -> PublishResult | None:
     """Upload ``run`` and verify it; write ``UPLOADED.json`` only after verification. None on ``dry_run``.
 
-    The token's write access is checked before anything is created or uploaded.
+    Fails closed: both markers (``run_dir/UPLOADED.json`` and the repo's) are withdrawn before anything is
+    staged or uploaded, so a publish that fails at any later point leaves no marker. The token's write access
+    is checked before anything is created or uploaded. A dry run changes nothing, markers included.
     """
+    if not dry_run:
+        (run.run_dir / UPLOADED_FILE).unlink(missing_ok=True)
     user = check_write_access(_with_retries(api.whoami, sleep=sleep))
-    slug = model_slug(run.model_name, run.meta.layout)
-    repo_id = f"{namespace or user}/{repo_prefix}-{slug}-{run.meta.reward_mode}"
+    repo_id = _repo_id(namespace or user, repo_prefix, run.model_name, run.meta.layout, run.meta.reward_mode)
+    if not dry_run:
+        _with_retries(lambda: api.create_repo(repo_id, private=private, exist_ok=True), sleep=sleep)
+        _withdraw_remote_marker(api, repo_id, sleep=sleep)
     with tempfile.TemporaryDirectory(prefix="drbm25-publish-") as tmp:
         plan = stage_files(run, base_fetcher, Path(tmp), repo_id=repo_id, code_url=code_url)
         digests = {path: digest(local) for path, local in plan.items()}
@@ -556,13 +566,12 @@ def publish_run(
             for path in sorted(plan):
                 logger.info("dry run: would upload %s (%d bytes) from %s to %s", path, digests[path].size, plan[path], repo_id)
             return None
-        _with_retries(lambda: api.create_repo(repo_id, private=private, exist_ok=True), sleep=sleep)
         git = run.meta.git_sha or "unknown"
         message = f"drbm25 {run.meta.reward_mode}: best step {run.meta.step} (code {git})"
-        revision, uploaded = _commit_missing(
-            api, repo_id, dict(plan), digests, message=message, sleep=sleep, delete_marker=True
-        )
-        verify_remote(digests, _tree(api, repo_id, revision, sleep))
+        revision, uploaded = _commit_missing(api, repo_id, dict(plan), digests, message=message, sleep=sleep)
+        tree = _tree(api, repo_id, revision, sleep)
+        verify_remote(digests, tree)
+        _verify_downloads(api, repo_id, revision, digests, tree, workdir=run.run_dir, sleep=sleep)
     files = {path: {"sha256": d.sha256, "size": d.size} for path, d in sorted(digests.items())}
     marker = {
         "repo_id": repo_id,
@@ -578,11 +587,101 @@ def publish_run(
     return PublishResult(repo_id=repo_id, revision=revision, uploaded=uploaded)
 
 
+def _repo_id(namespace: str, prefix: str, model_name: str, train_mode: str, reward_mode: str) -> str:
+    return f"{namespace}/{prefix}-{model_slug(model_name, train_mode)}-{reward_mode}"
+
+
+def _withdraw_remote_marker(api: HubApi, repo_id: str, *, sleep: Callable[[float], None]) -> None:
+    """Delete the repo's UPLOADED.json if it has one (nothing when the repo does not exist).
+
+    The tree is re-read on every attempt, so a retry after a delete whose response was lost does nothing.
+    """
+    for attempt in range(1, _ATTEMPTS + 1):
+        try:
+            head = _head(api, repo_id, sleep)
+        except RepositoryNotFoundError:
+            logger.info("%s does not exist yet: no Hub marker to withdraw", repo_id)
+            return
+        if UPLOADED_FILE not in _remote_files(_tree(api, repo_id, head, sleep)):
+            return
+        try:
+            api.create_commit(
+                repo_id,
+                [CommitOperationDelete(path_in_repo=UPLOADED_FILE)],
+                commit_message="drbm25: withdraw UPLOADED.json (a new upload or more training follows)",
+                parent_commit=head,
+            )
+        except (requests.RequestException, HfHubHTTPError) as exc:
+            if attempt == _ATTEMPTS or not _is_network_error(exc):
+                raise
+            logger.warning("withdrawing the marker of %s failed; retry %d/%d", repo_id, attempt, _ATTEMPTS - 1, exc_info=True)
+            sleep(_BACKOFF_S[attempt - 1])
+            continue
+        logger.info("withdrew %s from %s", UPLOADED_FILE, repo_id)
+        return
+
+
+def _verify_downloads(
+    api: HubApi,
+    repo_id: str,
+    revision: str,
+    local: Mapping[str, FileDigest],
+    tree: Iterable[RepoFile | RepoFolder],
+    *,
+    workdir: Path,
+    sleep: Callable[[float], None],
+) -> None:
+    """Download every LFS file (the weights) back at ``revision`` and compare its sha256 and size with the local file.
+
+    The tree's LFS sha256 is the hash the uploading client declared, so it alone does not prove what the Hub
+    stores. Each copy goes to its own temp dir under ``workdir`` (the run's volume: /tmp on an Expanse login
+    node is small) with ``force_download``, and is deleted before the next one.
+    """
+    remote = _remote_files(tree)
+    problems: list[str] = []
+    for path in sorted(p for p in local if (f := remote.get(p)) is not None and f.lfs is not None):
+        with tempfile.TemporaryDirectory(dir=workdir, prefix=".tmp-download-") as tmp:
+            downloaded = _with_retries(
+                lambda p=path, d=tmp: api.hf_hub_download(repo_id, p, revision=revision, local_dir=d, force_download=True),
+                sleep=sleep,
+            )
+            got = digest(Path(downloaded))
+        if (got.sha256, got.size) != (local[path].sha256, local[path].size):
+            problems.append(f"{path}: downloaded copy sha256/size {got.sha256}/{got.size} != local {local[path].sha256}/{local[path].size}")
+        else:
+            logger.info("downloaded %s back from %s: sha256 matches", path, repo_id)
+    if problems:
+        raise VerificationError("Hub copy does not match: " + "; ".join(problems))
+
+
+def invalidate_run(
+    api: HubApi, run_dir: Path, *, namespace: str | None, repo_prefix: str, sleep: Callable[[float], None] = time.sleep
+) -> None:
+    """Withdraw ``run_dir/UPLOADED.json`` and the run's Hub marker before training changes best/ (fail closed).
+
+    Without a run manifest the run never trained, so it was never published from this run directory.
+    """
+    (run_dir / UPLOADED_FILE).unlink(missing_ok=True)
+    manifest = read_manifest(run_dir)
+    if manifest is None:
+        logger.info("%s has no %s: nothing was published from it", run_dir, MANIFEST_FILE)
+        return
+    user = check_write_access(_with_retries(api.whoami, sleep=sleep))
+    repo_id = _repo_id(
+        namespace or user,
+        repo_prefix,
+        str(manifest["model"]["name"]),
+        str(manifest["config"]["model"]["train_mode"]),
+        str(manifest["reward_mode"]),
+    )
+    _withdraw_remote_marker(api, repo_id, sleep=sleep)
+
+
 def _publish_remote_marker(api: HubApi, marker: Mapping[str, Any], *, sleep: Callable[[float], None]) -> None:
     """Commit UPLOADED.json to the repo (``launch.sh --status`` reads it once the pod is gone) and verify it.
 
-    The Hub copy leaves out ``revision`` and ``verified_at`` so that it is byte-identical on a re-run of an
-    unchanged run, which then commits nothing; it is committed on top of the verified revision.
+    The Hub copy leaves out ``revision`` and ``verified_at`` (it is committed on top of the verified revision);
+    ``launch.sh --status`` compares its ``provenance/best_meta.json`` sha256 with the volume's best/meta.json.
     """
     repo_id = str(marker["repo_id"])
     remote = {k: marker[k] for k in ("repo_id", "reward_mode", "best_step", "files")}
@@ -621,7 +720,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     visibility.add_argument("--private", dest="private", action="store_true", default=True, help="(default)")
     visibility.add_argument("--public", dest="private", action="store_false")
     parser.add_argument("--code-url", default=DEFAULT_CODE_URL, help="https URL of the code repository")
-    parser.add_argument("--dry-run", action="store_true", help="list what would be uploaded; no Hub writes")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="list what would be uploaded; no Hub writes")
+    mode.add_argument(
+        "--invalidate",
+        action="store_true",
+        help="only withdraw RUN_DIR/UPLOADED.json and the repo's copy (run_all.sh does this before training)",
+    )
     return parser.parse_args(argv)
 
 
@@ -631,9 +736,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ns = _parse_args(argv)
     configure(level="INFO", fmt="json")
-    run = load_run(ns.run_dir, eval_jsonl=ns.eval_jsonl, report=ns.report)
     # HfApi reads HF_TOKEN from the environment; the token is never passed around or logged here.
     api: HubApi = HfApi()
+    if ns.invalidate:
+        invalidate_run(api, ns.run_dir, namespace=ns.namespace, repo_prefix=ns.repo_prefix)
+        return 0
+    run = load_run(ns.run_dir, eval_jsonl=ns.eval_jsonl, report=ns.report)
     result = publish_run(
         api,
         run,
@@ -653,3 +761,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

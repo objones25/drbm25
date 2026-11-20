@@ -85,7 +85,7 @@ jsonl files plus `report.md` are logged as one artifact, `eval-results` (type `e
 
 ```bash
 uv run python -m drbm25.publish --run-dir RUN_DIR [--eval-jsonl F] [--report F] [--namespace N] \
-  [--repo-prefix drbm25] [--private | --public] [--code-url URL] [--dry-run]
+  [--repo-prefix drbm25] [--private | --public] [--code-url URL] [--dry-run | --invalidate]
 ```
 
 The RunPod launcher runs this for both runs after the report; on Expanse run it from the login node (step 8
@@ -109,19 +109,34 @@ created or uploaded. Each run goes to its own repo, private unless `--public`:
 Resume checkpoints (optimizer state) are never uploaded. `load_run` refuses an eval file that scores a different
 best step, or a report whose row for the run disagrees with the eval file.
 
-Verification: after the commit the repo is listed again and every file is compared with the local copy (LFS files
-by sha256 and size, small files by their git blob id and size). Only if all match is `RUN_DIR/UPLOADED.json`
-written (repo id, the verified revision, best step, every file's sha256 and size, time) and a copy without the
-revision and time committed to the repo (so an unchanged re-run commits nothing). A commit that changes files also
-deletes the repo's old `UPLOADED.json`, so the Hub never shows the marker beside unverified files.
-A re-run uploads only files whose hash changed, so running it again is safe and cheap. Network errors (connection,
-timeout, HTTP 5xx/429) are retried up to 4 attempts with waits of 2, 5 and 15 s.
+Fail closed: a publish first deletes `RUN_DIR/UPLOADED.json` and the repo's `UPLOADED.json`, before anything is
+staged or uploaded, so a publish that fails at any later point leaves no marker. `--invalidate` does only that;
+`run_all.sh` runs it for every run that will train further, before training, because training can replace
+`best/`. If a marker cannot be withdrawn (token, network), that launch stops with `FAILED` before any training.
 
-When is it safe to delete the RunPod volume? When `bash scripts/runpod/launch.sh --status` prints
-`safe to delete the volume: yes` (both repos hold `UPLOADED.json`), or `drbm25.publish` logged "safe to delete
-the volume" (both `runs/*/UPLOADED.json` match the current `best/meta.json`). If `PUBLISH_FAILED` exists, keep the
-volume and publish again. The upload covers the selected policies and results, not the resume checkpoints: after
-deleting the volume a run cannot be resumed.
+Verification: after the commit the repo is listed again and every file is compared with the local copy (LFS files
+by sha256 and size, small files by their git blob id and size). The listed LFS sha256 is the hash the uploading
+client declared, so every LFS file (the weights) is then also downloaded back at the verified revision
+(`hf_hub_download(..., force_download=True)` into a temp dir under `RUN_DIR`, deleted right after) and its sha256
+recomputed. Only if all match is `RUN_DIR/UPLOADED.json` written (repo id, the verified revision, best step, every
+file's sha256 and size, time) and a copy without the revision and time committed to the repo. A re-run uploads no
+file whose hash is unchanged (it only withdraws and re-commits the marker, and downloads the weights back again).
+Network errors (connection, timeout, HTTP 5xx/429) are retried up to 4 attempts with waits of 2, 5 and 15 s.
+
+When is it safe to delete the RunPod volume? `bash scripts/runpod/launch.sh --status` prints each run's Hub marker
+with its best step and one of:
+- `safe to delete the volume: yes`: both repos hold `UPLOADED.json` and, read through the running pod, each one
+  was written for the `best/meta.json` the volume holds now;
+- `no`: a marker is missing, or it is for an older `best/` than the volume holds (publish again);
+- `unknown`: no running pod, so the volume cannot be compared. Markers are withdrawn at the start of every launch
+  that trains, and the pod's own check is in the last `run_all-*.log` ("safe to delete the volume", logged only when
+  both `runs/*/UPLOADED.json` match the current `best/meta.json`). Start a pod (or read that log) to be sure.
+If `PUBLISH_FAILED` exists, keep the volume and publish again. The upload covers the selected policies and results,
+not the resume checkpoints: after deleting the volume a run cannot be resumed.
+
+Before making a repo public (`--public`, or later on the Hub), read `provenance/run_manifest.json`: it records the
+machine's hostname, GPU and driver, and the resolved config including absolute paths (for example
+`/workspace/drbm25/...` or your Expanse project directory).
 
 Loading a published model (private repos need a token with read access):
 
@@ -332,7 +347,11 @@ The pod is terminated through the RunPod API (the documented way to stop GPU bil
 - `pod_bootstrap.sh`, on exit: after `run_all.sh` returns, after a skipped run, or after any failure. Failures
   include a failed clone and a volume that is not writable (it then logs to `/tmp`). Its exit trap is in place
   before any step that can fail.
-- A watchdog process, started first, at `DRBM25_HARD_DEADLINE_UNIX`, whatever the run is doing.
+- A watchdog process, started first, at `DRBM25_HARD_DEADLINE_UNIX`, whatever the run is doing. That is 1 h
+  after the budget deadline, and the evaluation, report and uploads are budgeted inside `RESERVE_S` before the
+  budget deadline, so the watchdog only cuts in when they overrun their estimate by more than an hour (the margin
+  is kept at least as long as one upload's timeout, `PUBLISH_TIMEOUT_S`, 30 min). A cut-off upload leaves no
+  marker; the data stays on the volume.
 
 Every terminate call tries your key (the `drbm25_runpod_api_key` secret) first, then the pod-scoped
 `RUNPOD_API_KEY` that RunPod injects into every pod. This covers a secret that was deleted or never replaced.
@@ -356,7 +375,7 @@ cost, it prints a warning. Standard network volume storage was $0.07/GB/month fo
 docs, as of 2026-11-20): 400 GB is about $28/month, billed until you delete the volume.
 
 Suggested budget: **$160** (the project's cap). At $4.18-4.38/h it buys 36.5-38.3 h, one hour of which is
-reserved for evaluation and the report (`RESERVE_S`). Whether 1,751 steps fit is not known in advance: the
+reserved for evaluation, the report and the uploads (`RESERVE_S`, 1.5 h). Whether 1,751 steps fit is not known in advance: the
 trainer times the first 10 PPO steps and logs `budget/projected_steps` (to `metrics.jsonl`, the log and W&B),
 computed as steps done + (deadline - reserve - now) / mean step time. Read it after the first 10 steps of the
 first chunk. Each run's projection counts only its own step time, but both runs share the clock in alternating
@@ -374,8 +393,9 @@ bash scripts/runpod/launch.sh --stop --yes
 ```
 
 `--status` prints the pod's id, status, hourly cost and data center, then asks the Hub whether each run's repo
-holds `UPLOADED.json` and prints `safe to delete the volume: yes` only when both do (this works after the pod is
-gone; see "Publishing results"). `--logs` runs a fixed read-only command
+holds `UPLOADED.json` (with its best step) and prints `safe to delete the volume: yes` only when both markers
+match the volume's current `best/`, read through the running pod; without a pod it prints `unknown` (see
+"Publishing results"). `--logs` runs a fixed read-only command
 in the pod through RunPod's exec API and prints the FAILED marker (if any), `spend.json` and the last 40 lines of
 the newest `logs/bootstrap-*.log` and `logs/run_all-*.log` (plus `PUBLISH_FAILED` and each run's `UPLOADED.json`). `--watch` repeats status and the last 10 log lines
 until the pod is gone. `--stop` terminates the pod after you type `yes` (`--stop --yes` without asking); the
@@ -413,7 +433,8 @@ asks anything: a missing setting, or a secret reference RunPod did not replace (
    the saved one, and once either run has a checkpoint the saved size is the only one checked: if it fails on
    a new pod, `FAILED` is written instead of stepping down, so both runs train every step at the same micro
    batch), training, evaluation of each run's `best/` policy, report, and publishing both runs to the Hugging
-   Face Hub (`python -m drbm25.publish`, at most 1 h per run; a failure writes `/workspace/drbm25/PUBLISH_FAILED`,
+   Face Hub (`python -m drbm25.publish`, at most 30 min per run including the download-back check; before
+   training, each run that will train has its upload markers withdrawn, see "Publishing results"; a failure writes `/workspace/drbm25/PUBLISH_FAILED`,
    logs an `ERROR` and still ends the launch normally and terminates the pod, so a relaunch only needs to publish
    again). Data and model stages leave markers in `/workspace/drbm25/.done/` and are skipped on
    a re-run; Java, uv, `uv sync` and training run every launch (training resumes from the latest checkpoint), and the
@@ -427,8 +448,8 @@ asks anything: a missing setting, or a secret reference RunPod did not replace (
    record and a restart is not counted. Spend (elapsed time x price) is written to `/workspace/drbm25/spend.json`
    after every chunk and on exit, so a relaunch shows the total already spent; give it the remaining budget, not the
    original one. Training stops at the next
-   checkpoint boundary once one more chunk would end less than `RESERVE_S` (default 3600 s, an unmeasured
-   estimate for four evaluation runs, the report and the terminate call; it does not budget for the upload) before the deadline; override with
+   checkpoint boundary once one more chunk would end less than `RESERVE_S` (default 5400 s: an unmeasured 1 h
+   for four evaluation runs and the report plus 30 min for the two uploads, and the terminate call) before the deadline; override with
    `RESERVE_S=...`. The chunk estimate is the larger of the trainer's own (mean step time x `run.ckpt_every`)
    and the previous chunk's wall-clock, which the launcher measures and passes as `--prev-chunk-s` (it includes
    torchrun start, model loads, vLLM init, validation and the checkpoint save). Both runs advance in chunks of

@@ -27,7 +27,8 @@
 # Hugging Face Hub API (base https://huggingface.co, bearer HF_TOKEN), the endpoints huggingface_hub 0.36.2 calls
 # (read from its installed source on 2026-11-20):
 #   GET /api/whoami-v2                       HfApi.whoami; the token role is .auth.accessToken.role
-#   GET /api/models/{repo_id}/tree/{rev}     HfApi.list_repo_tree (root entries: {type, path, ...})
+#   GET /{repo_id}/resolve/{rev}/{filename}  hf_hub_download (constants.HUGGINGFACE_CO_URL_TEMPLATE); a small
+#                                            JSON file is served directly (no LFS redirect is followed here)
 # Test hooks (environment): DRBM25_TTY (file read instead of /dev/tty), DRBM25_SLEEP (command used to wait).
 
 set -Eeuo pipefail
@@ -86,7 +87,15 @@ readonly WATCH_LOG_LINES=10
 readonly WATCH_MAX_POLLS=2000 # 2000 x 10 min is about 14 days, longer than any budget buys
 readonly CONSOLE_URL=https://console.runpod.io/pods
 # The pod's watchdog terminates it at launch + budget / price + this margin, whatever the run is doing.
+# Evaluation, report and uploads are budgeted inside run_all.sh's RESERVE_S (5400 s) before the budget deadline, so this
+# margin is slack for an overrun; keep it >= lib.sh PUBLISH_TIMEOUT_S (a bats test checks this).
 readonly HARD_DEADLINE_MARGIN_S=3600
+# Run inside the pod by --status: the sha256 of each run's best/meta.json, compared with the Hub's UPLOADED.json.
+# shellcheck disable=SC2016 # expanded by the pod's shell, not here
+readonly VOLUME_SHA_SCRIPT='cd /workspace/drbm25/runs 2>/dev/null || exit 0
+for m in normal count_once; do
+  if [ -f "$m/best/meta.json" ]; then echo "$m $(sha256sum "$m/best/meta.json" | cut -d " " -f 1)"; else echo "$m none"; fi
+done'
 # Run inside the pod by --logs and --watch (sh -c, fixed text; the line count comes in through env).
 # shellcheck disable=SC2016 # expanded by the pod's shell, not here
 readonly LOG_SCRIPT='cd /workspace/drbm25 2>/dev/null || { echo "no /workspace/drbm25 yet (the pod is still starting)"; exit 0; }
@@ -128,7 +137,7 @@ Launch options:
 
 Other modes:
   --status           print the $POD_NAME pod's id, status, price and data center, and whether each run's
-                     Hugging Face repo holds UPLOADED.json (then the volume is safe to delete)
+                     Hugging Face repo holds UPLOADED.json for the best/ on the volume (yes, no, or unknown without a pod)
   --logs             print the FAILED marker, spend and the last $LOG_LINES lines of the newest logs (via the exec API)
   --watch            poll status and logs every --interval-min minutes (default 10) until the pod is gone
   --stop             terminate the pod after you type 'yes' (the volume and its data are kept);
@@ -271,32 +280,70 @@ runpod_model_slug() {
   printf '%s\n' "$name"
 }
 
-# Prints, per run, whether its repo on the Hub holds UPLOADED.json (committed by drbm25.publish only after every
-# file's hash was verified), and whether the volume is safe to delete. Works with or without a pod.
+# Sets VOLUME_SHA_normal and VOLUME_SHA_count_once to the sha256 of each run's best/meta.json on the volume ("none"
+# when a run has no best/), read through the exec API of the running pod POD_ID. Leaves them empty (unknown) when
+# there is no running pod or the exec call fails; never dies.
+read_volume_best_shas() {
+  local out=$TMP_DIR/exec-vol.json body=$TMP_DIR/exec-vol-body.json mode sha stdout
+  VOLUME_SHA_normal='' VOLUME_SHA_count_once=''
+  if [[ -z ${POD_ID-} || ${POD_STATUS-} != RUNNING ]]; then return 0; fi
+  jq -n --arg script "$VOLUME_SHA_SCRIPT" '{command: ["sh", "-c", $script], timeoutSeconds: 20}' >"$body"
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  if ! api "$out" POST "/v2/pods/$POD_ID/exec" "$body"; then
+    say "cannot read the volume through pod $POD_ID (HTTP $API_STATUS); the upload state is unknown"
+    return 0
+  fi
+  stdout=$(jq -r '.stdout // ""' "$out") || stdout=''
+  while read -r mode sha; do
+    [[ $sha =~ ^([0-9a-f]{64}|none|[A-Za-z0-9]+)$ ]] || continue
+    case $mode in
+      normal) VOLUME_SHA_normal=$sha ;;
+      count_once) VOLUME_SHA_count_once=$sha ;;
+    esac
+  done <<<"$stdout"
+}
+
+# Prints, per run, the Hub's UPLOADED.json (committed by drbm25.publish only after every file was verified; its
+# best step always shown) and, when the volume can be read through a running pod, whether it was written for the
+# volume's current best/ (sha256 of best/meta.json). Then: safe to delete the volume yes (both markers match the
+# volume), no (a marker is missing or stale), or unknown (the volume cannot be read: no running pod).
 hf_upload_status() {
-  local slug mode repo out=$TMP_DIR/hf-tree.json verified=0
+  local slug mode repo out=$TMP_DIR/hf-marker.json step hub_sha volume_sha missing=0 matched=0
   slug=$(runpod_model_slug)
+  read_volume_best_shas
   printf 'Hugging Face uploads (private repos of %s):\n' "$HF_USER"
   for mode in normal count_once; do
     repo=$HF_USER/$HF_REPO_PREFIX-$slug-$mode
     # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-    if hf_api "$out" "/api/models/$repo/tree/main"; then
-      if jq -e 'any(.[]?; .type == "file" and .path == "UPLOADED.json")' "$out" >/dev/null; then
-        printf '  %s: uploaded and verified (UPLOADED.json)\n' "$repo"
-        verified=$((verified + 1))
-      else
-        printf '  %s: not verified (no UPLOADED.json yet)\n' "$repo"
-      fi
-    elif [[ $API_STATUS == 404 ]]; then
-      printf '  %s: not uploaded (no such repo)\n' "$repo"
+    if ! hf_api "$out" "/$repo/resolve/main/UPLOADED.json"; then
+      case $API_STATUS in
+        401 | 404)
+          printf '  %s: not uploaded (no verified UPLOADED.json)\n' "$repo"
+          missing=$((missing + 1))
+          continue
+          ;;
+        *) die "reading $repo/UPLOADED.json on $HF_API_BASE: HTTP $API_STATUS" ;;
+      esac
+    fi
+    step=$(jq -r '.best_step // "?"' "$out") || die "unexpected UPLOADED.json in $repo"
+    hub_sha=$(jq -r '.files["provenance/best_meta.json"].sha256 // ""' "$out") || die "unexpected UPLOADED.json in $repo"
+    if [[ $mode == normal ]]; then volume_sha=$VOLUME_SHA_normal; else volume_sha=$VOLUME_SHA_count_once; fi
+    if [[ -z $volume_sha ]]; then
+      printf '  %s: UPLOADED.json for best step %s (cannot compare with the volume: no running pod)\n' "$repo" "$step"
+    elif [[ -n $hub_sha && $volume_sha == "$hub_sha" ]]; then
+      printf '  %s: UPLOADED.json for best step %s, matches the volume'"'"'s best/\n' "$repo" "$step"
+      matched=$((matched + 1))
     else
-      die "reading $repo on $HF_API_BASE: HTTP $API_STATUS"
+      printf '  %s: UPLOADED.json for best step %s, STALE: the volume'"'"'s best/ is different; publish again\n' "$repo" "$step"
+      missing=$((missing + 1))
     fi
   done
-  if ((verified == 2)); then
-    printf 'safe to delete the volume: yes (both runs are on the Hub, verified)\n'
+  if ((matched == 2)); then
+    printf 'safe to delete the volume: yes (both runs are on the Hub, verified, for the best/ the volume holds)\n'
+  elif ((missing > 0)); then
+    printf 'safe to delete the volume: no (keep it; publish again: see PUBLISH_FAILED in --logs)\n'
   else
-    printf 'safe to delete the volume: no (keep it until both runs show UPLOADED.json; see PUBLISH_FAILED in --logs)\n'
+    printf 'safe to delete the volume: unknown (the volume can only be compared while a pod runs; markers are withdrawn at the start of every launch that trains, and the last run_all log says "safe to delete the volume" when the pod checked it)\n'
   fi
 }
 
@@ -602,12 +649,19 @@ do_launch() {
 }
 
 do_status() {
-  local rows
+  local rows count
   rows=$(list_pods)
+  POD_ID='' POD_STATUS=''
   if [[ -z $rows ]]; then
     printf 'no %s pod exists (the network volume and its data are kept)\n' "$POD_NAME"
   else
     printf '%s\n' "$rows" | awk -F '\t' '{ printf "pod %s  status %s  $%s/h  data center %s\n", $1, $2, $3, $4 }'
+    # One pod: its volume can be read for the upload check (find_pod dies on several).
+    count=$(printf '%s\n' "$rows" | awk 'END { print NR }')
+    if ((count == 1)); then
+      IFS=$'\t' read -r POD_ID POD_STATUS _ <<<"$rows"
+      [[ $POD_ID =~ ^[A-Za-z0-9_-]+$ ]] || die "unexpected pod id from the API: '$POD_ID'"
+    fi
   fi
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   prompt_var HF_TOKEN "Hugging Face token, to check the uploads (hidden)" --secret || exit 1

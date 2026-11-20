@@ -196,28 +196,69 @@ no_billable_calls() {
   ! grep -q -e "$HF" "$STUB_DIR/argv.log"
 }
 
-@test "--status reports which run's UPLOADED.json is on the Hub and that the volume is not yet safe to delete" {
-  resp GET_api_models_hfuser_drbm25-qwen2.5-3b-normal_tree_main '[{"type":"file","path":"README.md"},{"type":"file","path":"UPLOADED.json"}]'
-  resp GET_api_models_hfuser_drbm25-qwen2.5-3b-count_once_tree_main '[{"type":"file","path":"README.md"}]'
-  run -0 bash "$LAUNCH" --status
-  [[ $output == *"hfuser/drbm25-qwen2.5-3b-normal: uploaded and verified"* ]]
-  [[ $output == *"hfuser/drbm25-qwen2.5-3b-count_once: not verified"* ]]
-  [[ $output == *"safe to delete the volume: no"* ]]
+hub_marker() { # MODE BEST_STEP META_SHA: the Hub's UPLOADED.json for MODE
+  resp "GET_hfuser_drbm25-qwen2.5-3b-$1_resolve_main_UPLOADED.json" \
+    "{\"repo_id\":\"hfuser/drbm25-qwen2.5-3b-$1\",\"reward_mode\":\"$1\",\"best_step\":$2,\"files\":{\"provenance/best_meta.json\":{\"sha256\":\"$3\",\"size\":10}}}"
 }
 
-@test "--status says the volume is safe to delete when both runs have UPLOADED.json on the Hub" {
-  resp GET_api_models_hfuser_drbm25-qwen2.5-3b-normal_tree_main '[{"type":"file","path":"UPLOADED.json"}]'
-  resp GET_api_models_hfuser_drbm25-qwen2.5-3b-count_once_tree_main '[{"type":"file","path":"UPLOADED.json"}]'
+running_pod() { # STDOUT: what the pod's exec of the volume check prints
+  resp GET_v2_pods '{"pods":[{"id":"pod7","name":"drbm25","status":"RUNNING","cost":4.38,"dataCenterId":"US-MD-1"}],"pagination":{"hasNextPage":false}}'
+  resp POST_v2_pods_pod7_exec "$(jq -cn --arg o "$1" '{stdout: $o, stderr: ""}')"
+}
+
+@test "--status says safe to delete only when both Hub markers match the volume's current best/ (read through the pod)" {
+  hub_marker normal 400 aaa
+  hub_marker count_once 350 bbb
+  running_pod $'normal aaa\ncount_once bbb\n'
   run -0 bash "$LAUNCH" --status
+  [[ $output == *"hfuser/drbm25-qwen2.5-3b-normal: UPLOADED.json for best step 400, matches the volume"* ]]
+  [[ $output == *"hfuser/drbm25-qwen2.5-3b-count_once: UPLOADED.json for best step 350, matches the volume"* ]]
   [[ $output == *"safe to delete the volume: yes"* ]]
 }
 
-@test "--status treats a repo that does not exist (404) as not uploaded" {
-  resp_status GET_api_models_hfuser_drbm25-qwen2.5-3b-normal_tree_main 404
-  resp GET_api_models_hfuser_drbm25-qwen2.5-3b-count_once_tree_main '[{"type":"file","path":"UPLOADED.json"}]'
+@test "--status says no when a Hub marker is for an older best/ than the volume holds" {
+  hub_marker normal 400 aaa
+  hub_marker count_once 350 bbb
+  running_pod $'normal aaa\ncount_once NEWER\n'
+  run -0 bash "$LAUNCH" --status
+  [[ $output == *"count_once: UPLOADED.json for best step 350, STALE"* ]]
+  [[ $output == *"safe to delete the volume: no"* ]]
+}
+
+@test "--status without a pod cannot read the volume and says unknown, never yes, with each marker's best step" {
+  hub_marker normal 400 aaa
+  hub_marker count_once 350 bbb
+  run -0 bash "$LAUNCH" --status
+  [[ $output == *"no drbm25 pod"* ]]
+  [[ $output == *"normal: UPLOADED.json for best step 400"* ]]
+  [[ $output == *"count_once: UPLOADED.json for best step 350"* ]]
+  [[ $output == *"safe to delete the volume: unknown"* ]]
+  [[ $output != *"safe to delete the volume: yes"* ]]
+}
+
+@test "--status says no when a run has no Hub marker (404), even without a pod" {
+  resp_status GET_hfuser_drbm25-qwen2.5-3b-normal_resolve_main_UPLOADED.json 404
+  hub_marker count_once 350 bbb
   run -0 bash "$LAUNCH" --status
   [[ $output == *"hfuser/drbm25-qwen2.5-3b-normal: not uploaded"* ]]
   [[ $output == *"safe to delete the volume: no"* ]]
+}
+
+@test "--status with a pod whose exec fails (409) says unknown" {
+  hub_marker normal 400 aaa
+  hub_marker count_once 350 bbb
+  running_pod ''
+  resp_status POST_v2_pods_pod7_exec 409
+  run -0 bash "$LAUNCH" --status
+  [[ $output == *"safe to delete the volume: unknown"* ]]
+}
+
+@test "the watchdog margin is at least the publish timeout, so it never fires inside a budgeted upload" {
+  local margin publish
+  margin=$(sed -n 's/^readonly HARD_DEADLINE_MARGIN_S=\([0-9]*\).*/\1/p' "$LAUNCH")
+  publish=$(sed -n 's/^readonly PUBLISH_TIMEOUT_S=\([0-9]*\).*/\1/p' "${BATS_TEST_DIRNAME}/../../scripts/runpod/lib.sh")
+  [[ -n $margin && -n $publish ]]
+  ((margin >= publish))
 }
 
 # ---------------------------------------------------------------- usage

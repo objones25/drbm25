@@ -113,6 +113,7 @@ case $cmd in
       done
       rc_var=STUB_PUBLISH_RC_${run_dir##*/}
       if [[ -n ${!rc_var-} ]]; then exit "${!rc_var}"; fi
+      if [[ -n ${STUB_INVALIDATE-} ]]; then rm -f "$run_dir/UPLOADED.json"; exit 0; fi
       echo '{}' >"$run_dir/UPLOADED.json"
       exit 0
     fi
@@ -728,6 +729,41 @@ make_runs() {
   [[ $stderr == *ERROR*publish* ]]
   [[ $stderr != *"safe to delete the volume"* ]]
   grep -q 'curl .*-X DELETE .*pods/pod123' "$STUB_LOG"
+}
+
+@test "invalidate_uploads withdraws the upload markers of the runs that will train, before training" {
+  make_runs
+  echo step_000100 >"$DRBM25_ROOT/runs/normal/latest" # finished: training will not touch it
+  echo step_000050 >"$DRBM25_ROOT/runs/count_once/latest"
+  echo '{}' >"$DRBM25_ROOT/runs/normal/UPLOADED.json"
+  echo '{}' >"$DRBM25_ROOT/runs/count_once/UPLOADED.json"
+  SNIPPET='invalidate_uploads 100'
+  run -0 in_lib STUB_INVALIDATE=1
+  grep -q -- "drbm25.publish --run-dir $DRBM25_ROOT/runs/count_once --invalidate" "$STUB_LOG"
+  ! grep -q -- "runs/normal --invalidate" "$STUB_LOG"
+  [[ -f $DRBM25_ROOT/runs/normal/UPLOADED.json ]]
+  [[ ! -e $DRBM25_ROOT/runs/count_once/UPLOADED.json ]]
+}
+
+@test "a marker that cannot be withdrawn stops the launch with FAILED before any training (fail closed)" {
+  make_runs
+  SNIPPET='invalidate_uploads 100'
+  run -1 in_lib STUB_PUBLISH_RC_normal=1
+  grep -q 'UPLOADED.json' "$DRBM25_ROOT/FAILED"
+  [[ -z $(train_calls) ]]
+}
+
+@test "run_all.sh withdraws the upload markers after reading total_steps and before training" {
+  local inv train
+  inv=$(grep -n '^  invalidate_uploads "\$total_steps"$' "$RUN_ALL" | cut -d: -f1)
+  train=$(grep -n '^  train_and_report "\$total_steps"' "$RUN_ALL" | cut -d: -f1)
+  [[ -n $inv && -n $train ]]
+  ((inv < train))
+}
+
+@test "the reserve covers evaluation, report and both uploads: 5400 s, with 1800 s per upload (budget)" {
+  grep -q '^readonly DEFAULT_RESERVE_S=5400$' "$RUN_ALL"
+  grep -q '^readonly PUBLISH_TIMEOUT_S=1800 ' "$LIB"
 }
 
 @test "run_all.sh publishes after the evaluation and report and does not fail the launch on a publish error" {

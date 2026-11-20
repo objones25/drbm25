@@ -16,9 +16,10 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 readonly REPO_ROOT=$SCRIPT_DIR/../..
 # Seconds kept free before the deadline for the final evaluation (four scoring runs over the dev
-# queries), the report with its 10,000-resample bootstrap, the log copy and the terminate call.
-# One hour is an unmeasured, deliberately generous estimate (about $2.4-4.4 of a $160 budget).
-readonly DEFAULT_RESERVE_S=3600
+# queries), the report with its 10,000-resample bootstrap, the Hugging Face upload of both runs (each
+# downloaded back to verify it), the log copy and the terminate call. 1 h for evaluation and report plus
+# 30 min for the uploads: unmeasured, deliberately generous estimates (about $3.3-6.6 at $2.2-4.4/h).
+readonly DEFAULT_RESERVE_S=5400
 
 usage() {
   cat <<EOF2
@@ -136,6 +137,9 @@ main() {
   export DEADLINE_UNIX RESERVE_S
   now=$(date +%s)
   _runpod_log "budget \$$BUDGET_USD at \$$PRICE_PER_HOUR/h: deadline in $(((deadline - now) / 60)) min, reserve $((RESERVE_S / 60)) min for eval and report"
+  # Fail closed: a run that trains further gets a new best/, so its upload markers (local and on the Hub) are
+  # withdrawn first; a marker that cannot be withdrawn stops the launch (FAILED) before any training.
+  invalidate_uploads "$total_steps"
   train_and_report "$total_steps" "$chunk_steps"
   stage publish
   # A failed upload leaves PUBLISH_FAILED and the data on the volume; the pod is still terminated.

@@ -26,6 +26,7 @@
 #   launch_deadline_unix START_UNIX BUDGET_USD PRICE_PER_HOUR    DRBM25_BUDGET_DEADLINE_UNIX, else the above
 #   run_alternating_chunks UNTIL CHUNK   status 0 done, 3 budget stop, 1 failure
 #   eval_stage, train_and_report UNTIL CHUNK
+#   invalidate_uploads TOTAL   withdraw the upload markers of the runs that will train (FAILED if impossible)
 #   publish_stage              upload both runs' best/ to the Hugging Face Hub (python -m drbm25.publish);
 #                              a failure writes PUBLISH_FAILED (not FAILED) and returns 1
 #   spend_begin / spend_record / spend_total   dollars spent, kept in spend.json on the volume
@@ -64,7 +65,7 @@ readonly KILL_AFTER_S=60           # SIGKILL this long after the TERM that `time
 readonly TRAIN_TIMEOUT_MARGIN_S=1800
 readonly TRAIN_TIMEOUT_MIN_S=900
 readonly EVAL_TIMEOUT_S=7200       # per evaluation command and for the report
-readonly PUBLISH_TIMEOUT_S=3600    # per run's Hugging Face upload + verification (a 3B bf16 actor is ~6.2 GB)
+readonly PUBLISH_TIMEOUT_S=1800    # per run's Hugging Face upload + download-back check (3B bf16 actor ~6.2 GB); also --invalidate
 readonly SMOKE_TIMEOUT_S=3600      # per smoke command
 readonly DISK_MIN_KB=94371840      # 90 GiB before a run's first save: one checkpoint (~74 GB) + best/ (~6.8 GB)
 readonly DISK_BEST_KB=7340032      # 7 GiB: room for a run's first best/ (3B actor in bf16, ~6.8 GB)
@@ -996,6 +997,23 @@ train_and_report() {
 }
 
 # ---------------------------------------------------------------- publish
+
+# A run below TOTAL steps will train, which can replace its best/; its UPLOADED.json (here and in its Hub repo)
+# would then describe an older policy, so both are withdrawn first (python -m drbm25.publish --invalidate).
+# Fail closed: when that is impossible (HF_TOKEN, network) the launch stops with FAILED before any training.
+invalidate_uploads() {
+  local total=${1:?TOTAL} mode have
+  for mode in normal count_once; do
+    # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+    have=$(latest_step "$DRBM25_RUNS_DIR/$mode") || return 1
+    if ((have >= total)); then continue; fi
+    # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+    if ! _uv_timeout "$PUBLISH_TIMEOUT_S" python -m drbm25.publish --run-dir "$DRBM25_RUNS_DIR/$mode" --invalidate; then
+      mark_failed "could not withdraw the $mode run's UPLOADED.json on the Hugging Face Hub before training (HF_TOKEN or network); fix it, then relaunch with --clear-failed"
+      return 1
+    fi
+  done
+}
 
 # Uploads each run's best/ policy, provenance and results to a private Hugging Face repo and verifies the
 # upload; drbm25.publish writes runs/<mode>/UPLOADED.json only after every file's hash matched. Both runs are
