@@ -198,3 +198,13 @@ def test_value_loss_clipfrac_is_zero_when_clipped_and_unclipped_tie() -> None:
 def test_validate_token_mask_keeps_float_dtype_and_floats_bool() -> None:
     assert validate_token_mask(torch.ones(1, 2, dtype=F64)).dtype == F64
     assert validate_token_mask(torch.ones(1, 2, dtype=torch.bool)).is_floating_point()
+
+
+def test_entropy_from_logits_upcasts_half_logits_to_fp32() -> None:
+    gen = torch.Generator().manual_seed(0)
+    logits = (torch.randn(2, 3, 50, generator=gen) * 8).half()
+    mask = torch.ones(2, 3)
+    out = entropy_from_logits(logits, mask)
+    assert out.dtype == torch.float32
+    reference = torch.distributions.Categorical(logits=logits.double()).entropy().mean()
+    torch.testing.assert_close(out, reference.float(), rtol=1e-5, atol=1e-5)

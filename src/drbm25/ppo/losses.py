@@ -91,12 +91,17 @@ def value_loss(
 
 
 def entropy_from_logits(logits: Tensor, mask: Tensor) -> Tensor:
-    """Mean token entropy of ``softmax(logits)`` over valid tokens; ``logits`` is ``[B, T, V]``."""
+    """Mean token entropy of ``softmax(logits)`` over valid tokens; ``logits`` is ``[B, T, V]``.
+
+    fp16/bf16 logits are upcast to fp32 first: half-precision softmax loses ~1e-3 nats.
+    """
     if logits.ndim != 3 or logits.shape[:2] != mask.shape:
         raise ValueError(
             f"mask has shape {tuple(mask.shape)} but logits has shape {tuple(logits.shape)} "
             "(expected [B, T, V] with mask [B, T])"
         )
+    if logits.dtype in (torch.float16, torch.bfloat16):
+        logits = logits.float()
     probs = torch.softmax(logits, dim=-1)
     entropy = torch.logsumexp(logits, dim=-1) - (probs * logits).sum(dim=-1)
     return masked_mean(entropy, mask)
