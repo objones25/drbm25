@@ -129,36 +129,49 @@ Full fine-tune with AdamW and fp32 master weights ≈ 18 bytes/parameter.
 
 ### 6.1 Package layout (uv project, `src/` layout)
 
+The tree as built (2026-11-20; `git ls-files src scripts configs`):
+
 ```
 pyproject.toml, uv.lock, .python-version
 configs/            expanse_v100_lora.yaml, runpod_a100_full.yaml, smoke_cpu.yaml
 src/drbm25/
   config.py         frozen dataclasses; YAML loaded with yaml.safe_load; validated at load
-  data.py           download MS-S + 800K collection from HF; typed Example; seeded train/val split
+  data.py           MS-S download and parsing; typed Example; seeded train/val split and data order
+  prepare.py        download MS-S + build the BM25 index once, atomically, idempotently
   prompt.py         the upstream sparse prompt, verbatim
-  reward.py         pure: parse response → ParsedRewrite | FormatError; nDCG@k; reward()
+  reward.py         pure: parse response -> ParsedRewrite | FormatError; nDCG@k; reward
   checkpoint.py     atomic resume checkpoints (step_*/latest) and the selected policy (best/)
   manifest.py       run_manifest.json: seeds, resolved config + sha256, versions, hardware
+  budget.py         dollar budget -> deadline; the chunk stop rule
+  distributed.py    process-group setup, manual gradient averaging (no DDP wrapper)
+  tiny.py           tiny random Qwen2 + tokenizer for tests and CPU smoke runs
+  train.py          resumable PPO training CLI (python -m drbm25.train)
   bm25/
-    index.py        build Lucene index for the 800K collection (Pyserini JsonCollection)
+    index.py        build the Lucene index for the 800K collection (pyserini)
     searcher.py     ScoringMode = Literal["normal","count_once"]; Bm25Searcher.search(q, mode, k)
   rollout/
-    hf_generate.py  batched HF generate (default on V100)
-    vllm_engine.py  colocated vLLM, weight sync after each update (default on A100)
+    base.py         RolloutEngine protocol, RolloutBatch, shared prompt/response handling
+    hf_generate.py  batched HF generate (V100; CPU runs)
+    vllm_engine.py  colocated vLLM, weight sync after each update (A100)
   ppo/
-    gae.py          token-level KL-in-reward + GAE (γ=λ=1) — pure tensor functions
-    losses.py       clipped policy loss, clipped value loss, entropy — pure
-    models.py       LoRA actor/critic on shared base (V100); FSDP actor/critic/ref (A100)
-    trainer.py      one PPO step: rollout → reward → ref/old logprobs, values → GAE → update
+    gae.py          token-level KL-in-reward + GAE (gamma = lambda = 1), pure tensor functions
+    losses.py       clipped policy loss, clipped value loss, entropy, pure
+    models.py       PolicyModels protocol; LoRA actor/critic on a shared base (V100)
+    models_full.py  FSDP2 actor/critic/reference, full fine-tune (A100)
+    trainer.py      one PPO step: rollout -> reward -> ref/old logprobs, values -> GAE -> update
   eval/
-    run_eval.py     Exp 1 and Exp 2 scoring; writes per-query jsonl + summary
-    stats.py        paired bootstrap CI; query statistics (length, repeat ratio)
-  obs/
-    logging.py      stdlib JSON logging with run id
-    wandb_run.py    W&B init/log/summary/artifacts; offline mode + later sync
+    records.py      QueryRecord and the per-source jsonl format (with a provenance header)
+    run_eval.py     Exp 1 and Exp 2 scoring of one source; writes per-query jsonl
+    stats.py        paired bootstrap CI; query statistics
+    report.py       report.md (+ optional W&B tables and artifact) from the jsonl files
+  obs/              logging and W&B plumbing: setup.py, json_formatter.py, context.py,
+                    redact.py, metrics.py, wandb_run.py, runs.py
 scripts/
-  expanse/          sbatch: build_index, smoke_vllm_v100 (gpu-debug), train, eval
-  runpod/           setup.sh, train.sh, eval.sh
+  prepare_data.py, memory_check.py, spike_monitor.py
+  audit_tests.py, audit_observability.py, lint_pytorch.py, diff_guard.py, mutate_check.py
+  expanse/          common.sh, run.sh, prepare_login.sh (login node), probe.sbatch
+                    (gpu-debug), train.sbatch, submit_chain.sh, eval.sbatch
+  runpod/           run_all.sh (one-shot launcher), lib.sh
 tests/
 ```
 
@@ -236,8 +249,10 @@ A100 / full layout (`configs/runpod_a100_full.yaml`):
 
 ### 6.6 Run protocol
 - Each training run = fixed number of PPO steps (`total_steps`), same for both runs.
-  Target 1,751 steps (5 epochs × 22,416 / 64, upstream's 5 epochs). The real cap
-  comes from the budget (below).
+  Target 1,751 steps: upstream's 5 epochs over its 22,416 train rows
+  (5 × 22,416 / 64 = 1,751.25). We train on 21,916 rows (500 are held out for
+  validation, §6.2), so 1,751 steps of 64 are ≈ 5.11 epochs of our train split.
+  The real cap comes from the budget (below).
 - **Equal progress under any interruption.** The two runs advance in alternating
   chunks of `chunk_steps` (default 50): run normal to step 50, checkpoint, run
   count-once to step 50, checkpoint, and so on. If money or time runs out, both runs
