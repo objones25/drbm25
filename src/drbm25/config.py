@@ -7,6 +7,7 @@ hardware rules that need to know the device and world size.
 
 from __future__ import annotations
 
+import math
 import types
 import typing
 from collections.abc import Mapping
@@ -240,11 +241,27 @@ def load_config(path: Path, overrides: Mapping[str, str] = MappingProxyType({}))
     return _build(Config, raw, "")
 
 
+def _require_finite_floats(section: Any, where: str = "") -> None:
+    """NaN and inf pass ordinary `<`/`<=` range checks, so reject them explicitly."""
+    for f in fields(section):
+        value = getattr(section, f.name)
+        if is_dataclass(value):
+            _require_finite_floats(value, _join(where, f.name))
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise ConfigError(f"{_join(where, f.name)} must be finite, got {value}")
+
+
 def validate_for_runtime(cfg: Config, *, device_capability: tuple[int, int] | None, world_size: int) -> None:
     """Check cross-field and hardware rules; raise ConfigError on the first violation."""
     if world_size < 1:
         raise ConfigError(f"world_size must be >= 1, got {world_size}")
     p = cfg.ppo
+    _require_finite_floats(cfg)
+    for name in ("batch_size", "mini_batch_size", "micro_batch_size"):
+        if getattr(p, name) < 1:
+            raise ConfigError(f"{name} must be >= 1, got {getattr(p, name)}")
+    if cfg.lora is not None and not cfg.lora.target_modules:
+        raise ConfigError("lora.target_modules must not be empty")
     if cfg.model.precision == "bf16" and device_capability is not None and device_capability < _BF16_MIN_CAPABILITY:
         raise ConfigError(
             f"bf16 requires compute capability >= 8.0, got {device_capability[0]}.{device_capability[1]}; "
@@ -259,7 +276,7 @@ def validate_for_runtime(cfg: Config, *, device_capability: tuple[int, int] | No
     if p.batch_size % p.mini_batch_size:
         raise ConfigError(f"batch_size {p.batch_size} is not a multiple of mini_batch_size {p.mini_batch_size}")
     per_rank = p.mini_batch_size // world_size
-    if p.micro_batch_size < 1 or per_rank % p.micro_batch_size:
+    if per_rank % p.micro_batch_size:
         raise ConfigError(
             f"micro_batch_size {p.micro_batch_size} does not divide per-rank mini_batch_size {per_rank}"
         )

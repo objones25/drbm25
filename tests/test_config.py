@@ -2,6 +2,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import yaml
 
 from drbm25.config import ConfigError, load_config, validate_for_runtime
 
@@ -131,3 +132,137 @@ def test_rejects_reward_range_breaking_values(key, value):
     cfg = load_config(EXPANSE, {key: value})
     with pytest.raises(ConfigError, match=key.split(".")[1]):
         validate_for_runtime(cfg, device_capability=(7, 0), world_size=1)
+
+
+# --- non-positive ints and non-finite floats -------------------------------
+@pytest.mark.parametrize(
+    ("key", "value", "world_size"),
+    [
+        ("ppo.mini_batch_size", "0", 1),
+        ("ppo.batch_size", "0", 1),
+        ("ppo.micro_batch_size", "0", 1),
+        ("ppo.mini_batch_size", "-16", 1),
+    ],
+)
+def test_rejects_non_positive_batch_ints_as_config_error(key, value, world_size):
+    cfg = load_config(EXPANSE, {key: value})
+    with pytest.raises(ConfigError, match=key.split(".")[1]):
+        validate_for_runtime(cfg, device_capability=(7, 0), world_size=world_size)
+
+
+def test_rejects_zero_world_size():
+    with pytest.raises(ConfigError, match="world_size"):
+        validate_for_runtime(load_config(EXPANSE), device_capability=(7, 0), world_size=0)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("ppo.kl_coef", "nan"),
+        ("ppo.kl_coef", "inf"),
+        ("ppo.actor_lr", "nan"),
+        ("ppo.actor_lr", "inf"),
+        ("ppo.critic_lr", "inf"),
+        ("ppo.clip_ratio", "nan"),
+    ],
+)
+def test_rejects_non_finite_floats(key, value):
+    cfg = load_config(EXPANSE, {key: value})
+    with pytest.raises(ConfigError, match=key.split(".")[1]):
+        validate_for_runtime(cfg, device_capability=(7, 0), world_size=1)
+
+
+def test_rejects_empty_target_modules():
+    cfg = load_config(EXPANSE, {"lora.target_modules": ""})
+    with pytest.raises(ConfigError, match="target_modules"):
+        validate_for_runtime(cfg, device_capability=(7, 0), world_size=1)
+
+
+# --- strict typing of the YAML file itself ---------------------------------
+def _write_variant(tmp_path, mutate):
+    raw = yaml.safe_load(EXPANSE.read_text())
+    mutate(raw)
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    return path
+
+
+def test_rejects_string_where_int_expected(tmp_path):
+    p = _write_variant(tmp_path, lambda r: r["ppo"].update(batch_size="64"))
+    with pytest.raises(ConfigError, match=r"ppo\.batch_size: expected int"):
+        load_config(p)
+
+
+def test_rejects_bool_where_int_expected(tmp_path):
+    p = _write_variant(tmp_path, lambda r: r["ppo"].update(batch_size=True))
+    with pytest.raises(ConfigError, match=r"ppo\.batch_size: expected int"):
+        load_config(p)
+
+
+def test_rejects_missing_key(tmp_path):
+    p = _write_variant(tmp_path, lambda r: r["ppo"].pop("kl_coef"))
+    with pytest.raises(ConfigError, match=r"missing key 'ppo\.kl_coef'"):
+        load_config(p)
+
+
+def test_rejects_unknown_key_in_yaml_file(tmp_path):
+    p = _write_variant(tmp_path, lambda r: r["ppo"].update(batchsize=8))
+    with pytest.raises(ConfigError, match=r"unknown key 'ppo\.batchsize'"):
+        load_config(p)
+
+
+def test_rejects_non_mapping_section(tmp_path):
+    p = _write_variant(tmp_path, lambda r: r.update(ppo=[1, 2]))
+    with pytest.raises(ConfigError, match=r"ppo: expected a mapping"):
+        load_config(p)
+
+
+def test_rejects_non_mapping_top_level(tmp_path):
+    p = tmp_path / "cfg.yaml"
+    p.write_text("- a\n- b\n")
+    with pytest.raises(ConfigError, match="top level must be a mapping"):
+        load_config(p)
+
+
+def test_rejects_missing_file(tmp_path):
+    with pytest.raises(ConfigError, match="cannot read config"):
+        load_config(tmp_path / "nope.yaml")
+
+
+def test_rejects_bad_target_modules_type(tmp_path):
+    p = _write_variant(tmp_path, lambda r: r["lora"].update(target_modules=[1, 2]))
+    with pytest.raises(ConfigError, match=r"lora\.target_modules: expected a list of strings"):
+        load_config(p)
+
+
+# --- overrides: tuple, bool, null ------------------------------------------
+def test_override_parses_tuple():
+    cfg = load_config(EXPANSE, {"lora.target_modules": "q_proj,v_proj"})
+    assert cfg.lora is not None
+    assert cfg.lora.target_modules == ("q_proj", "v_proj")
+
+
+def test_override_parses_bool():
+    assert load_config(EXPANSE, {"model.gradient_checkpointing": "false"}).model.gradient_checkpointing is False
+    assert load_config(EXPANSE, {"model.gradient_checkpointing": "true"}).model.gradient_checkpointing is True
+
+
+def test_override_rejects_bad_bool():
+    with pytest.raises(ConfigError, match=r"model\.gradient_checkpointing"):
+        load_config(EXPANSE, {"model.gradient_checkpointing": "yes"})
+
+
+def test_override_null_sets_optional_none():
+    cfg = load_config(EXPANSE, {"run.wandb_entity": "someone"})
+    assert cfg.run.wandb_entity == "someone"
+    assert load_config(EXPANSE, {"run.wandb_entity": "null"}).run.wandb_entity is None
+
+
+def test_override_rejects_section_key():
+    with pytest.raises(ConfigError, match="is a section"):
+        load_config(EXPANSE, {"ppo": "x"})
+
+
+def test_override_rejects_key_below_leaf():
+    with pytest.raises(ConfigError, match=r"unknown key 'ppo\.batch_size\.x'"):
+        load_config(EXPANSE, {"ppo.batch_size.x": "1"})
