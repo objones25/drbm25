@@ -24,6 +24,7 @@ from drbm25.ppo.trainer import (
     TrainingHealthError,
     response_logprobs,
     response_values,
+    tempered_response_logits,
 )
 from drbm25.rollout.base import RolloutBatch, RolloutEngine
 from drbm25.rollout.hf_generate import HFGenerateEngine
@@ -234,6 +235,17 @@ def test_response_logprobs_use_the_sampling_temperature() -> None:
     torch.testing.assert_close(response_logprobs(logits, ids, prompt_len=3, temperature=0.5), expected)
 
 
+@pytest.mark.parametrize("temperature", [0.0, -0.6])
+def test_tempered_logits_reject_non_positive_temperature(temperature: float) -> None:
+    with pytest.raises(ValueError, match="temperature must be > 0"):
+        tempered_response_logits(torch.zeros(1, 5, 7), prompt_len=3, temperature=temperature)
+
+
+def test_tempered_logits_reject_a_missing_response() -> None:
+    with pytest.raises(ValueError, match="no response tokens"):
+        tempered_response_logits(torch.zeros(1, 3, 7), prompt_len=3, temperature=0.6)
+
+
 def test_response_values_are_the_states_before_each_response_token() -> None:
     # values[t] is the value of the state after token t; response token j is chosen in the state
     # after token P-1+j, so the response values are values[P-1 : L-1].
@@ -283,6 +295,42 @@ def test_histograms_on_deep_log_steps_only(toy_index: Path) -> None:
     assert sum(hists["hist/response_len"]) / cfg.ppo.batch_size == pytest.approx(metrics["rollout/response_len_mean"])
     trainer.step(examples(cfg.ppo.batch_size), step=1)
     assert trainer.histograms() == {}
+
+
+def test_kl_histogram_matches_the_logged_kl_once_the_actor_moved(toy_index: Path) -> None:
+    cfg = smoke_cfg(toy_index, **{"run.deep_log_every": "1", "ppo.actor_lr": "1e-2"})
+    trainer, _ = make_trainer(cfg, searcher=ModeSearcher())
+    trainer.step(examples(cfg.ppo.batch_size, relevant="docN"), step=0)  # actor == ref here: KL 0
+    metrics = trainer.step(examples(cfg.ppo.batch_size, relevant="docN"), step=1)
+    kl = trainer.histograms()["hist/kl_ref"]
+    assert abs(metrics["ppo/kl_ref_mean"]) > 1e-6
+    assert sum(kl) / len(kl) == pytest.approx(metrics["ppo/kl_ref_mean"], rel=1e-4)
+
+
+def test_entropy_bonus_raises_entropy(toy_index: Path) -> None:
+    # Every reward is equal, so the whitened advantages are ~0 and the entropy bonus dominates.
+    cfg = smoke_cfg(toy_index, **{"ppo.entropy_coef": "1.0", "ppo.actor_lr": "1e-2", "run.deep_log_every": "1000"})
+    trainer, _ = make_trainer(cfg, searcher=ModeSearcher())
+    batch = examples(cfg.ppo.batch_size, relevant="docN")
+    entropies = [trainer.step(batch, step=s)["ppo/entropy"] for s in range(1, 5)]
+    assert entropies[-1] > entropies[0], entropies
+
+
+def _grad_norms_with_micro_batch(toy_index: Path, micro: str) -> tuple[float, float]:
+    torch.manual_seed(7)  # identical rollouts for both splits
+    cfg = smoke_cfg(toy_index, **{"ppo.batch_size": "2", "ppo.micro_batch_size": micro})
+    trainer, _ = make_trainer(cfg, searcher=ModeSearcher())
+    metrics = trainer.step(examples(2, relevant="docN"), step=1)
+    return metrics["optim/actor_grad_norm"], metrics["optim/critic_grad_norm"]
+
+
+def test_micro_batch_losses_are_averaged_over_accumulation_steps(toy_index: Path) -> None:
+    # Same rollouts, one mini-batch of 2 split into 1 or 2 micro-batches: the accumulated
+    # gradient is a mean either way (token-means differ slightly with lengths), never a sum.
+    actor_one, critic_one = _grad_norms_with_micro_batch(toy_index, "2")
+    actor_two, critic_two = _grad_norms_with_micro_batch(toy_index, "1")
+    assert 0.5 < actor_two / actor_one < 2.0
+    assert 0.5 < critic_two / critic_one < 2.0
 
 
 def test_per_layer_grad_norms_are_taken_before_clipping(toy_index: Path) -> None:
