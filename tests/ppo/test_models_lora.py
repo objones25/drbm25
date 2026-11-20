@@ -440,6 +440,51 @@ def test_without_checkpointing_switching_before_backward_is_allowed() -> None:
     assert len(_grads(plain.critic_parameters())) == 30
 
 
+def _joint_grads(policy: LoraPolicyModels, ids: Tensor, mask: Tensor, *, ref_between: bool) -> list[Tensor]:
+    _zero_grads(policy.actor_parameters() + policy.critic_parameters())
+    actor_loss = _actor_loss(policy, ids, mask)
+    critic_loss = _critic_loss(policy, ids, mask)
+    if ref_between:
+        policy.ref_logits(ids, mask)
+    (actor_loss + critic_loss).backward()
+    return _grads(policy.actor_parameters()) + _grads(policy.critic_parameters())
+
+
+def test_ref_logits_between_forward_and_backward_keeps_joint_grads() -> None:
+    plain, _ = _random_lora_pair()
+    ids, mask = _batch()
+    expected = _joint_grads(plain, ids, mask, ref_between=False)
+    torch.testing.assert_close(_joint_grads(plain, ids, mask, ref_between=True), expected)
+
+
+def _actor_grads_after_detours(policy: LoraPolicyModels, ids: Tensor, mask: Tensor, *, detour: bool) -> list[Tensor]:
+    _zero_grads(policy.actor_parameters())
+    loss = _actor_loss(policy, ids, mask)
+    if detour:
+        with torch.no_grad():
+            policy.critic_values(ids, mask)
+        policy.ref_logits(ids, mask)
+    loss.backward()
+    return _grads(policy.actor_parameters())
+
+
+def test_no_grad_critic_then_ref_between_forward_and_backward_keeps_actor_grads() -> None:
+    plain, _ = _random_lora_pair()
+    ids, mask = _batch()
+    expected = _actor_grads_after_detours(plain, ids, mask, detour=False)
+    torch.testing.assert_close(_actor_grads_after_detours(plain, ids, mask, detour=True), expected)
+
+
+@pytest.mark.parametrize("gradient_checkpointing", [False, True])
+def test_ref_logits_leaves_every_lora_param_trainable(gradient_checkpointing: bool) -> None:
+    policy = _policy(build_tiny_qwen2(seed=0), gradient_checkpointing=gradient_checkpointing)
+    ids, mask = _batch()
+    with torch.no_grad():
+        policy.critic_values(ids, mask)
+    policy.ref_logits(ids, mask)
+    assert all(p.requires_grad for p in policy.actor_parameters() + policy.critic_parameters())
+
+
 # --------------------------------------------------------------------------- overfit
 def test_lora_overfits_one_batch(tiny_qwen2: PreTrainedModel) -> None:
     """pytorch-skill overfit protocol: the actor LoRA alone can memorise one fixed batch.

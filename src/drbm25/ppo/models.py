@@ -90,7 +90,7 @@ class PolicyModels(Protocol):
     def decoder_layers(self) -> Sequence[nn.Module]: ...
 
     def discard_pending(self) -> None:
-        """Forget forwards whose outputs will never be backpropagated (see ``AdapterSwitchError``)."""
+        """Clear ALL pending marks; only for outputs that will never be backpropagated (see ``AdapterSwitchError``)."""
         ...
 
     def merged_actor_state_dict(self) -> dict[str, Tensor]:
@@ -138,6 +138,7 @@ class LoraPolicyModels:
         self._checkpointing = gradient_checkpointing
         self._pending_adapter: str | None = None
         self._pending_tokens: set[int] = set()
+        self._active_adapter = ACTOR
         self._tokens = itertools.count()
         device = base.get_input_embeddings().weight.device
         self._value_head = nn.Linear(base.config.hidden_size, 1, device=device, dtype=torch.float32)
@@ -165,17 +166,28 @@ class LoraPolicyModels:
     def _activate(self, adapter: str, *, training: bool) -> None:
         self._peft.train(training)
         self._peft.set_adapter(adapter)
+        self._active_adapter = adapter
         for p in self._actor + self._critic_lora:
             p.requires_grad_(True)
 
     @contextmanager
-    def _restoring_pending(self) -> Iterator[None]:
-        """After a no-grad forward, put back the adapter and train mode a pending backward will re-run."""
+    def _no_grad_detour(self) -> Iterator[None]:
+        """Undo a no-grad forward's side effects on the adapter state, in every mode.
+
+        Restores the adapter and train mode that were active before (or, if a checkpointed
+        backward is pending, its adapter in train mode), and ``requires_grad=True`` on both
+        adapters: peft's ``set_adapter`` -- also called by ``disable_adapter()`` on exit --
+        freezes the inactive adapter, and autograd skips accumulating into a parameter whose
+        ``requires_grad`` is False at backward time, so an earlier forward's grads would
+        silently come back None.
+        """
+        adapter, training = self._active_adapter, self._peft.training
         try:
             yield
         finally:
             if self._pending_adapter is not None:
-                self._activate(self._pending_adapter, training=True)
+                adapter, training = self._pending_adapter, True
+            self._activate(adapter, training=training)
 
     def _run(self, adapter: str, forward_output: _Forward) -> Tensor:
         grad = torch.is_grad_enabled()
@@ -186,9 +198,13 @@ class LoraPolicyModels:
                 f"(the pending {pending} backward re-runs its layers with whichever adapter is active); "
                 f"call discard_pending() if the {pending} output will never be backpropagated"
             )
-        with self._restoring_pending():
-            self._activate(adapter, training=grad)
+        if grad:
+            self._activate(adapter, training=True)
             out = forward_output()
+        else:
+            with self._no_grad_detour():
+                self._activate(adapter, training=False)
+                out = forward_output()
         if grad and self._checkpointing and out.requires_grad:
             self._mark_pending(adapter, out)
         return out
@@ -198,6 +214,9 @@ class LoraPolicyModels:
         self._pending_tokens.add(token)
         self._pending_adapter = adapter
 
+        # Fires on ANY gradient reaching `out` -- including torch.autograd.grad and a first
+        # backward(retain_graph=True) -- so the mark can clear before a later backward of the same
+        # graph; never interleave a different-adapter forward between such calls.
         def clear(_grad: Tensor) -> None:
             self._pending_tokens.discard(token)
             if not self._pending_tokens:
@@ -206,7 +225,11 @@ class LoraPolicyModels:
         out.register_hook(clear)
 
     def discard_pending(self) -> None:
-        """Forget pending forwards whose outputs will never be backpropagated."""
+        """Clear ALL pending marks (every adapter, every outstanding output).
+
+        Use only when the pending outputs will never be backpropagated; backpropagating one
+        afterwards across a different-adapter forward gives silently wrong grads.
+        """
         self._pending_tokens.clear()
         self._pending_adapter = None
 
@@ -217,7 +240,7 @@ class LoraPolicyModels:
         return self._run(ACTOR, forward)
 
     def ref_logits(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
-        with torch.no_grad(), self._restoring_pending(), self._peft.disable_adapter():
+        with torch.no_grad(), self._no_grad_detour(), self._peft.disable_adapter():
             self._peft.eval()
             out = self._peft(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
         return out.logits
