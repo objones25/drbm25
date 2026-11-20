@@ -13,6 +13,17 @@ uv run ruff check .
 uv run pyright
 ```
 
+## End-to-end smoke test (CPU, no downloads)
+
+`tests/test_e2e_smoke.py` (marks `java` and `slow`; part of the default `uv run pytest`) runs the whole
+pipeline on `configs/smoke_cpu.yaml` (tiny local model, the 1,002-document toy index): it trains 4 steps
+under each reward mode in two chunks (`--until-step 2`, then `4`, as the RunPod launcher does), scores the
+original queries, the untrained policy and each run's `best/` with `run_eval`, builds the report, and
+checks the four table rows, nDCG in [0, 1], best step and validation score columns, `run_manifest.json`
+seeds, and that both runs saw the same data order. It needs Java 21 on `PATH` (on the dev Mac:
+`JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home PATH=/opt/homebrew/opt/openjdk@21/bin:$PATH`).
+It checks that the stages connect, not that training helps.
+
 ## What a training run leaves behind
 
 Each run directory `runs/<run>/` holds:
