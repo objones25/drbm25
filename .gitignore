@@ -1,0 +1,27 @@
+# upstream reference clone (read-only)
+upstream/DeepRetrieval/
+
+# secrets
+.env
+*.env
+
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# data, models, indexes, runs
+data/
+indexes/
+runs/
+wandb/
+*.safetensors
+*.pt
+
+# OS
+.DS_Store
