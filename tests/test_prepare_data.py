@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -140,7 +141,7 @@ def test_prepare_real_800k_index() -> None:
     info = prepare(cfg)
     assert info.n_docs == 800_000
     assert read_index_info(cfg.retrieval.index_dir) == info
-    print(f"prepare wall time: {time.monotonic() - start:.1f}s")
+    logging.getLogger(__name__).info("prepare wall time: %.1fs", time.monotonic() - start)
 
 
 def test_prepare_rejects_collection_with_wrong_doc_count(cfg: Config, fake_download: Any) -> None:

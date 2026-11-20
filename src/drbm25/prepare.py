@@ -18,6 +18,7 @@ from pathlib import Path
 from drbm25.bm25.index import INDEX_INFO_NAME, IndexInfo, build_index, read_index_info, tsv_to_jsonl
 from drbm25.config import Config, load_config
 from drbm25.data import download_msmarco_science
+from drbm25.obs import configure
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not sep or not key:
             parser.error(f"--set expects key=value, got {item!r}")
         overrides[key] = value
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    configure(level="INFO")
     cfg = load_config(args.config, overrides)
     info = prepare(cfg)
     print(f"index ok: {cfg.retrieval.index_dir} n_docs={info.n_docs} checksum={info.checksum}")
