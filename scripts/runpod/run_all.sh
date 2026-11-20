@@ -24,10 +24,13 @@ usage() {
   cat <<EOF2
 Usage: $SCRIPT_NAME [--no-terminate] [-h|--help]
 
-Runs the whole pipeline on a RunPod pod, resuming from /workspace/drbm25 where it left off:
-prompts (HF_TOKEN, WANDB_API_KEY, WANDB_PROJECT, WANDB_ENTITY, RUNPOD_API_KEY, BUDGET_USD,
-PRICE_PER_HOUR, TERMINATE_ON_FINISH; hidden for secrets, skipped when set in the environment
-or in /workspace/drbm25/.env), Java 21 and uv, uv sync, dataset and index, model snapshot,
+Runs the whole pipeline on a RunPod pod, resuming from /workspace/drbm25 where it left off.
+Run it inside tmux (or under nohup) so a closed SSH or web terminal cannot interrupt it; output
+goes to /workspace/drbm25/logs/run_all-<time>.log after the prompts.
+Prompts: HF_TOKEN, WANDB_API_KEY, WANDB_PROJECT, WANDB_ENTITY, RUNPOD_API_KEY, TERMINATE_ON_FINISH
+(hidden for secrets; skipped when set in the environment or in /workspace/drbm25/.env), and on every
+launch BUDGET_USD (the dollars still left to spend, shown with what earlier launches spent) and
+PRICE_PER_HOUR, which are never saved. Then Java 21 and uv, uv sync, dataset and index, model snapshot,
 GPU smoke test, alternating training chunks of both runs within the budget, evaluation, report.
 
 When it ends, for any reason, it copies logs to /workspace/drbm25/logs and terminates the pod
@@ -35,7 +38,7 @@ through the RunPod API, unless --no-terminate is given or TERMINATE_ON_FINISH=no
 RESERVE_S (default $DEFAULT_RESERVE_S) is the number of seconds before the budget deadline at
 which training stops so evaluation and the report still fit.
 
-Exit status: 0 success, 1 failure (a FAILED marker is left in /workspace/drbm25), 2 usage error.
+Exit status: 0 success, 1 failure (a FAILED marker is left in /workspace/drbm25; a launch that finds one stops without terminating the pod), 2 usage error.
 EOF2
 }
 
@@ -66,22 +69,24 @@ main() {
   start_unix=$(date +%s)
   if ((no_terminate)); then export NO_TERMINATE=1; fi
   runpod_paths
+  # A leftover FAILED marker stops the launch before any prompt and does NOT terminate the pod.
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  refuse_if_failed || exit 1
   cd "$REPO_ROOT"
   mkdir -p "$DRBM25_LOG_DIR"
   logfile=$DRBM25_LOG_DIR/run_all-$(date '+%Y%m%dT%H%M%S').log
-  # shellcheck disable=SC2312 # status is checked explicitly here, not left to set -e
-  exec > >(tee -a "$logfile") 2>&1
 
-  # From here on, every exit (success, error, Ctrl-C, SIGTERM) copies logs and terminates the pod.
-  trap 'on_exit $?' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  # From here on, every exit (success, error, Ctrl-C, closed terminal, SIGTERM) records spend, copies
+  # logs and terminates the pod.
+  install_exit_traps
 
   stage settings
   collect_settings
-  if [[ -f $DRBM25_FAILED_FILE ]]; then
-    _common_die "an earlier launch failed: $(<"$DRBM25_FAILED_FILE"); fix the cause and delete $DRBM25_FAILED_FILE"
-  fi
+  # Straight to a file, not through tee: a closed terminal cannot break the log, and on_exit writes here.
+  printf '%s: logging to %s (follow it with: tail -f %s)\n' "$SCRIPT_NAME" "$logfile" "$logfile" >&2
+  exec >>"$logfile" 2>&1
+  spend_begin "$start_unix" "$PRICE_PER_HOUR"
+  _runpod_log "spent by earlier launches: \$$SPEND_BASE_USD; this launch's remaining budget: \$$BUDGET_USD at \$$PRICE_PER_HOUR/h"
 
   # Java, uv and the venv live on the pod's own disk (Java's tarball on the volume), so these run on
   # every launch; they are quick when already in place.

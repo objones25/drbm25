@@ -47,7 +47,7 @@ run:
   chunk_steps: 50
   val_every: 50
   ckpt_every: 50
-  keep_ckpts: 2
+  keep_ckpts: 1  # a save needs the old checkpoint beside the new one (peak 2 per run); see README
   deep_log_every: 10
   seed: 1234
   wandb_project: drbm25

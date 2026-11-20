@@ -173,8 +173,10 @@ def _load_inputs(paths: Sequence[Path]) -> dict[str, list[QueryRecord]]:
     return sources
 
 
-def _log_to_wandb(cfg_path: Path, report: Report, inputs: Sequence[Path], n_resamples: int) -> None:
-    cfg = load_config(cfg_path)
+def _log_to_wandb(
+    cfg_path: Path, overrides: Mapping[str, str], report: Report, inputs: Sequence[Path], n_resamples: int
+) -> None:
+    cfg = load_config(cfg_path, dict(overrides))
     extra: dict[str, object] = {
         "inputs": [str(p) for p in inputs],
         "n_queries": report.n_queries,
@@ -208,16 +210,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--n-resamples", type=int, default=10_000)
     parser.add_argument("--wandb", action="store_true", help="also log the tables to a W&B run (job_type report)")
     parser.add_argument("--config", type=Path, default=None, help="config for the W&B project (with --wandb)")
+    parser.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE")
     ns = parser.parse_args(argv)
     if ns.wandb and ns.config is None:
         parser.error("--wandb needs --config (it names the W&B project)")
+    overrides: dict[str, str] = {}
+    for item in ns.overrides:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            parser.error(f"--set expects key=value, got {item!r}")
+        overrides[key] = value
     configure(level="INFO", fmt="json")
     report = build_report_data(_load_inputs(ns.inputs), n_resamples=ns.n_resamples)
     ns.out.parent.mkdir(parents=True, exist_ok=True)
     ns.out.write_text(render_markdown(report), encoding="utf-8")
     logger.info("wrote %s", ns.out)
     if ns.wandb:
-        _log_to_wandb(ns.config, report, ns.inputs, ns.n_resamples)
+        _log_to_wandb(ns.config, overrides, report, ns.inputs, ns.n_resamples)
     return 0
 
 

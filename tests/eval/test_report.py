@@ -209,6 +209,35 @@ def test_wandb_flag_logs_tables_in_a_report_run(tmp_path: Path, monkeypatch: pyt
     assert len(row["report/ndcg"].data) == 4
 
 
+def test_wandb_report_applies_set_overrides_to_the_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Any] = []
+
+    @contextmanager
+    def fake_open_run(cfg: Any, **kwargs: Any) -> Iterator[_FakeRun]:
+        seen.append(cfg)
+        yield _FakeRun()
+
+    monkeypatch.setattr(report_module, "open_run", fake_open_run)
+    paths = []
+    for name, recs in _all_sources().items():
+        path = tmp_path / f"{name}.jsonl"
+        write_records(path, recs)
+        paths.append(str(path))
+    argv = ["--inputs", *paths, "--out", str(tmp_path / "r.md"), "--n-resamples", "50", "--wandb", "--config", str(SMOKE)]
+    argv += ["--set", "run.wandb_project=my-proj", "--set", "run.wandb_entity=my-team"]
+    assert main(argv) == 0
+    (cfg,) = seen
+    assert cfg.run.wandb_project == "my-proj"
+    assert cfg.run.wandb_entity == "my-team"
+
+
+def test_report_rejects_a_malformed_set_override(tmp_path: Path) -> None:
+    path = tmp_path / "a.jsonl"
+    write_records(path, next(iter(_all_sources().values())))
+    with pytest.raises(SystemExit):
+        main(["--inputs", str(path), "--out", str(tmp_path / "r.md"), "--set", "nokey"])
+
+
 def test_wandb_flag_needs_config(tmp_path: Path) -> None:
     path = tmp_path / "a.jsonl"
     write_records(path, _records("original", [0.1], [0.1]))

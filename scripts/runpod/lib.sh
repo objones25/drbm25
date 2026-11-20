@@ -21,7 +21,9 @@
 #   compute_deadline_unix START_UNIX BUDGET_USD PRICE_PER_HOUR   print the deadline (unix seconds)
 #   run_alternating_chunks UNTIL CHUNK   status 0 done, 3 budget stop, 1 failure
 #   eval_stage, train_and_report UNTIL CHUNK
-#   on_exit STATUS             copy logs, then terminate the pod unless told not to
+#   spend_begin / spend_record / spend_total   dollars spent, kept in spend.json on the volume
+#   refuse_if_failed, install_exit_traps
+#   on_exit STATUS             record spend, copy logs, then terminate the pod unless told not to
 #
 # Test hooks (environment): DRBM25_ROOT, DRBM25_TTY (file read instead of /dev/tty),
 # DRBM25_SLEEP (command used for the terminate backoff), DRBM25_CONFIG.
@@ -35,10 +37,19 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../expanse/common.sh"
 readonly UV_VERSION=0.13.7
 readonly RUNPOD_CONSOLE_URL=https://console.runpod.io/pods
 readonly RUNPOD_CONFIG_DEFAULT=configs/runpod_a100_full.yaml
+# BUDGET_USD and PRICE_PER_HOUR are deliberately not stored: a relaunch must ask for the budget that
+# is left (see spend_total), or it could silently reuse the whole budget again.
 # Only these names are read from the .env, so a damaged file cannot set PATH or LD_PRELOAD.
-readonly RUNPOD_SETTING_NAMES=(HF_TOKEN WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY RUNPOD_API_KEY BUDGET_USD PRICE_PER_HOUR TERMINATE_ON_FINISH)
+readonly RUNPOD_SETTING_NAMES=(HF_TOKEN WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY RUNPOD_API_KEY TERMINATE_ON_FINISH)
 readonly TERMINATE_ATTEMPTS=3
-readonly TERMINATE_BACKOFF_S=(5 15 45)
+# Sleeps between the 3 attempts (after attempt 1 and after attempt 2).
+readonly TERMINATE_BACKOFF_S=(5 15)
+readonly KILL_AFTER_S=60           # SIGKILL this long after the TERM that `timeout` sends
+readonly TRAIN_TIMEOUT_MARGIN_S=1800
+readonly TRAIN_TIMEOUT_MIN_S=900
+readonly EVAL_TIMEOUT_S=7200       # per evaluation command and for the report
+readonly SMOKE_TIMEOUT_S=3600      # per smoke command
+readonly DISK_MIN_KB=94371840      # 90 GiB: needed before the first checkpoint of a run exists
 
 _runpod_log() {
   local now
@@ -61,6 +72,7 @@ runpod_paths() {
   DRBM25_DONE_DIR="$DRBM25_ROOT/.done"
   DRBM25_LOG_DIR="$DRBM25_ROOT/logs"
   DRBM25_ENV_FILE="$DRBM25_ROOT/.env"
+  DRBM25_SPEND_FILE="$DRBM25_ROOT/spend.json"
   DRBM25_FAILED_FILE="$DRBM25_ROOT/FAILED"
   RUNPOD_CONFIG=${DRBM25_CONFIG:-$RUNPOD_CONFIG_DEFAULT}
 }
@@ -206,7 +218,10 @@ collect_settings() {
   prompt_var WANDB_PROJECT "W&B project" --default drbm25
   prompt_var WANDB_ENTITY "W&B entity (optional, Enter to skip)" --optional
   prompt_var RUNPOD_API_KEY "RunPod API key with pods:write, used only to terminate this pod (hidden)" --secret
-  prompt_var BUDGET_USD "Dollar budget for this pod (for example 90)"
+  local spent
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  spent=$(spend_total) || return 1
+  prompt_var BUDGET_USD "REMAINING dollar budget for this launch (already spent by earlier launches: \$$spent; for example 90)"
   prompt_var PRICE_PER_HOUR "This pod's price per hour in dollars (for example 2.78)"
   prompt_var TERMINATE_ON_FINISH "Terminate the pod when finished (yes/no)" --default yes
   _require_positive_number BUDGET_USD
@@ -249,10 +264,122 @@ mark_done() {
 # A marker for a failure that must not be retried blindly: the next launch stops on it at once
 # instead of spending budget on the same error.
 mark_failed() {
-  mkdir -p -- "$DRBM25_ROOT"
+  # Best effort: a full or read-only volume must not stop the caller from cleaning up.
   # shellcheck disable=SC2312 # status is checked explicitly here, not left to set -e
-  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" >"$DRBM25_FAILED_FILE"
-  _runpod_log "error: $1 (wrote $DRBM25_FAILED_FILE; delete it after fixing the cause)"
+  if ! { mkdir -p -- "$DRBM25_ROOT" && printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" >"$DRBM25_FAILED_FILE"; }; then
+    _runpod_log "WARNING: could not write $DRBM25_FAILED_FILE"
+  fi
+  _runpod_log "error: $1 (FAILED marker: $DRBM25_FAILED_FILE; delete it after fixing the cause)"
+}
+
+# A launch that finds the marker must not start (and must not terminate: the user is here to fix it).
+refuse_if_failed() {
+  if [[ -f $DRBM25_FAILED_FILE ]]; then
+    _common_log "error: an earlier launch failed: $(<"$DRBM25_FAILED_FILE")"
+    _common_log "error: fix the cause, then delete $DRBM25_FAILED_FILE and run again"
+    _common_log "error: nothing was started and this pod was NOT terminated: it is still billing; terminate it at $RUNPOD_CONSOLE_URL if you stop here"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------- spend and time
+
+# Test hook: DRBM25_NOW_UNIX pins the clock.
+_now_unix() {
+  if [[ -n ${DRBM25_NOW_UNIX-} ]]; then printf '%s\n' "$DRBM25_NOW_UNIX"; else date +%s; fi
+}
+
+# Dollars spent by earlier launches (spend.json on the volume); 0 when there is none.
+spend_total() {
+  local value
+  if [[ ! -f $DRBM25_SPEND_FILE ]]; then
+    printf '0\n'
+    return 0
+  fi
+  value=$(sed -n 's/.*"spent_usd": *\([0-9][0-9]*\(\.[0-9]*\)\{0,1\}\).*/\1/p' "$DRBM25_SPEND_FILE")
+  if [[ ! $value =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    _common_log "error: $DRBM25_SPEND_FILE is malformed (no spent_usd number); fix or delete it"
+    return 1
+  fi
+  printf '%s\n' "$value"
+}
+
+# Start counting this launch's spend: START_UNIX is when billing for this launch began.
+spend_begin() {
+  SPEND_START_UNIX=$1
+  SPEND_PRICE=$2
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  SPEND_BASE_USD=$(spend_total) || return 1
+}
+
+# Writes base + elapsed hours x price. Called at the end of every chunk and from on_exit.
+spend_record() {
+  local now spent tmp
+  if [[ -z ${SPEND_PRICE-} ]]; then return 0; fi
+  now=$(_now_unix)
+  spent=$(awk -v b="$SPEND_BASE_USD" -v e="$((now - SPEND_START_UNIX))" -v p="$SPEND_PRICE" 'BEGIN { printf "%.4f", b + e * p / 3600 }')
+  if ! { mkdir -p -- "$DRBM25_ROOT" && tmp=$(mktemp "$DRBM25_ROOT/.spend.XXXXXX") &&
+    printf '{"spent_usd": %s, "updated_unix": %s}\n' "$spent" "$now" >"$tmp" &&
+    mv -f -- "$tmp" "$DRBM25_SPEND_FILE"; }; then
+    _runpod_log "WARNING: could not record spend in $DRBM25_SPEND_FILE"
+    return 1
+  fi
+}
+
+_timeout_bin() {
+  if [[ -n ${DRBM25_TIMEOUT-} ]]; then
+    printf '%s\n' "$DRBM25_TIMEOUT"
+  elif command -v timeout >/dev/null 2>&1; then
+    printf 'timeout\n'
+  elif command -v gtimeout >/dev/null 2>&1; then
+    printf 'gtimeout\n'
+  else
+    return 1
+  fi
+}
+
+# Runs "$@" for at most SECS seconds (GNU timeout). A hang (NCCL, vLLM) then ends as a failure.
+_with_timeout() {
+  local secs=$1 bin rc=0
+  shift
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  bin=$(_timeout_bin) || {
+    _common_log "error: GNU timeout not found (on macOS install coreutils for gtimeout)"
+    return 1
+  }
+  "$bin" --kill-after="$KILL_AFTER_S" "$secs" "$@" || rc=$?
+  if ((rc == 124 || rc == 137)); then
+    _runpod_log "error: command timed out after ${secs}s (hang?): $1 $2 ..."
+  fi
+  return "$rc"
+}
+
+_uv_timeout() {
+  local secs=$1
+  shift
+  _with_timeout "$secs" uv run --no-sync "$@"
+}
+
+# Fails (FAILED marker) when the volume cannot hold the next checkpoint: 1.2 x the last one, or 90 GiB
+# before the first. `df -Pk` and `du -sk` are POSIX.
+_check_disk() {
+  local mode=$1 run_dir=$2 have=$3 need_kb=$DISK_MIN_KB free_kb ckpt used_kb
+  if ((have > 0)); then
+    ckpt=$run_dir/$(printf 'step_%06d' "$have")
+    if [[ -d $ckpt ]]; then
+      used_kb=$(du -sk "$ckpt" | awk '{print $1}')
+      need_kb=$((used_kb * 12 / 10))
+    fi
+  fi
+  free_kb=$(df -Pk "$DRBM25_ROOT" | awk 'NR == 2 {print $4}')
+  if [[ ! $free_kb =~ ^[0-9]+$ ]]; then
+    mark_failed "cannot read free disk space of $DRBM25_ROOT (df printed '$free_kb')"
+    return 1
+  fi
+  if ((free_kb < need_kb)); then
+    mark_failed "not enough disk before training $mode: ${free_kb} KB free on the volume, need ${need_kb} KB (checkpoints are tens of GB each); free space or use a bigger volume"
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------- terminate
@@ -390,12 +517,12 @@ smoke_stage() {
   _runpod_log "GPU smoke: vLLM and full-model tests, then the 2-GPU memory check"
   # --no-cov: the repo's coverage gate would fail a two-file run.
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  if ! _uv pytest -p no:randomly --no-cov -m gpu tests/rollout/test_vllm_engine.py tests/ppo/test_models_full.py; then
+  if ! _uv_timeout "$SMOKE_TIMEOUT_S" pytest -p no:randomly --no-cov -m gpu tests/rollout/test_vllm_engine.py tests/ppo/test_models_full.py; then
     _runpod_log "error: GPU pytest failed"
     return 1
   fi
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  if ! _uv torchrun --nproc_per_node 2 scripts/memory_check.py --config "$RUNPOD_CONFIG" \
+  if ! _uv_timeout "$SMOKE_TIMEOUT_S" torchrun --nproc_per_node 2 scripts/memory_check.py --config "$RUNPOD_CONFIG" \
     "${RUNPOD_SET_ARGS[@]}" --ckpt-dir "$DRBM25_ROOT/memcheck"; then
     _runpod_log "error: memory check failed (exit 1 means an error or under 2 GiB headroom per GPU)"
     return 1
@@ -434,7 +561,7 @@ _is_positive_int() {
 
 # One torchrun for MODE up to STEP. Status 0 ok, 3 budget stop, 1 failure (FAILED written).
 _train_chunk() {
-  local mode=$1 step=$2 torchrun_rc=0 code='' have run_dir
+  local mode=$1 step=$2 torchrun_rc=0 code='' have after limit run_dir
   run_dir=$DRBM25_RUNS_DIR/$mode
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   have=$(latest_step "$run_dir") || return 1
@@ -442,16 +569,38 @@ _train_chunk() {
     _runpod_log "$mode already at step $have (>= $step); skipping this chunk"
     return 0
   fi
-  _runpod_log "training $mode: step $have -> $step"
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  _uv torchrun --nproc_per_node 2 --standalone -m drbm25.train \
+  _check_disk "$mode" "$run_dir" "$have" || return 1
+  # The trainer stops itself at the deadline, so a chunk running past it plus a margin is hung.
+  limit=$((DEADLINE_UNIX - $(_now_unix) + TRAIN_TIMEOUT_MARGIN_S))
+  if ((limit < TRAIN_TIMEOUT_MIN_S)); then limit=$TRAIN_TIMEOUT_MIN_S; fi
+  # A leftover exit_code (0 or 3 from the previous chunk) must never be read for this one: rank 0
+  # only overwrites it after load_config, and torchrun can fail before that.
+  rm -f -- "$run_dir/exit_code"
+  _runpod_log "training $mode: step $have -> $step (timeout ${limit}s)"
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  _uv_timeout "$limit" torchrun --nproc_per_node 2 --standalone -m drbm25.train \
     --config "$RUNPOD_CONFIG" --reward-mode "$mode" --run-name "$mode" --until-step "$step" \
     --deadline-unix "$DEADLINE_UNIX" --reserve-s "$RESERVE_S" "${RUNPOD_SET_ARGS[@]}" || torchrun_rc=$?
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  spend_record || true
+  if ((torchrun_rc == 124 || torchrun_rc == 137)); then
+    mark_failed "$mode training timed out after ${limit}s (hang?); see $run_dir/train_rank0.log"
+    return 1
+  fi
   # torchrun collapses worker exit codes; rank 0 writes the real one to exit_code.
   # shellcheck disable=SC2310 # a missing or malformed file means "no usable exit_code"
   code=$(run_exit_code "$run_dir") || code=''
   case $code in
-    0) return 0 ;;
+    0)
+      # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+      after=$(latest_step "$run_dir") || return 1
+      if ((after < step)); then
+        mark_failed "$mode wrote exit_code 0 but its latest complete checkpoint is step $after, not step $step"
+        return 1
+      fi
+      return 0
+      ;;
     3)
       _runpod_log "$mode stopped on the budget deadline (exit_code 3)"
       return 3
@@ -515,7 +664,7 @@ _run_eval() {
   local source=$1 out=$2 checkpoint=${3-}
   local args=(--config "$RUNPOD_CONFIG" --source "$source" --out "$out")
   if [[ -n $checkpoint ]]; then args+=(--checkpoint "$checkpoint"); fi
-  _uv python -m drbm25.eval.run_eval "${args[@]}" "${RUNPOD_SET_ARGS[@]}"
+  _uv_timeout "$EVAL_TIMEOUT_S" python -m drbm25.eval.run_eval "${args[@]}" "${RUNPOD_SET_ARGS[@]}"
 }
 
 # Always re-run: evaluation is deterministic (greedy) and cheap next to the cost of a missed report.
@@ -547,10 +696,10 @@ print(common_step(Path(sys.argv[1]), Path(sys.argv[2])))
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   _run_eval checkpoint "$out_dir/trained-count_once.jsonl" "$count_once_dir/$step_name" || return 1
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  _uv python -m drbm25.eval.report \
+  _uv_timeout "$EVAL_TIMEOUT_S" python -m drbm25.eval.report \
     --inputs "$out_dir/original.jsonl" "$out_dir/untrained.jsonl" \
     "$out_dir/trained-normal.jsonl" "$out_dir/trained-count_once.jsonl" \
-    --out "$out_dir/report.md" --wandb --config "$RUNPOD_CONFIG" || return 1
+    --out "$out_dir/report.md" --wandb --config "$RUNPOD_CONFIG" "${RUNPOD_SET_ARGS[@]}" || return 1
   _runpod_log "report: $out_dir/report.md"
 }
 
@@ -586,19 +735,33 @@ _copy_logs() {
   done
 }
 
-# EXIT trap body. Always attempts to terminate (also after a failure) unless told not to, and always
-# returns 0 so the script keeps the exit status it was already ending with.
+# Traps: any exit, including a closed terminal (HUP), INT and TERM, copies logs and terminates the pod.
+# SIGPIPE is ignored so a dead pipe or terminal cannot kill the script halfway through on_exit.
+install_exit_traps() {
+  trap 'on_exit $?' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap '' PIPE
+}
+
+# EXIT trap body. Everything in it is best effort and terminate_pod runs last, whatever failed before
+# (a full volume, a missing directory, an unset variable). It always returns 0 so the script keeps the
+# exit status it was already ending with.
 on_exit() {
   local status=${1:-0}
-  if ((status != 0)) && [[ ! -f $DRBM25_FAILED_FILE ]]; then
+  set +e +u
+  # audit-bash disable=B102 # this only removes an inherited ERR trap; set -E comes from common.sh
+  trap - ERR
+  if ((status != 0)) && [[ ! -f ${DRBM25_FAILED_FILE-} ]]; then
     mark_failed "run_all.sh exited with status $status during stage '${RUNPOD_STAGE:-unknown}'"
   fi
-  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  _copy_logs || _runpod_log "WARNING: copying logs failed"
+  spend_record
+  _copy_logs
   if [[ ${NO_TERMINATE-} == 1 || ${TERMINATE_ON_FINISH-} == no ]]; then
     _runpod_log "not terminating the pod (--no-terminate or TERMINATE_ON_FINISH=no): billing continues"
     return 0
   fi
-  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  terminate_pod || true
+  terminate_pod
+  return 0
 }

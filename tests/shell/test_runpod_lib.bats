@@ -63,6 +63,7 @@ case $cmd in
     [[ -f $STUB_DIR/exit_${run}_$step ]] && code=$(cat "$STUB_DIR/exit_${run}_$step")
     if [[ $code != missing ]]; then echo "$code" >"$out/$run/exit_code"; fi
     echo '{"step": 1}' >>"$out/$run/metrics.jsonl"
+    if [[ $code == 0 && -z ${STUB_NO_LATEST-} ]]; then printf 'step_%06d\n' "$step" >"$out/$run/latest"; fi
     exit 1 # torchrun collapses worker codes
     ;;
   pytest) exit "${STUB_PYTEST_RC:-0}" ;;
@@ -74,6 +75,20 @@ case $cmd in
     ;;
 esac
 EOF
+  # GNU timeout shim: STUB_TIMEOUT_RC makes it report a timeout without running the command.
+  cat >"$bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+echo "timeout $*" >>"$STUB_LOG"
+if [[ -n ${STUB_TIMEOUT_RC-} ]]; then exit "$STUB_TIMEOUT_RC"; fi
+while [[ $1 == --* ]]; do shift; done
+shift
+exec "$@"
+EOF
+  cat >"$bin/df" <<'EOF'
+#!/usr/bin/env bash
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "vol 1 1 ${STUB_DF_KB:-999999999999} 1% /workspace"
+EOF
   chmod +x "$bin"/*
   export PATH=$bin:$PATH
 }
@@ -82,12 +97,13 @@ EOF
 in_lib() {
   env -i PATH="$PATH" HOME="$HOME" STUB_LOG="$STUB_LOG" STUB_DIR="$STUB_DIR" \
     DRBM25_ROOT="$DRBM25_ROOT" DRBM25_SLEEP="$DRBM25_SLEEP" DRBM25_TTY="$DRBM25_TTY" \
+    DRBM25_NOW_UNIX="${DRBM25_NOW_UNIX-}" \
     "$@" bash -c 'source "$1"; shift; runpod_paths; eval "$1"' _ "$LIB" "$SNIPPET"
 }
 
 calls() { cat "$STUB_LOG"; }
 
-train_calls() { grep -o 'torchrun.*--run-name [a-z_]* .*--until-step [0-9]*' "$STUB_LOG" | sed 's/.*--run-name \([a-z_]*\) .*--until-step \([0-9]*\)/\1@\2/'; }
+train_calls() { grep '^uv ' "$STUB_LOG" | grep -o 'torchrun.*--run-name [a-z_]* .*--until-step [0-9]*' | sed 's/.*--run-name \([a-z_]*\) .*--until-step \([0-9]*\)/\1@\2/'; }
 
 # ---------------------------------------------------------------- env file
 
@@ -200,20 +216,34 @@ train_calls() { grep -o 'torchrun.*--run-name [a-z_]* .*--until-step [0-9]*' "$S
 HF_TOKEN=hf_a
 RUNPOD_API_KEY=rp_a
 WANDB_PROJECT=drbm25
-BUDGET_USD=90
-PRICE_PER_HOUR=2.78
 TERMINATE_ON_FINISH=yes
 WANDB_ENTITY=
 EOF
   SNIPPET='collect_settings; printf "%s" "$WANDB_API_KEY"'
   printf 'wb_new\n' >"$DRBM25_TTY"
-  run -0 --separate-stderr in_lib
+  run -0 --separate-stderr in_lib BUDGET_USD=90 PRICE_PER_HOUR=2.78
   [[ $output == wb_new ]]
   [[ $stderr == *WANDB_API_KEY* ]]
   [[ $stderr != *HF_TOKEN* ]]
   [[ $stderr != *BUDGET_USD* ]]
   grep -qx 'WANDB_API_KEY=wb_new' "$DRBM25_ROOT/.env"
+  ! grep -q 'BUDGET_USD\|PRICE_PER_HOUR' "$DRBM25_ROOT/.env"
   [[ $(stat -c %a "$DRBM25_ROOT/.env" 2>/dev/null || stat -f %Lp "$DRBM25_ROOT/.env") == 600 ]]
+}
+
+@test "collect_settings never reuses a saved budget or price from the .env" {
+  printf 'HF_TOKEN=a\nWANDB_API_KEY=b\nRUNPOD_API_KEY=c\nWANDB_PROJECT=p\nWANDB_ENTITY=\nBUDGET_USD=90\nPRICE_PER_HOUR=2.78\nTERMINATE_ON_FINISH=yes\n' >"$DRBM25_ROOT/.env"
+  SNIPPET='collect_settings'
+  run -1 --separate-stderr in_lib
+  [[ $stderr == *BUDGET_USD* ]]
+}
+
+@test "collect_settings shows the dollars already spent on earlier launches at the budget prompt" {
+  printf '{"spent_usd": 41.5000, "updated_unix": 1}\n' >"$DRBM25_ROOT/spend.json"
+  SNIPPET='collect_settings'
+  printf '50\n' >"$DRBM25_TTY"
+  run -1 --separate-stderr in_lib HF_TOKEN=a WANDB_API_KEY=b RUNPOD_API_KEY=c WANDB_PROJECT=p WANDB_ENTITY=
+  [[ $stderr == *41.5* ]]
 }
 
 @test "collect_settings rejects a non-numeric budget and an invalid terminate flag" {
@@ -509,4 +539,179 @@ on_exit_env() { printf '%s\n' RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key; }
 @test "run_all.sh rejects an unknown option with status 2" {
   run -2 --separate-stderr bash "$RUN_ALL" --bogus
   [[ $stderr == *--bogus* ]]
+}
+
+# ---------------------------------------------------------------- fix round 1
+
+@test "on_exit still terminates the pod when the volume is unwritable (C1)" {
+  SNIPPET='set -Ee; trap "false" ERR; chmod -R a-w "$DRBM25_ROOT"; rc=0; on_exit 1 || rc=$?; chmod -R u+w "$DRBM25_ROOT"; echo "rc=$rc"'
+  run -0 in_lib RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key
+  grep -q 'curl .*-X DELETE .*pods/pod123' "$STUB_LOG"
+}
+
+@test "on_exit terminates even when the paths were never set up (C1)" {
+  SNIPPET='unset DRBM25_ROOT; set -u; bash_rc=0; DRBM25_FAILED_FILE=/nonexistent/dir/FAILED DRBM25_LOG_DIR=/nonexistent/logs DRBM25_RUNS_DIR=/nonexistent/runs on_exit 1'
+  run -0 in_lib RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key
+  grep -q 'curl .*-X DELETE' "$STUB_LOG"
+}
+
+@test "runpod config keeps one checkpoint per run (C2)" {
+  grep -qE '^  keep_ckpts: 1( |$)' "${BATS_TEST_DIRNAME}/../../configs/runpod_a100_full.yaml"
+}
+
+@test "a chunk is refused with FAILED when the volume has under 90 GB free and no checkpoint exists (C2)" {
+  SNIPPET='rc=0; run_alternating_chunks 50 50 || rc=$?; echo "rc=$rc"'
+  run -0 --separate-stderr in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_DF_KB=94371839
+  [[ $output == *rc=1* ]]
+  [[ -z $(train_calls) ]]
+  grep -qi 'disk' "$DRBM25_ROOT/FAILED"
+}
+
+@test "a chunk runs when the volume has exactly 90 GB free and no checkpoint exists (C2)" {
+  SNIPPET='run_alternating_chunks 50 50'
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_DF_KB=94371840
+  [[ $(train_calls | tr '\n' ' ') == 'normal@50 count_once@50 ' ]]
+}
+
+@test "the disk preflight needs 1.2x the last checkpoint size once one exists (C2)" {
+  local mode
+  for mode in normal count_once; do
+    mkdir -p "$DRBM25_ROOT/runs/$mode/step_000050"
+    head -c 2097152 /dev/zero >"$DRBM25_ROOT/runs/$mode/step_000050/blob"
+    echo step_000050 >"$DRBM25_ROOT/runs/$mode/latest"
+  done
+  SNIPPET='rc=0; run_alternating_chunks 100 50 || rc=$?; echo "rc=$rc"'
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_DF_KB=2400
+  [[ $output == *rc=1* ]]
+  [[ -z $(train_calls) ]]
+  grep -q 'normal' "$DRBM25_ROOT/FAILED"
+  rm -f "$DRBM25_ROOT/FAILED"
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_DF_KB=2500
+  [[ $(train_calls | head -1) == normal@100 ]]
+}
+
+@test "the report carries the W&B project and entity (W&B)" {
+  SNIPPET='train_and_report 50 50'
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_COMMON_STEP=50 WANDB_PROJECT=myproj WANDB_ENTITY=myteam
+  grep 'drbm25.eval.report' "$STUB_LOG" | grep -q -- '--set run.wandb_project=myproj'
+  grep 'drbm25.eval.report' "$STUB_LOG" | grep -q -- '--set run.wandb_entity=myteam'
+}
+
+@test "spend_record stores spent-so-far = earlier spend + elapsed hours x price (I1)" {
+  printf '{"spent_usd": 10.0000, "updated_unix": 1}\n' >"$DRBM25_ROOT/spend.json"
+  SNIPPET='spend_begin 1000 2.5; spend_record'
+  run -0 in_lib DRBM25_NOW_UNIX=4600
+  grep -q '"spent_usd": 12.5000' "$DRBM25_ROOT/spend.json"
+}
+
+@test "spend_record accumulates across launches without double counting (I1)" {
+  SNIPPET='spend_begin 0 2; spend_record; spend_record'
+  run -0 in_lib DRBM25_NOW_UNIX=1800
+  grep -q '"spent_usd": 1.0000' "$DRBM25_ROOT/spend.json"
+  SNIPPET='spend_total'
+  run -0 in_lib
+  [[ $output == 1.0000 ]]
+}
+
+@test "spend_total is 0 when no spend file exists, and fails on a malformed one (I1)" {
+  SNIPPET='spend_total'
+  run -0 in_lib
+  [[ $output == 0 ]]
+  echo garbage >"$DRBM25_ROOT/spend.json"
+  run -1 --separate-stderr in_lib
+  [[ $stderr == *spend.json* ]]
+}
+
+@test "spend_record before spend_begin is a no-op (I1)" {
+  SNIPPET='spend_record'
+  run -0 in_lib
+  [[ ! -e $DRBM25_ROOT/spend.json ]]
+}
+
+@test "each finished chunk and on_exit record spend (I1)" {
+  SNIPPET='spend_begin 0 3; run_alternating_chunks 50 50'
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 DRBM25_NOW_UNIX=3600
+  grep -q '"spent_usd": 3.0000' "$DRBM25_ROOT/spend.json"
+  rm "$DRBM25_ROOT/spend.json"
+  SNIPPET='spend_begin 0 3; on_exit 0'
+  run -0 in_lib DRBM25_NOW_UNIX=7200 NO_TERMINATE=1
+  grep -q '"spent_usd": 6.0000' "$DRBM25_ROOT/spend.json"
+}
+
+@test "a stale exit_code 0 from an earlier chunk is not read as success (I2)" {
+  mkdir -p "$DRBM25_ROOT/runs/normal"
+  echo 0 >"$DRBM25_ROOT/runs/normal/exit_code"
+  echo missing >"$STUB_DIR/exit_normal_50"
+  SNIPPET='rc=0; run_alternating_chunks 50 50 || rc=$?; echo "rc=$rc"'
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600
+  [[ $output == *rc=1* ]]
+  [[ -f $DRBM25_ROOT/FAILED ]]
+}
+
+@test "exit_code 0 without a checkpoint at the requested step is a failure (I2)" {
+  SNIPPET='rc=0; run_alternating_chunks 50 50 || rc=$?; echo "rc=$rc"'
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_NO_LATEST=1
+  [[ $output == *rc=1* ]]
+  grep -q 'step 50' "$DRBM25_ROOT/FAILED"
+}
+
+@test "install_exit_traps: SIGHUP runs on_exit, which terminates the pod (I3)" {
+  SNIPPET='install_exit_traps; kill -HUP $$'
+  run -129 in_lib RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key
+  grep -q 'curl .*-X DELETE .*pods/pod123' "$STUB_LOG"
+}
+
+@test "install_exit_traps: SIGTERM and SIGINT also terminate the pod (I3)" {
+  SNIPPET='install_exit_traps; kill -TERM $$'
+  run -143 in_lib RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key
+  grep -q 'curl .*-X DELETE' "$STUB_LOG"
+}
+
+@test "run_all.sh logs straight to a file and tells the user to use tmux (I3)" {
+  ! grep -q 'tee' "$RUN_ALL"
+  grep -q 'tmux' "${BATS_TEST_DIRNAME}/../../README.md"
+}
+
+@test "training runs under timeout, limited to the time to the deadline plus a margin (I4)" {
+  SNIPPET='run_alternating_chunks 50 50'
+  run -0 in_lib DEADLINE_UNIX=10000 RESERVE_S=600 DRBM25_NOW_UNIX=1000
+  grep -q 'timeout --kill-after=[0-9]* 10800 uv run --no-sync torchrun' "$STUB_LOG"
+}
+
+@test "a hung training chunk (timeout status 124) becomes FAILED (I4)" {
+  SNIPPET='rc=0; run_alternating_chunks 50 50 || rc=$?; echo "rc=$rc"'
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=600 STUB_TIMEOUT_RC=124
+  [[ $output == *rc=1* ]]
+  grep -qi 'timed out' "$DRBM25_ROOT/FAILED"
+}
+
+@test "smoke and eval commands also run under timeout and fail when it fires (I4)" {
+  SNIPPET='smoke_stage'
+  run -0 in_lib
+  [[ $(grep -c '^timeout' "$STUB_LOG") == 2 ]]
+  : >"$STUB_LOG"
+  run -1 --separate-stderr in_lib STUB_TIMEOUT_RC=124
+  [[ $stderr == *"timed out"* ]]
+  : >"$STUB_LOG"
+  SNIPPET='eval_stage'
+  run -0 in_lib STUB_COMMON_STEP=50
+  [[ $(grep -c '^timeout .*run_eval' "$STUB_LOG") == 4 ]]
+  grep -q '^timeout .*eval.report' "$STUB_LOG"
+}
+
+@test "refuse_if_failed returns 1, names the marker and says the pod was not terminated" {
+  echo "earlier failure" >"$DRBM25_ROOT/FAILED"
+  SNIPPET='refuse_if_failed'
+  run -1 --separate-stderr in_lib
+  [[ $stderr == *FAILED* ]]
+  [[ $stderr == *"NOT terminated"* ]]
+  rm "$DRBM25_ROOT/FAILED"
+  run -0 in_lib
+}
+
+@test "run_all.sh stops before prompting and does not terminate when FAILED exists" {
+  echo "earlier failure" >"$DRBM25_ROOT/FAILED"
+  run -1 --separate-stderr env DRBM25_ROOT="$DRBM25_ROOT" DRBM25_TTY="$DRBM25_TTY" RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key bash "$RUN_ALL"
+  [[ $stderr == *FAILED* ]]
+  ! grep -q '^curl' "$STUB_LOG"
 }
