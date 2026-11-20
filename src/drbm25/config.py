@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, get_args, get_origin, get_type_hints
+from typing import Any, Literal, TypeGuard, get_args, get_origin, get_type_hints
 
 import yaml
 
@@ -124,6 +124,11 @@ def _is_union(tp: Any) -> bool:
     return get_origin(tp) in (typing.Union, types.UnionType)
 
 
+def _is_dataclass_type(tp: Any) -> TypeGuard[type]:
+    """`is_dataclass` also accepts instances; config field types are always classes."""
+    return isinstance(tp, type) and is_dataclass(tp)
+
+
 def _coerce(value: Any, tp: Any, where: str) -> Any:
     """Convert a parsed YAML value to type `tp`, strictly (no bool-as-int, no str-as-number)."""
     if _is_union(tp):
@@ -132,7 +137,7 @@ def _coerce(value: Any, tp: Any, where: str) -> Any:
             return None
         (inner,) = (a for a in args if a is not type(None))
         return _coerce(value, inner, where)
-    if is_dataclass(tp):
+    if _is_dataclass_type(tp):
         return _build(tp, value, where)
     if get_origin(tp) is Literal:
         if value not in get_args(tp):
@@ -154,7 +159,7 @@ def _coerce(value: Any, tp: Any, where: str) -> Any:
         raise TypeError(f"{where}: unsupported config field type {tp!r}")
     if not ok:
         raise ConfigError(f"{where}: expected {getattr(tp, '__name__', tp)}, got {value!r}")
-    return Path(value) if tp is Path else float(value) if tp is float else value
+    return Path(str(value)) if tp is Path else float(value) if tp is float else value
 
 
 def _build(cls: type, data: Any, where: str) -> Any:
@@ -213,13 +218,13 @@ def _apply_override(raw: dict[str, Any], dotted: str, text: str) -> None:
             raise ConfigError(f"unknown key '{dotted}'")
         tp = hints[part]
         if i == len(parts) - 1:
-            if is_dataclass(tp) or (_is_union(tp) and any(is_dataclass(a) for a in get_args(tp))):
+            if _is_dataclass_type(tp) or (_is_union(tp) and any(_is_dataclass_type(a) for a in get_args(tp))):
                 raise ConfigError(f"'{dotted}' is a section; override one of its fields")
             node[part] = _parse_override(text, tp, dotted)
             return
         if _is_union(tp):
             (tp,) = (a for a in get_args(tp) if a is not type(None))
-        if not is_dataclass(tp):
+        if not _is_dataclass_type(tp):
             raise ConfigError(f"unknown key '{dotted}'")
         child = node.get(part)
         if not isinstance(child, dict):

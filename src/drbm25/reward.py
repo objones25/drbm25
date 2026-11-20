@@ -1,8 +1,10 @@
 """Format check, nDCG@k and the scalar reward for the query-rewriting task.
 
 Mirrors upstream DeepRetrieval (``msmarco.py`` format checks and reward,
-``Lucene/utils.py`` nDCG) with two deliberate differences: a non-string
-``query`` is a format error, and no exception is swallowed.
+``Lucene/utils.py`` nDCG) with three deliberate differences: a non-string
+``query`` is a format error, no exception is swallowed, and JSON that is not
+an object is ``FormatError(NO_QUERY_KEY)`` (reward -2) where upstream scored 0
+via a swallowed exception.
 """
 
 import json

@@ -10,4 +10,5 @@ uv sync                # creates .venv from uv.lock (Python 3.12)
 uv sync --extra vllm   # Linux only: adds vllm==0.19.0
 uv run pytest          # default run deselects gpu and integration tests
 uv run ruff check .
+uv run pyright
 ```

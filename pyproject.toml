@@ -31,6 +31,7 @@ exclude-newer = "2026-11-05T00:00:00Z"
 [dependency-groups]
 dev = [
     "hypothesis>=6.170.14",
+    "pyright==1.1.414",
     "pytest>=9.2.0",
     "pytest-cov>=7.1.0",
     "pytest-randomly>=5.0.0",
@@ -92,3 +93,11 @@ source_paths = ["src"]
 also_copy = []
 pytest_add_cli_args = ["-p", "no:randomly", "--no-cov", "-q"]
 pytest_add_cli_args_test_selection = ["tests"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+include = ["src", "tests"]
+exclude = ["scripts", "upstream", ".venv", "runs", "data", "indexes"]
+typeCheckingMode = "standard"
