@@ -81,6 +81,62 @@ the other 21,916; the test set is all 2,305 dev queries (`run_eval` never sees v
 With `--wandb` (and `--config`) the tables are also logged to a W&B run (`job_type` report), and the input
 jsonl files plus `report.md` are logged as one artifact, `eval-results` (type `evaluation`).
 
+## Publishing results
+
+```bash
+uv run python -m drbm25.publish --run-dir RUN_DIR [--eval-jsonl F] [--report F] [--namespace N] \
+  [--repo-prefix drbm25] [--private | --public] [--code-url URL] [--dry-run]
+```
+
+The RunPod launcher runs this for both runs after the report; on Expanse run it from the login node (step 8
+above). It needs `HF_TOKEN` in the environment with write access, checked with `whoami` before anything is
+created or uploaded. Each run goes to its own repo, private unless `--public`:
+`<your user>/drbm25-<model>-<reward mode>`, for example `drbm25-qwen2.5-3b-normal` (RunPod, full fine-tune) or
+`drbm25-qwen2.5-1.5b-lora-count_once` (Expanse, LoRA). What is uploaded:
+
+- the selected policy from `best/`: for a full fine-tune `model.safetensors` plus the base model's `config.json`,
+  `generation_config.json` and tokenizer files; for LoRA a PEFT adapter (`adapter_model.safetensors`,
+  `adapter_config.json` naming the base model and its pinned revision) plus the tokenizer files;
+- `provenance/best_meta.json`, `provenance/run_manifest.json`, the run's test-set evaluation
+  `provenance/trained-<mode>.jsonl` and `provenance/report.md`;
+- `README.md`, a model card with the base model and revision, reward mode, best and trained steps, validation and
+  test nDCG@10 under both scorers, seeds, config sha256 and the code commit;
+- the base model's `LICENSE`. The two base models are licensed differently (their model cards at the pinned
+  revisions, read 2026-11-20): Qwen2.5-1.5B-Instruct is `apache-2.0`, Qwen2.5-3B-Instruct is the Qwen Research
+  License (non-commercial). The card copies the base card's license fields, and for the research license a
+  `NOTICE` file carries the attribution its section 3c requires.
+
+Resume checkpoints (optimizer state) are never uploaded. `load_run` refuses an eval file that scores a different
+best step, or a report whose row for the run disagrees with the eval file.
+
+Verification: after the commit the repo is listed again and every file is compared with the local copy (LFS files
+by sha256 and size, small files by their git blob id and size). Only if all match is `RUN_DIR/UPLOADED.json`
+written (repo id, the verified revision, best step, every file's sha256 and size, time) and a copy without the
+revision and time committed to the repo (so an unchanged re-run commits nothing). A commit that changes files also
+deletes the repo's old `UPLOADED.json`, so the Hub never shows the marker beside unverified files.
+A re-run uploads only files whose hash changed, so running it again is safe and cheap. Network errors (connection,
+timeout, HTTP 5xx/429) are retried up to 4 attempts with waits of 2, 5 and 15 s.
+
+When is it safe to delete the RunPod volume? When `bash scripts/runpod/launch.sh --status` prints
+`safe to delete the volume: yes` (both repos hold `UPLOADED.json`), or `drbm25.publish` logged "safe to delete
+the volume" (both `runs/*/UPLOADED.json` match the current `best/meta.json`). If `PUBLISH_FAILED` exists, keep the
+volume and publish again. The upload covers the selected policies and results, not the resume checkpoints: after
+deleting the volume a run cannot be resumed.
+
+Loading a published model (private repos need a token with read access):
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+# full fine-tune
+model = AutoModelForCausalLM.from_pretrained("<user>/drbm25-qwen2.5-3b-normal")
+# LoRA: the base at the revision in adapter_config.json, then the adapter
+base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct", revision="989aa7980e4cf806f80c7fef2b1adb7bc71aa306")
+model = PeftModel.from_pretrained(base, "<user>/drbm25-qwen2.5-1.5b-lora-normal")
+tokenizer = AutoTokenizer.from_pretrained("<user>/drbm25-qwen2.5-1.5b-lora-normal")
+```
+
 ## Running on SDSC Expanse (2x V100 32GB)
 
 Scripts live in `scripts/expanse/`; the profile is `configs/expanse_v100_lora.yaml` (Qwen2.5-1.5B,
@@ -182,6 +238,14 @@ Everything below is a sequence of commands to run in a login-node shell. Run `sb
      --out "$DRBM25_RUNS_DIR"/eval/report.md'
    ```
 
+8. Publish both runs to the Hugging Face Hub from the login node (compute nodes may be offline; see
+   "Publishing results"). `HF_TOKEN` must be in your environment and allowed to write model repos:
+
+   ```bash
+   scripts/expanse/run.sh bash -c 'for m in normal count_once; do
+     uv run --frozen python -m drbm25.publish --run-dir "$DRBM25_RUNS_DIR/$m" || exit 1; done'
+   ```
+
 Shell tests: `bats tests/shell/` (needs bats >= 1.5 and bash >= 4 for `mapfile`) and
 `shellcheck scripts/expanse/*.sh scripts/expanse/*.sbatch`.
 
@@ -221,7 +285,9 @@ itself (also after a fatal error). The network volume `drbm25` keeps everything 
   `--ref <pushed branch or tag>`. `launch.sh` checks this with `git ls-remote` before it creates anything.
 - A RunPod API key allowed to read the catalog, list and create network volumes, pods and secrets, and
   terminate pods (`pods:write`). The pod uses the same key, stored as a RunPod secret, to terminate itself.
-- A Hugging Face token and a Weights & Biases API key.
+- A Hugging Face token with the `write` role (or a fine-grained token with `repo.write` on your user), and a
+  Weights & Biases API key. `launch.sh` checks the token with `whoami` before it creates anything and refuses a
+  read-only one, because the pod uploads the trained models to your account when it finishes.
 
 ### Launch
 
@@ -307,9 +373,11 @@ bash scripts/runpod/launch.sh --stop
 bash scripts/runpod/launch.sh --stop --yes
 ```
 
-`--status` prints the pod's id, status, hourly cost and data center. `--logs` runs a fixed read-only command
+`--status` prints the pod's id, status, hourly cost and data center, then asks the Hub whether each run's repo
+holds `UPLOADED.json` and prints `safe to delete the volume: yes` only when both do (this works after the pod is
+gone; see "Publishing results"). `--logs` runs a fixed read-only command
 in the pod through RunPod's exec API and prints the FAILED marker (if any), `spend.json` and the last 40 lines of
-the newest `logs/bootstrap-*.log` and `logs/run_all-*.log`. `--watch` repeats status and the last 10 log lines
+the newest `logs/bootstrap-*.log` and `logs/run_all-*.log` (plus `PUBLISH_FAILED` and each run's `UPLOADED.json`). `--watch` repeats status and the last 10 log lines
 until the pod is gone. `--stop` terminates the pod after you type `yes` (`--stop --yes` without asking); the
 volume and its data are kept, but
 the run is cut off at once, so `spend.json` misses the time since the last finished chunk. In the RunPod web
@@ -344,7 +412,10 @@ asks anything: a missing setting, or a secret reference RunPod did not replace (
    if 2 fails too, `FAILED` is written and the pod is terminated; a later pod never retries a size larger than
    the saved one, and once either run has a checkpoint the saved size is the only one checked: if it fails on
    a new pod, `FAILED` is written instead of stepping down, so both runs train every step at the same micro
-   batch), training, evaluation of each run's `best/` policy, report. Data and model stages leave markers in `/workspace/drbm25/.done/` and are skipped on
+   batch), training, evaluation of each run's `best/` policy, report, and publishing both runs to the Hugging
+   Face Hub (`python -m drbm25.publish`, at most 1 h per run; a failure writes `/workspace/drbm25/PUBLISH_FAILED`,
+   logs an `ERROR` and still ends the launch normally and terminates the pod, so a relaunch only needs to publish
+   again). Data and model stages leave markers in `/workspace/drbm25/.done/` and are skipped on
    a re-run; Java, uv, `uv sync` and training run every launch (training resumes from the latest checkpoint), and the
    smoke test runs once per pod. The W&B project and entity you entered are applied to training, evaluation and the
    report.
@@ -357,7 +428,7 @@ asks anything: a missing setting, or a secret reference RunPod did not replace (
    after every chunk and on exit, so a relaunch shows the total already spent; give it the remaining budget, not the
    original one. Training stops at the next
    checkpoint boundary once one more chunk would end less than `RESERVE_S` (default 3600 s, an unmeasured
-   estimate for four evaluation runs, the report and the terminate call) before the deadline; override with
+   estimate for four evaluation runs, the report and the terminate call; it does not budget for the upload) before the deadline; override with
    `RESERVE_S=...`. The chunk estimate is the larger of the trainer's own (mean step time x `run.ckpt_every`)
    and the previous chunk's wall-clock, which the launcher measures and passes as `--prev-chunk-s` (it includes
    torchrun start, model loads, vLLM init, validation and the checkpoint save). Both runs advance in chunks of
@@ -403,8 +474,8 @@ An interactive launch that finds a `FAILED` marker stops before prompting and do
 cause, delete the file and run again, or terminate the pod yourself.
 
 Where things are (all under `/workspace/drbm25`): `runs/{normal,count_once}/` (the sharded resume checkpoint,
-`best/`, `run_manifest.json`, `metrics.jsonl`, `train_rank*.log`, `exit_code`), `runs/eval/` (per-query jsonl
-and `report.md`), `repo/` (the clone the pod runs), `logs/` (`bootstrap-*.log`, `run_all-*.log`, copies of the
+`best/`, `run_manifest.json`, `metrics.jsonl`, `train_rank*.log`, `exit_code`, `UPLOADED.json` once published),
+`runs/eval/` (per-query jsonl and `report.md`), `PUBLISH_FAILED` (when the upload failed), `repo/` (the clone the pod runs), `logs/` (`bootstrap-*.log`, `run_all-*.log`, copies of the
 run logs made on exit, archived `FAILED-*` markers), `micro_batch` (the
 micro batch size the smoke stage chose), `spend.json`, `hf/` (model cache), `indexes/`, `data/`, `.env`.
 

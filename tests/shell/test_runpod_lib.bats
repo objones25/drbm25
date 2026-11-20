@@ -104,6 +104,18 @@ case $cmd in
   python)
     if [[ $* == *deadline_from_budget* ]]; then echo 1234567890; fi
     if [[ $* == *spike_monitor.py* ]]; then exit "${STUB_SPIKE_RC:-0}"; fi
+    if [[ $* == *drbm25.publish* ]]; then
+      # Writes RUN_DIR/UPLOADED.json and exits 0, unless STUB_PUBLISH_RC_<mode> is set (then exits with it).
+      run_dir=''
+      while (($#)); do
+        if [[ $1 == --run-dir ]]; then run_dir=$2; fi
+        shift
+      done
+      rc_var=STUB_PUBLISH_RC_${run_dir##*/}
+      if [[ -n ${!rc_var-} ]]; then exit "${!rc_var}"; fi
+      echo '{}' >"$run_dir/UPLOADED.json"
+      exit 0
+    fi
     if [[ $* == *drbm25.eval.report* ]]; then
       # Writes --out (unless STUB_REPORT_NO_OUT), then exits STUB_REPORT_RC (a failed W&B upload).
       while (($#)); do
@@ -684,6 +696,44 @@ memchecks() { grep '^memcheck micro=' "$STUB_LOG" | sed 's/memcheck micro=//' | 
   run -1 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600
   ! grep -q 'run_eval' "$STUB_LOG"
   [[ -f $DRBM25_ROOT/FAILED ]]
+}
+
+# ---------------------------------------------------------------- publish_stage
+
+make_runs() {
+  mkdir -p "$DRBM25_ROOT/runs/normal/best" "$DRBM25_ROOT/runs/count_once/best"
+}
+
+@test "publish_stage publishes both runs and says the volume is safe to delete" {
+  make_runs
+  echo old >"$DRBM25_ROOT/PUBLISH_FAILED"
+  SNIPPET='publish_stage'
+  run -0 --separate-stderr in_lib DRBM25_REPO_URL=https://github.com/me/drbm25
+  grep -q -- "drbm25.publish --run-dir $DRBM25_ROOT/runs/normal --code-url https://github.com/me/drbm25" "$STUB_LOG"
+  grep -q -- "drbm25.publish --run-dir $DRBM25_ROOT/runs/count_once --code-url https://github.com/me/drbm25" "$STUB_LOG"
+  [[ $stderr == *"safe to delete the volume"* ]]
+  [[ ! -e $DRBM25_ROOT/PUBLISH_FAILED ]]
+  [[ ! -e $DRBM25_ROOT/FAILED ]]
+}
+
+@test "a publish failure writes PUBLISH_FAILED (not FAILED), keeps going, and the pod is still terminated" {
+  make_runs
+  SNIPPET='install_exit_traps; publish_stage || echo "publish rc=$?"'
+  run -0 --separate-stderr in_lib STUB_PUBLISH_RC_normal=1 RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key
+  [[ $output == *"publish rc=1"* ]]
+  grep -q -- "drbm25.publish --run-dir $DRBM25_ROOT/runs/count_once" "$STUB_LOG"
+  grep -q 'normal' "$DRBM25_ROOT/PUBLISH_FAILED"
+  ! grep -q 'count_once' "$DRBM25_ROOT/PUBLISH_FAILED"
+  [[ ! -e $DRBM25_ROOT/FAILED ]]
+  [[ $stderr == *ERROR*publish* ]]
+  [[ $stderr != *"safe to delete the volume"* ]]
+  grep -q 'curl .*-X DELETE .*pods/pod123' "$STUB_LOG"
+}
+
+@test "run_all.sh publishes after the evaluation and report and does not fail the launch on a publish error" {
+  grep -q '^  stage publish$' "$RUN_ALL"
+  [[ $(grep -n 'train_and_report "\$total_steps"' "$RUN_ALL" | cut -d: -f1) -lt $(grep -n '^  stage publish$' "$RUN_ALL" | cut -d: -f1) ]]
+  grep -q 'publish_stage ||' "$RUN_ALL"
 }
 
 # ---------------------------------------------------------------- on_exit

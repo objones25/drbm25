@@ -24,6 +24,10 @@
 #   POST   /v2/pods             https://docs.runpod.io/api-reference-v2/pods/create-a-pod
 #   POST   /v2/pods/{id}/exec   https://docs.runpod.io/api-reference-v2/pods/run-a-command-in-a-pod
 #   DELETE /v2/pods/{id}        https://docs.runpod.io/api-reference-v2/pods/terminate-a-pod
+# Hugging Face Hub API (base https://huggingface.co, bearer HF_TOKEN), the endpoints huggingface_hub 0.36.2 calls
+# (read from its installed source on 2026-11-20):
+#   GET /api/whoami-v2                       HfApi.whoami; the token role is .auth.accessToken.role
+#   GET /api/models/{repo_id}/tree/{rev}     HfApi.list_repo_tree (root entries: {type, path, ...})
 # Test hooks (environment): DRBM25_TTY (file read instead of /dev/tty), DRBM25_SLEEP (command used to wait).
 
 set -Eeuo pipefail
@@ -35,6 +39,22 @@ readonly SCRIPT_DIR
 readonly REPO_ROOT=$SCRIPT_DIR/../..
 
 readonly API_BASE=https://api.runpod.io
+readonly HF_API_BASE=https://huggingface.co
+# Repo names drbm25.publish creates: <user>/<prefix>-<model slug>-<reward mode> (DEFAULT_REPO_PREFIX there).
+readonly HF_REPO_PREFIX=drbm25
+# A token may write the user's model repos when its role is write, or when it is fine-grained and one of its
+# scoped entries names the user with repo.write (the whoami-v2 shape from secondary sources; drbm25.publish
+# check_write_access applies the same rule). Prints ok:<user> or error:<reason>.
+# shellcheck disable=SC2016 # jq program, not shell
+readonly HF_WRITE_JQ='(.name // "") as $n | (.auth.accessToken.role // "") as $r |
+  if $n == "" then "error:HF_TOKEN: whoami returned no user name"
+  elif $r == "write" then "ok:" + $n
+  elif $r == "read" then "error:HF_TOKEN is read-only; the pod could not upload the models. Create a token with the write role at https://huggingface.co/settings/tokens"
+  elif $r == "fineGrained" then
+    (if any(.auth.accessToken.fineGrained.scoped[]?; .entity.name == $n and ((.permissions // []) | index("repo.write")) != null)
+     then "ok:" + $n
+     else "error:HF_TOKEN is a fine-grained token without repo.write on user " + $n + "; grant it or use a write token" end)
+  else "error:HF_TOKEN: cannot tell whether this token may write (role \($r)); use a write token" end'
 readonly DEFAULT_REPO_URL=https://github.com/objones25/drbm25
 readonly POD_NAME=drbm25
 readonly VOLUME_NAME=drbm25
@@ -71,6 +91,8 @@ readonly HARD_DEADLINE_MARGIN_S=3600
 # shellcheck disable=SC2016 # expanded by the pod's shell, not here
 readonly LOG_SCRIPT='cd /workspace/drbm25 2>/dev/null || { echo "no /workspace/drbm25 yet (the pod is still starting)"; exit 0; }
 if [ -f FAILED ]; then echo "FAILED marker: $(cat FAILED)"; fi
+if [ -f PUBLISH_FAILED ]; then echo "PUBLISH_FAILED marker: $(cat PUBLISH_FAILED)"; fi
+for m in normal count_once; do if [ -f "runs/$m/UPLOADED.json" ]; then echo "runs/$m/UPLOADED.json: uploaded and verified"; fi; done
 if [ -f spend.json ]; then echo "spend so far: $(cat spend.json)"; fi
 for f in "$(ls -t logs/bootstrap-*.log 2>/dev/null | head -n 1)" "$(ls -t logs/run_all-*.log 2>/dev/null | head -n 1)"; do
   [ -n "$f" ] || continue
@@ -92,6 +114,8 @@ ends or fails; the volume and its data are kept. Run this again to resume from t
 Asked for (hidden for keys) unless set in the environment: RUNPOD_API_KEY (needs pods:write and access to
 network volumes, secrets and the catalog), HF_TOKEN, WANDB_API_KEY, WANDB_PROJECT (default drbm25),
 WANDB_ENTITY (optional), BUDGET_USD (the dollars still left to spend; earlier spend is in the pod log).
+HF_TOKEN must be allowed to write model repos (checked before anything is created): when the run ends the pod
+uploads both runs' best policy, verified, to private repos $HF_REPO_PREFIX-<model>-<reward mode> under your account.
 
 Launch options:
   --yes              do not ask for confirmation (for scripts); the price is still printed
@@ -103,7 +127,8 @@ Launch options:
   --clear-failed     the pod moves an earlier FAILED marker into logs/ and runs (after you fixed the cause)
 
 Other modes:
-  --status           print the $POD_NAME pod's id, status, price and data center
+  --status           print the $POD_NAME pod's id, status, price and data center, and whether each run's
+                     Hugging Face repo holds UPLOADED.json (then the volume is safe to delete)
   --logs             print the FAILED marker, spend and the last $LOG_LINES lines of the newest logs (via the exec API)
   --watch            poll status and logs every --interval-min minutes (default 10) until the pod is gone
   --stop             terminate the pod after you type 'yes' (the volume and its data are kept);
@@ -148,16 +173,18 @@ _retry_after() {
 # the body from a file, so neither is in curl's argv. A 429 is retried after Retry-After (docs: "Rate
 # limits"); a 5xx or network error is retried for GET, PATCH and DELETE, never for POST, which may already
 # have created the resource.
+# API_BASE_URL and API_AUTH_FILE (set as locals by hf_api) point the same logic at the Hugging Face API.
 api() {
   local out=$1 method=$2 path=$3 body=${4-} attempt status wait_s
+  local base=${API_BASE_URL:-$API_BASE} auth=${API_AUTH_FILE:-$AUTH_FILE}
   local -a args
   for ((attempt = 1; attempt <= API_ATTEMPTS; attempt++)); do
     args=(--silent --show-error --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time "$CURL_MAX_TIME_S"
-      -X "$method" -H "@$AUTH_FILE" -H 'Accept: application/json' -o "$out" -D "$TMP_DIR/headers" -w '%{http_code}')
+      -X "$method" -H "@$auth" -H 'Accept: application/json' -o "$out" -D "$TMP_DIR/headers" -w '%{http_code}')
     if [[ -n $body ]]; then args+=(-H 'Content-Type: application/json' --data-binary "@$body"); fi
     : >"$out"
     # audit-bash disable=B202 # args always holds the base options, never empty
-    status=$(curl "${args[@]}" "$API_BASE$path") || status=000
+    status=$(curl "${args[@]}" "$base$path") || status=000
     API_STATUS=$status
     case $status in
       2??) return 0 ;;
@@ -169,7 +196,7 @@ api() {
       *) return 1 ;;
     esac
     if ((attempt == API_ATTEMPTS)); then break; fi
-    say "RunPod API $method $path: HTTP $status; retrying in ${wait_s}s (attempt $attempt of $API_ATTEMPTS)"
+    say "API $method $base$path: HTTP $status; retrying in ${wait_s}s (attempt $attempt of $API_ATTEMPTS)"
     "${DRBM25_SLEEP:-sleep}" "$wait_s"
   done
   return 1
@@ -193,6 +220,83 @@ _require_single_page() {
   more=$(jq -r '.pagination.hasNextPage // false' "$1")
   if [[ $more == true ]]; then
     die "$2: more than one page (over 1000 entries) is not supported"
+  fi
+}
+
+# hf_api OUT PATH: one GET to the Hugging Face API, with HF_TOKEN's header from HF_AUTH_FILE (mode 600).
+hf_api() {
+  # shellcheck disable=SC2034 # read by api() through dynamic scope
+  local API_BASE_URL=$HF_API_BASE API_AUTH_FILE=$HF_AUTH_FILE
+  api "$1" GET "$2"
+}
+
+# Sets HF_USER from whoami-v2. With --write, dies unless the token can write the user's model repos, so a
+# launch never pays for a run whose models cannot be uploaded.
+hf_whoami() {
+  local out=$TMP_DIR/hf-whoami.json verdict
+  # printf is a builtin: the token reaches the file without appearing in any process's argv.
+  printf 'Authorization: Bearer %s\n' "$HF_TOKEN" >"$HF_AUTH_FILE"
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  if ! hf_api "$out" /api/whoami-v2; then
+    case $API_STATUS in
+      401) die "HF_TOKEN is invalid (Hugging Face answered 401); create one at https://huggingface.co/settings/tokens" ;;
+      000) die "cannot reach $HF_API_BASE to check HF_TOKEN (network error or timeout); nothing was created" ;;
+      *) die "checking HF_TOKEN: Hugging Face answered HTTP $API_STATUS; nothing was created" ;;
+    esac
+  fi
+  if [[ ${1-} == --write ]]; then
+    verdict=$(jq -r "$HF_WRITE_JQ" "$out") || die "unexpected answer from $HF_API_BASE/api/whoami-v2"
+  else
+    verdict=$(jq -r '"ok:" + (.name // "")' "$out") || die "unexpected answer from $HF_API_BASE/api/whoami-v2"
+  fi
+  case $verdict in
+    ok:?*) HF_USER=${verdict#ok:} ;;
+    error:*) die "${verdict#error:}" ;;
+    *) die "HF_TOKEN: whoami returned no user name" ;;
+  esac
+  [[ $HF_USER =~ ^[A-Za-z0-9._-]+$ ]] || die "unexpected Hugging Face user name from whoami: '$HF_USER'"
+}
+
+# Prints the model slug drbm25.publish (model_slug) derives from the RunPod config: the model name after its
+# org, lower case, without -instruct, plus -lora for train_mode lora (Qwen/Qwen2.5-3B-Instruct, full: qwen2.5-3b).
+runpod_model_slug() {
+  local config=$REPO_ROOT/$RUNPOD_CONFIG_DEFAULT name mode
+  [[ -f $config ]] || die "cannot read $config"
+  name=$(awk '/^model:/ { m = 1; next } m && /^[^ ]/ { m = 0 } m && $1 == "name:" { gsub(/"/, "", $2); print $2; exit }' "$config")
+  mode=$(awk '/^model:/ { m = 1; next } m && /^[^ ]/ { m = 0 } m && $1 == "train_mode:" { print $2; exit }' "$config")
+  [[ -n $name && -n $mode ]] || die "no model.name or model.train_mode in $config"
+  name=$(printf '%s' "${name##*/}" | tr '[:upper:]' '[:lower:]')
+  name=${name%-instruct}
+  if [[ $mode == lora ]]; then name+=-lora; fi
+  printf '%s\n' "$name"
+}
+
+# Prints, per run, whether its repo on the Hub holds UPLOADED.json (committed by drbm25.publish only after every
+# file's hash was verified), and whether the volume is safe to delete. Works with or without a pod.
+hf_upload_status() {
+  local slug mode repo out=$TMP_DIR/hf-tree.json verified=0
+  slug=$(runpod_model_slug)
+  printf 'Hugging Face uploads (private repos of %s):\n' "$HF_USER"
+  for mode in normal count_once; do
+    repo=$HF_USER/$HF_REPO_PREFIX-$slug-$mode
+    # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+    if hf_api "$out" "/api/models/$repo/tree/main"; then
+      if jq -e 'any(.[]?; .type == "file" and .path == "UPLOADED.json")' "$out" >/dev/null; then
+        printf '  %s: uploaded and verified (UPLOADED.json)\n' "$repo"
+        verified=$((verified + 1))
+      else
+        printf '  %s: not verified (no UPLOADED.json yet)\n' "$repo"
+      fi
+    elif [[ $API_STATUS == 404 ]]; then
+      printf '  %s: not uploaded (no such repo)\n' "$repo"
+    else
+      die "reading $repo on $HF_API_BASE: HTTP $API_STATUS"
+    fi
+  done
+  if ((verified == 2)); then
+    printf 'safe to delete the volume: yes (both runs are on the Hub, verified)\n'
+  else
+    printf 'safe to delete the volume: no (keep it until both runs show UPLOADED.json; see PUBLISH_FAILED in --logs)\n'
   fi
 }
 
@@ -241,6 +345,8 @@ collect_launch_settings() {
   prompt_var BUDGET_USD "REMAINING dollar budget (total minus what earlier launches spent; see --logs)" || exit 1
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   _require_positive_number BUDGET_USD || exit 1
+  hf_whoami --write
+  say "HF_TOKEN can write model repos of $HF_USER (the pod uploads both runs there when it finishes)"
 }
 
 # yes or no from the terminal; anything but 'yes' is no. --yes answers for the user.
@@ -500,9 +606,13 @@ do_status() {
   rows=$(list_pods)
   if [[ -z $rows ]]; then
     printf 'no %s pod exists (the network volume and its data are kept)\n' "$POD_NAME"
-    return 0
+  else
+    printf '%s\n' "$rows" | awk -F '\t' '{ printf "pod %s  status %s  $%s/h  data center %s\n", $1, $2, $3, $4 }'
   fi
-  printf '%s\n' "$rows" | awk -F '\t' '{ printf "pod %s  status %s  $%s/h  data center %s\n", $1, $2, $3, $4 }'
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  prompt_var HF_TOKEN "Hugging Face token, to check the uploads (hidden)" --secret || exit 1
+  hf_whoami
+  hf_upload_status
 }
 
 # Prints the newest log lines through the exec API. Returns 1 when the pod cannot run commands yet.
@@ -630,6 +740,7 @@ main() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   AUTH_FILE=$TMP_DIR/auth
+  HF_AUTH_FILE=$TMP_DIR/hf_auth
   ask_api_key
   case $OPT_MODE in
     launch) do_launch ;;

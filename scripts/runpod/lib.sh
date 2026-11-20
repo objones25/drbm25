@@ -26,6 +26,8 @@
 #   launch_deadline_unix START_UNIX BUDGET_USD PRICE_PER_HOUR    DRBM25_BUDGET_DEADLINE_UNIX, else the above
 #   run_alternating_chunks UNTIL CHUNK   status 0 done, 3 budget stop, 1 failure
 #   eval_stage, train_and_report UNTIL CHUNK
+#   publish_stage              upload both runs' best/ to the Hugging Face Hub (python -m drbm25.publish);
+#                              a failure writes PUBLISH_FAILED (not FAILED) and returns 1
 #   spend_begin / spend_record / spend_total   dollars spent, kept in spend.json on the volume
 #   refuse_if_failed, check_failed_marker, install_exit_traps
 #   launch_start_unix          print when billing for this launch began (DRBM25_POD_START_UNIX or now)
@@ -62,6 +64,7 @@ readonly KILL_AFTER_S=60           # SIGKILL this long after the TERM that `time
 readonly TRAIN_TIMEOUT_MARGIN_S=1800
 readonly TRAIN_TIMEOUT_MIN_S=900
 readonly EVAL_TIMEOUT_S=7200       # per evaluation command and for the report
+readonly PUBLISH_TIMEOUT_S=3600    # per run's Hugging Face upload + verification (a 3B bf16 actor is ~6.2 GB)
 readonly SMOKE_TIMEOUT_S=3600      # per smoke command
 readonly DISK_MIN_KB=94371840      # 90 GiB before a run's first save: one checkpoint (~74 GB) + best/ (~6.8 GB)
 readonly DISK_BEST_KB=7340032      # 7 GiB: room for a run's first best/ (3B actor in bf16, ~6.8 GB)
@@ -95,6 +98,7 @@ runpod_paths() {
   DRBM25_ENV_FILE="$DRBM25_ROOT/.env"
   DRBM25_SPEND_FILE="$DRBM25_ROOT/spend.json"
   DRBM25_FAILED_FILE="$DRBM25_ROOT/FAILED"
+  DRBM25_PUBLISH_FAILED_FILE="$DRBM25_ROOT/PUBLISH_FAILED"
   DRBM25_MICRO_BATCH_FILE="$DRBM25_ROOT/micro_batch"
   RUNPOD_CONFIG=${DRBM25_CONFIG:-$RUNPOD_CONFIG_DEFAULT}
 }
@@ -988,6 +992,36 @@ train_and_report() {
   if ! eval_stage; then
     mark_failed "evaluation or report failed; checkpoints are intact, re-run run_all.sh"
     return 1
+  fi
+}
+
+# ---------------------------------------------------------------- publish
+
+# Uploads each run's best/ policy, provenance and results to a private Hugging Face repo and verifies the
+# upload; drbm25.publish writes runs/<mode>/UPLOADED.json only after every file's hash matched. Both runs are
+# tried even when the first fails. A failure writes PUBLISH_FAILED and returns 1: the data stays on the volume
+# (do not delete it), and the caller still finishes (a FAILED marker would block the next launch, which only
+# needs to publish again). DRBM25_REPO_URL (from launch.sh) goes into the model card.
+publish_stage() {
+  local mode failed='' rc
+  local -a code_url=()
+  if [[ -n ${DRBM25_REPO_URL-} ]]; then code_url=(--code-url "$DRBM25_REPO_URL"); fi
+  rm -f -- "$DRBM25_PUBLISH_FAILED_FILE"
+  for mode in normal count_once; do
+    _runpod_log "publishing the $mode run to the Hugging Face Hub"
+    rc=0
+    # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+    _uv_timeout "$PUBLISH_TIMEOUT_S" python -m drbm25.publish --run-dir "$DRBM25_RUNS_DIR/$mode" ${code_url[@]+"${code_url[@]}"} || rc=$?
+    if ((rc != 0)); then failed+="$mode "; fi
+  done
+  if [[ -n $failed ]]; then
+    printf 'publishing to the Hugging Face Hub failed for: %s(see logs/run_all-*.log); re-run: uv run python -m drbm25.publish --run-dir %s/<mode>\n' \
+      "$failed" "$DRBM25_RUNS_DIR" >"$DRBM25_PUBLISH_FAILED_FILE"
+    _runpod_log "ERROR: publishing to the Hugging Face Hub failed for: ${failed% }. Everything is still on the volume: do NOT delete it. See $DRBM25_PUBLISH_FAILED_FILE"
+    return 1
+  fi
+  if [[ -f $DRBM25_RUNS_DIR/normal/UPLOADED.json && -f $DRBM25_RUNS_DIR/count_once/UPLOADED.json ]]; then
+    _runpod_log "both runs are uploaded and verified (runs/*/UPLOADED.json): safe to delete the volume"
   fi
 }
 

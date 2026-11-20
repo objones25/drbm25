@@ -31,7 +31,9 @@ Prompts: HF_TOKEN, WANDB_API_KEY, WANDB_PROJECT, WANDB_ENTITY, RUNPOD_API_KEY, T
 (hidden for secrets; skipped when set in the environment or in /workspace/drbm25/.env), and on every
 launch BUDGET_USD (the dollars still left to spend, shown with what earlier launches spent) and
 PRICE_PER_HOUR, which are never saved. Then Java 21 and uv, uv sync, dataset and index, model snapshot,
-GPU smoke test, alternating training chunks of both runs within the budget, evaluation, report.
+GPU smoke test, alternating training chunks of both runs within the budget, evaluation, report, and the
+upload of both runs' best policy to private Hugging Face repos (verified; runs/<mode>/UPLOADED.json, or a
+PUBLISH_FAILED marker when it fails, which does not fail the launch).
 
 When it ends, for any reason, it copies logs to /workspace/drbm25/logs and terminates the pod
 through the RunPod API, unless --no-terminate is given or TERMINATE_ON_FINISH=no.
@@ -135,6 +137,10 @@ main() {
   now=$(date +%s)
   _runpod_log "budget \$$BUDGET_USD at \$$PRICE_PER_HOUR/h: deadline in $(((deadline - now) / 60)) min, reserve $((RESERVE_S / 60)) min for eval and report"
   train_and_report "$total_steps" "$chunk_steps"
+  stage publish
+  # A failed upload leaves PUBLISH_FAILED and the data on the volume; the pod is still terminated.
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  publish_stage || _runpod_log "finished WITHOUT a verified Hugging Face upload; keep the volume"
   stage finished
   _runpod_log "finished; report: $DRBM25_RUNS_DIR/eval/report.md"
 }

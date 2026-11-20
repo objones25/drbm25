@@ -61,6 +61,7 @@ while (($#)); do
   shift
 done
 path=${url#https://api.runpod.io}
+path=${path#https://huggingface.co}
 path=${path%%\?*}
 key=${method}$(printf '%s' "$path" | tr '/' '_')
 n=$(cat "$STUB_DIR/n_$key" 2>/dev/null || echo 0)
@@ -115,6 +116,7 @@ resp_status() { # KEY STATUS...: statuses returned for KEY, in order
 }
 
 default_responses() {
+  resp GET_api_whoami-v2 '{"type":"user","name":"hfuser","auth":{"type":"access_token","accessToken":{"displayName":"t","role":"write"}}}'
   resp GET_v2_catalog_gpus '{"gpus":[
     {"id":"NVIDIA A100-SXM4-80GB","name":"A100 SXM","memory":80,"secure":true,"community":true,
      "price":{"secure":2.19,"community":1.39},"availability":"LOW",
@@ -154,6 +156,68 @@ body_of() { # KEY: the last recorded request body for KEY
 no_billable_calls() {
   ! grep -q '^POST https://api.runpod.io/v2/pods$' "$STUB_DIR/calls.log" &&
     ! grep -q '^POST https://api.runpod.io/v2/network-volumes' "$STUB_DIR/calls.log"
+}
+
+# ---------------------------------------------------------------- Hugging Face token and uploads
+
+@test "a read-only HF token stops the launch before anything billable or any secret is written" {
+  resp GET_api_whoami-v2 '{"type":"user","name":"hfuser","auth":{"type":"access_token","accessToken":{"role":"read"}}}'
+  run -1 --separate-stderr launch --yes
+  [[ $stderr == *read-only* ]]
+  grep -q '^GET https://huggingface.co/api/whoami-v2$' "$STUB_DIR/calls.log"
+  ! grep -q '^\(POST\|PATCH\|DELETE\)' "$STUB_DIR/calls.log"
+}
+
+@test "a fine-grained HF token without repo.write on the user stops the launch" {
+  resp GET_api_whoami-v2 '{"name":"hfuser","auth":{"accessToken":{"role":"fineGrained","fineGrained":{"scoped":[{"entity":{"type":"user","name":"hfuser"},"permissions":["repo.content.read"]}]}}}}'
+  run -1 --separate-stderr launch --yes
+  [[ $stderr == *repo.write* ]]
+  no_billable_calls
+}
+
+@test "a fine-grained HF token with repo.write on the user is accepted" {
+  resp GET_api_whoami-v2 '{"name":"hfuser","auth":{"accessToken":{"role":"fineGrained","fineGrained":{"scoped":[{"entity":{"type":"user","name":"hfuser"},"permissions":["repo.content.read","repo.write"]}]}}}}'
+  run -0 launch --yes
+  grep -q '^GET https://huggingface.co/api/whoami-v2$' "$STUB_DIR/calls.log"
+  grep -q '^POST https://api.runpod.io/v2/pods$' "$STUB_DIR/calls.log"
+}
+
+@test "an invalid HF token (401) stops the launch before anything billable" {
+  resp_status GET_api_whoami-v2 401
+  run -1 --separate-stderr launch --yes
+  [[ $stderr == *HF_TOKEN* ]]
+  no_billable_calls
+}
+
+@test "the HF token check happens before the pod is created, with the token only in a header file" {
+  run -0 launch --yes
+  grep -q '^GET https://huggingface.co/api/whoami-v2$' "$STUB_DIR/calls.log"
+  [[ $(grep -n 'huggingface.co/api/whoami-v2' "$STUB_DIR/calls.log" | cut -d: -f1) -lt $(grep -n '^POST https://api.runpod.io/v2/pods$' "$STUB_DIR/calls.log" | cut -d: -f1) ]]
+  ! grep -q -e "$HF" "$STUB_DIR/argv.log"
+}
+
+@test "--status reports which run's UPLOADED.json is on the Hub and that the volume is not yet safe to delete" {
+  resp GET_api_models_hfuser_drbm25-qwen2.5-3b-normal_tree_main '[{"type":"file","path":"README.md"},{"type":"file","path":"UPLOADED.json"}]'
+  resp GET_api_models_hfuser_drbm25-qwen2.5-3b-count_once_tree_main '[{"type":"file","path":"README.md"}]'
+  run -0 bash "$LAUNCH" --status
+  [[ $output == *"hfuser/drbm25-qwen2.5-3b-normal: uploaded and verified"* ]]
+  [[ $output == *"hfuser/drbm25-qwen2.5-3b-count_once: not verified"* ]]
+  [[ $output == *"safe to delete the volume: no"* ]]
+}
+
+@test "--status says the volume is safe to delete when both runs have UPLOADED.json on the Hub" {
+  resp GET_api_models_hfuser_drbm25-qwen2.5-3b-normal_tree_main '[{"type":"file","path":"UPLOADED.json"}]'
+  resp GET_api_models_hfuser_drbm25-qwen2.5-3b-count_once_tree_main '[{"type":"file","path":"UPLOADED.json"}]'
+  run -0 bash "$LAUNCH" --status
+  [[ $output == *"safe to delete the volume: yes"* ]]
+}
+
+@test "--status treats a repo that does not exist (404) as not uploaded" {
+  resp_status GET_api_models_hfuser_drbm25-qwen2.5-3b-normal_tree_main 404
+  resp GET_api_models_hfuser_drbm25-qwen2.5-3b-count_once_tree_main '[{"type":"file","path":"UPLOADED.json"}]'
+  run -0 bash "$LAUNCH" --status
+  [[ $output == *"hfuser/drbm25-qwen2.5-3b-normal: not uploaded"* ]]
+  [[ $output == *"safe to delete the volume: no"* ]]
 }
 
 # ---------------------------------------------------------------- usage
