@@ -14,10 +14,10 @@ from typing import Any
 
 import pytest
 import torch
+import wandb
 import yaml
 
 import drbm25.train as train_module
-import wandb
 from drbm25.bm25.index import read_index_info
 from drbm25.checkpoint import load_best, load_sharded_actor
 from drbm25.config import load_config

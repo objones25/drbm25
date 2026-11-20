@@ -49,13 +49,13 @@ from typing import Final, Literal, get_args
 import numpy as np
 import torch
 import torch.distributed as tdist
+import wandb
 from safetensors.torch import save_file
 from torch import nn
 from torch.amp.grad_scaler import GradScaler
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
-import wandb
 from drbm25.bm25.index import read_index_info
 from drbm25.bm25.searcher import Bm25Searcher
 from drbm25.budget import should_stop

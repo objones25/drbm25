@@ -11,6 +11,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import wandb
+
 from drbm25.config import Config, ScoringMode
 from drbm25.obs.redact import is_secret_name, name_words
 from drbm25.obs.wandb_run import start_run

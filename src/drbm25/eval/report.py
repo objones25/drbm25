@@ -21,8 +21,8 @@ from types import MappingProxyType
 from typing import Any
 
 import numpy as np
-
 import wandb
+
 from drbm25.config import load_config
 from drbm25.eval.records import (
     SOURCE_ORIGINAL,

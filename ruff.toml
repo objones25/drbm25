@@ -3,6 +3,9 @@
 
 target-version = "py312"
 line-length = 120
+# Only src/ holds first-party code. Ruff's default src = [".", "src"] would also count any top-level
+# directory, e.g. the gitignored wandb/ offline-run directory, and flip the import grouping of `wandb`.
+src = ["src"]
 # mutmut writes a mutated copy of the project into mutants/; never lint it.
 # Gate scripts are vendored verbatim from the skills; do not restyle them.
 extend-exclude = ["mutants", "scripts/audit_observability.py", "scripts/lint_pytorch.py", "scripts/spike_monitor.py"]
@@ -21,6 +24,9 @@ ignore = [
     "PT001", "PT023",  # parentheses style: cosmetic
     "E501",            # line length is the formatter's job (ruff format)
 ]
+
+[lint.isort]
+known-third-party = ["wandb"]
 
 [lint.flake8-pytest-style]
 parametrize-names-type = "tuple"
