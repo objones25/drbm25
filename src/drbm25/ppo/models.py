@@ -19,7 +19,9 @@ API facts checked against the installed versions (peft 0.21.2, transformers 4.57
     (equal to ``model.model(...).last_hidden_state``).
 """
 
-from collections.abc import Mapping, Sequence
+import itertools
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Protocol, runtime_checkable
 
 import torch
@@ -34,6 +36,16 @@ from drbm25.config import LoraCfg
 ACTOR = "actor"
 CRITIC = "critic"
 _HEAD_PREFIX = "value_head."
+_Forward = Callable[[], Tensor]
+
+
+class AdapterSwitchError(RuntimeError):
+    """A grad-enabled forward through one adapter while another adapter's backward is pending.
+
+    Under reentrant gradient checkpointing the LoRA layers are re-run during backward and
+    read the adapter that is active *then*; running a different adapter in between would
+    make the pending backward silently use the wrong weights.
+    """
 
 
 def token_logprobs(logits: Tensor, input_ids: Tensor) -> Tensor:
@@ -77,6 +89,10 @@ class PolicyModels(Protocol):
 
     def decoder_layers(self) -> Sequence[nn.Module]: ...
 
+    def discard_pending(self) -> None:
+        """Forget forwards whose outputs will never be backpropagated (see ``AdapterSwitchError``)."""
+        ...
+
     def merged_actor_state_dict(self) -> dict[str, Tensor]:
         """The actor as plain base-model weights, named as the base's own ``state_dict()``."""
         ...
@@ -90,6 +106,13 @@ class LoraPolicyModels:
     only runs in train mode, and a reentrant checkpoint under ``no_grad`` warns that no
     input requires grad. So LoRA dropout (``lora.dropout``) is active only in grad-enabled
     forwards; keep it 0 when old (no-grad) and new log-probs must agree at ratio 1.
+
+    With ``gradient_checkpointing=True`` every grad-enabled actor/critic forward stays
+    *pending* until backward reaches its output (a tensor hook clears it). While one is
+    pending, a grad-enabled forward through the other adapter raises ``AdapterSwitchError``
+    (backward each loss before running the other adapter), and no-grad forwards (ref,
+    rollout values) restore the pending adapter and train mode afterwards. Call
+    ``discard_pending()`` when an output is intentionally never backpropagated.
     """
 
     def __init__(self, base: PreTrainedModel, lora: LoraCfg, *, gradient_checkpointing: bool) -> None:
@@ -112,6 +135,10 @@ class LoraPolicyModels:
 
         self._base = base
         self._peft = peft_model
+        self._checkpointing = gradient_checkpointing
+        self._pending_adapter: str | None = None
+        self._pending_tokens: set[int] = set()
+        self._tokens = itertools.count()
         device = base.get_input_embeddings().weight.device
         self._value_head = nn.Linear(base.config.hidden_size, 1, device=device, dtype=torch.float32)
         nn.init.zeros_(self._value_head.weight)
@@ -126,7 +153,7 @@ class LoraPolicyModels:
         self._critic_lora = self._adapter_params(CRITIC)
         if not self._actor or len(self._actor) != len(self._critic_lora):
             raise ValueError(f"no LoRA layers matched target_modules={lora.target_modules}")
-        self._activate(ACTOR)
+        self._activate(ACTOR, training=False)
 
     def _adapter_params(self, adapter: str) -> list[nn.Parameter]:
         params: list[nn.Parameter] = []
@@ -135,35 +162,79 @@ class LoraPolicyModels:
                 params.extend(table[adapter].parameters())
         return params
 
-    def _activate(self, adapter: str) -> None:
-        self._peft.train(torch.is_grad_enabled())
+    def _activate(self, adapter: str, *, training: bool) -> None:
+        self._peft.train(training)
         self._peft.set_adapter(adapter)
         for p in self._actor + self._critic_lora:
             p.requires_grad_(True)
 
+    @contextmanager
+    def _restoring_pending(self) -> Iterator[None]:
+        """After a no-grad forward, put back the adapter and train mode a pending backward will re-run."""
+        try:
+            yield
+        finally:
+            if self._pending_adapter is not None:
+                self._activate(self._pending_adapter, training=True)
+
+    def _run(self, adapter: str, forward_output: _Forward) -> Tensor:
+        grad = torch.is_grad_enabled()
+        pending = self._pending_adapter
+        if grad and pending is not None and pending != adapter:
+            raise AdapterSwitchError(
+                f"backward the {pending} loss before running {adapter} with gradient checkpointing "
+                f"(the pending {pending} backward re-runs its layers with whichever adapter is active); "
+                f"call discard_pending() if the {pending} output will never be backpropagated"
+            )
+        with self._restoring_pending():
+            self._activate(adapter, training=grad)
+            out = forward_output()
+        if grad and self._checkpointing and out.requires_grad:
+            self._mark_pending(adapter, out)
+        return out
+
+    def _mark_pending(self, adapter: str, out: Tensor) -> None:
+        token = next(self._tokens)
+        self._pending_tokens.add(token)
+        self._pending_adapter = adapter
+
+        def clear(_grad: Tensor) -> None:
+            self._pending_tokens.discard(token)
+            if not self._pending_tokens:
+                self._pending_adapter = None
+
+        out.register_hook(clear)
+
+    def discard_pending(self) -> None:
+        """Forget pending forwards whose outputs will never be backpropagated."""
+        self._pending_tokens.clear()
+        self._pending_adapter = None
+
     def actor_logits(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
-        self._activate(ACTOR)
-        out = self._peft(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-        return out.logits
+        def forward() -> Tensor:
+            return self._peft(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+
+        return self._run(ACTOR, forward)
 
     def ref_logits(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
-        with torch.no_grad(), self._peft.disable_adapter():
+        with torch.no_grad(), self._restoring_pending(), self._peft.disable_adapter():
             self._peft.eval()
             out = self._peft(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
         return out.logits
 
     def critic_values(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
-        self._activate(CRITIC)
-        # logits_to_keep=1: the LM head is not needed, so skip the [B, L, V] projection.
-        out = self._peft(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            logits_to_keep=1,
-            use_cache=False,
-        )
-        hidden = out.hidden_states[-1]
-        return self._value_head(hidden.float()).squeeze(-1)
+        def forward() -> Tensor:
+            # logits_to_keep=1: the LM head is not needed, so skip the [B, L, V] projection.
+            out = self._peft(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                logits_to_keep=1,
+                use_cache=False,
+            )
+            return self._value_head(out.hidden_states[-1].float()).squeeze(-1)
+
+        return self._run(CRITIC, forward)
 
     def actor_parameters(self) -> list[nn.Parameter]:
         return list(self._actor)
@@ -172,9 +243,17 @@ class LoraPolicyModels:
         return [*self._critic_lora, *self._value_head.parameters()]
 
     def generation_module(self) -> nn.Module:
-        """The PEFT model with the actor active, in eval mode (call under ``torch.inference_mode()``)."""
-        self._activate(ACTOR)
-        self._peft.eval()
+        """The PEFT model with the actor active, in eval mode (call under ``torch.inference_mode()``).
+
+        The returned module is shared: its active adapter changes whenever ``critic_values``
+        (or ``actor_logits``) runs, so call ``generation_module()`` again right before each
+        generate. Refused with ``AdapterSwitchError`` while a checkpointed backward is pending.
+        """
+        if self._pending_adapter is not None:
+            raise AdapterSwitchError(
+                f"backward the {self._pending_adapter} loss (or discard_pending()) before generation"
+            )
+        self._activate(ACTOR, training=False)
         return self._peft
 
     def _named_trainable(self) -> dict[str, nn.Parameter]:

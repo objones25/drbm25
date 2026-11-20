@@ -8,7 +8,7 @@ from torch import Tensor, nn
 from transformers import PreTrainedModel, Qwen2ForCausalLM
 
 from drbm25.config import LoraCfg
-from drbm25.ppo.models import LoraPolicyModels, PolicyModels, token_logprobs
+from drbm25.ppo.models import AdapterSwitchError, LoraPolicyModels, PolicyModels, token_logprobs
 from drbm25.tiny import build_tiny_qwen2
 
 TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
@@ -347,6 +347,97 @@ def test_gradient_checkpointing_ref_and_critic_match_no_checkpointing() -> None:
     _zero_grads(checkpointed.critic_parameters())
     _critic_loss(checkpointed, ids, mask).backward()
     assert all(p.grad is not None for p in checkpointed.critic_parameters())
+
+
+# --------------------------------------------------------------------------- checkpointing + adapter switch
+def _random_lora_pair() -> tuple[LoraPolicyModels, LoraPolicyModels]:
+    """Same random (non-zero) adapters and head on a plain and a checkpointed policy."""
+    plain = _policy(build_tiny_qwen2(seed=0))
+    gen = torch.Generator().manual_seed(0)
+    state = {k: torch.randn(v.shape, generator=gen) * 0.1 for k, v in plain.trainable_state_dict().items()}
+    plain.load_trainable_state_dict(state)
+    checkpointed = _policy(build_tiny_qwen2(seed=0), gradient_checkpointing=True)
+    checkpointed.load_trainable_state_dict(state)
+    return plain, checkpointed
+
+
+def _grads(params: list[nn.Parameter]) -> list[Tensor]:
+    grads = [p.grad for p in params]
+    assert all(g is not None for g in grads)
+    return [g.clone() for g in grads if g is not None]
+
+
+def _sequential_grads(policy: LoraPolicyModels, ids: Tensor, mask: Tensor) -> tuple[list[Tensor], list[Tensor]]:
+    _zero_grads(policy.actor_parameters() + policy.critic_parameters())
+    _actor_loss(policy, ids, mask).backward()
+    _critic_loss(policy, ids, mask).backward()
+    return _grads(policy.actor_parameters()), _grads(policy.critic_parameters())
+
+
+def test_checkpointing_rejects_switching_adapter_before_backward() -> None:
+    _, checkpointed = _random_lora_pair()
+    ids, mask = _batch()
+    actor_loss = _actor_loss(checkpointed, ids, mask)
+    with pytest.raises(AdapterSwitchError, match="backward the actor loss before running critic"):
+        checkpointed.critic_values(ids, mask)
+    actor_loss.backward()  # the pending actor output is still correct after the refused switch
+    _critic_loss(checkpointed, ids, mask).backward()
+
+
+def test_checkpointing_sequential_backward_matches_plain_grads() -> None:
+    plain, checkpointed = _random_lora_pair()
+    ids, mask = _batch()
+    expected_actor, expected_critic = _sequential_grads(plain, ids, mask)
+    got_actor, got_critic = _sequential_grads(checkpointed, ids, mask)
+    torch.testing.assert_close(got_actor, expected_actor)
+    torch.testing.assert_close(got_critic, expected_critic)
+
+
+def _actor_grads_with_detour(policy: LoraPolicyModels, ids: Tensor, mask: Tensor) -> list[Tensor]:
+    """Actor forward, then no-grad ref and critic forwards, then the actor backward."""
+    _zero_grads(policy.actor_parameters())
+    loss = _actor_loss(policy, ids, mask)
+    policy.ref_logits(ids, mask)
+    with torch.no_grad():
+        policy.critic_values(ids, mask)
+    loss.backward()
+    return _grads(policy.actor_parameters())
+
+
+def test_checkpointing_no_grad_forwards_between_forward_and_backward_keep_grads_correct() -> None:
+    plain, checkpointed = _random_lora_pair()
+    ids, mask = _batch()
+    torch.testing.assert_close(
+        _actor_grads_with_detour(checkpointed, ids, mask), _actor_grads_with_detour(plain, ids, mask)
+    )
+
+
+def test_discard_pending_allows_switching_after_an_abandoned_forward() -> None:
+    _, checkpointed = _random_lora_pair()
+    ids, mask = _batch()
+    checkpointed.actor_logits(ids, mask)  # output intentionally never backpropagated
+    checkpointed.discard_pending()
+    _critic_loss(checkpointed, ids, mask).backward()
+    assert all(p.grad is not None for p in checkpointed.critic_parameters())
+
+
+def test_generation_module_refused_while_a_backward_is_pending() -> None:
+    _, checkpointed = _random_lora_pair()
+    ids, mask = _batch()
+    loss = _actor_loss(checkpointed, ids, mask)
+    with pytest.raises(AdapterSwitchError, match="generation"):
+        checkpointed.generation_module()
+    loss.backward()
+    assert isinstance(checkpointed.generation_module(), nn.Module)
+
+
+def test_without_checkpointing_switching_before_backward_is_allowed() -> None:
+    plain, _ = _random_lora_pair()
+    ids, mask = _batch()
+    _zero_grads(plain.actor_parameters() + plain.critic_parameters())
+    (_actor_loss(plain, ids, mask) + _critic_loss(plain, ids, mask)).backward()
+    assert len(_grads(plain.actor_parameters())) == 28
+    assert len(_grads(plain.critic_parameters())) == 30
 
 
 # --------------------------------------------------------------------------- overfit
