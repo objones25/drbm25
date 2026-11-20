@@ -110,6 +110,47 @@ class HitSearcher:
         return text.split()
 
 
+class EchoW4Engine:
+    """Answers ``w4`` when the prompt contains ``w4``, else ``zz``; records how many prompts it saw."""
+
+    def __init__(self) -> None:
+        self.seen = 0
+
+    def generate(self, prompts: Sequence[str], *, greedy: bool) -> RolloutBatch:
+        del greedy
+        self.seen += len(prompts)
+        texts = tuple(
+            f'</think>\n<answer>{{"query": "{"w4" if "w4" in p else "zz"}"}}</answer>' for p in prompts
+        )
+        z = torch.zeros(len(prompts), 1, dtype=torch.long)
+        return RolloutBatch(z, z, z, z, texts, torch.zeros(len(prompts), dtype=torch.bool))
+
+    def sync_weights(self, models: PolicyModels) -> None:
+        del models
+
+
+# Seven validation examples, three of them hits (indices 0, 3, 4): mean nDCG 3/7. Split by rank
+# (rank::2) the halves score 2/4 and 1/3, so only a correct all-reduce gives 3/7 on every rank.
+VAL_QUERIES: Final = ("w4 solar", "solar", "panel", "w4 w9", "w4", "heart", "aspirin")
+
+
+def val_examples() -> list[Example]:
+    return [Example(qid=f"v{i}", query=q, relevant_ids=frozenset({"hit"})) for i, q in enumerate(VAL_QUERIES)]
+
+
+def lora_validate(dist: DistInfo) -> tuple[dict[str, float], int]:
+    """LoRA-layout ``PPOTrainer.validate`` on ``val_examples``; returns the metrics and prompts seen."""
+    import drbm25.train as train_module
+
+    cfg = load_config(SMOKE)
+    layout = train_module.init_layout(cfg, dist)
+    engine = EchoW4Engine()
+    trainer = PPOTrainer(
+        cfg, models=layout.models, engine=engine, searcher=HitSearcher(), reward_mode="normal", dist=dist, scaler=None
+    )
+    return trainer.validate(val_examples()), engine.seen
+
+
 def ppo_step(mesh: DeviceMesh, dist: DistInfo, cfg: Config) -> tuple[FullPolicyModels, dict[str, float]]:
     """One PPOTrainer step on the full layout; every rank gets the same 2 examples."""
     torch.manual_seed(0)
@@ -248,6 +289,12 @@ def case_lora_init_construction(rank: int, mesh: DeviceMesh, out: Path) -> None:
     _lora_init(rank, out, broadcast=False)
 
 
+def case_lora_validate(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    del mesh
+    metrics, seen = lora_validate(DistInfo(rank, WORLD, rank, CPU))
+    torch.save({"metrics": metrics, "seen": seen}, out / f"result_rank{rank}.pt")
+
+
 def case_assert_params(rank: int, mesh: DeviceMesh, out: Path) -> None:
     """assert_params_equal raises on different values and passes after broadcast_params."""
     del mesh
@@ -304,6 +351,7 @@ CASES: Final = {
     "ppo_step": case_ppo_step,
     "lora_init": case_lora_init,
     "lora_init_construction": case_lora_init_construction,
+    "lora_validate": case_lora_validate,
 }
 
 

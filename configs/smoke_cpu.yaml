@@ -55,6 +55,7 @@ run:
   keep_ckpts: 2
   deep_log_every: 10
   seed: 1234
+  dist_timeout_min: 60  # collective timeout: generous, since one rank may save or validate for minutes
   wandb_project: drbm25
   wandb_entity: null
   wandb_group: ms-s-bm25

@@ -25,13 +25,20 @@ Each run directory `runs/<run>/` holds:
   strictly beats the stored best, `best/` is replaced atomically (ties keep the earlier step).
   `best/model.safetensors` holds the actor only (LoRA: the actor adapter; full fine-tune: the actor in
   bf16 with HF names, about 6.8 GB at 3B); `best/meta.json` records the step, both validation scores,
-  the selection metric, the reward mode, the config sha256 and the seeds. A resume keeps the stored best.
+  the selection metric, the reward mode, the config sha256, the seeds and the git sha and dirty flag. A
+  resume keeps the stored best. With 2 ranks, validation is a collective: on the LoRA layout each rank
+  rewrites every other validation query and the nDCG sums are all-reduced; on the full layout every rank
+  rewrites all of them (FSDP forwards are collectives). Every rank gets the same scores and decision.
 - `run_manifest.json`: every seed with its derivation (`run.seed`: model construction, data order, per-rank
   sampling and vLLM seeds `run.seed + rank`; `data.split_seed`: the train/validation split), the resolved
   config and its sha256, git sha and dirty flag, dataset and model revisions, index checksum and size,
   library versions, CUDA, driver and GPUs, world size, host, start time, and one `resumed_at` entry per
   resume. A resume with a different `run.seed` or `data.split_seed` is refused. The same dict is the
   W&B run's `config.meta`.
+
+`run.dist_timeout_min` (60 in every profile) is the `torch.distributed` collective timeout passed to
+`init_process_group`: a rank waiting longer than that in a collective (for example while rank 0 writes
+a checkpoint) is killed by NCCL's watchdog.
 
 Splits: validation = `data.val_size` (500) train queries picked by `data.split_seed` (1234); training uses
 the other 21,916; the test set is all 2,305 dev queries (`run_eval` never sees validation queries).

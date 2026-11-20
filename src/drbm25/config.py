@@ -12,6 +12,7 @@ import types
 import typing
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
+from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, TypeGuard, get_args, get_origin, get_type_hints
@@ -106,6 +107,7 @@ class RunCfg:
     keep_ckpts: int
     deep_log_every: int
     seed: int
+    dist_timeout_min: int  # torch.distributed collective timeout (NCCL watchdog); rank 0 saves can be long
     wandb_project: str
     wandb_entity: str | None
     wandb_group: str
@@ -258,6 +260,13 @@ def _require_finite_floats(section: Any, where: str = "") -> None:
             raise ConfigError(f"{_join(where, f.name)} must be finite, got {value}")
 
 
+def dist_timeout(cfg: Config) -> timedelta:
+    """The process-group timeout from ``run.dist_timeout_min``; ConfigError unless it is >= 1 minute."""
+    if cfg.run.dist_timeout_min < 1:
+        raise ConfigError(f"run.dist_timeout_min must be >= 1, got {cfg.run.dist_timeout_min}")
+    return timedelta(minutes=cfg.run.dist_timeout_min)
+
+
 def validate_for_runtime(cfg: Config, *, device_capability: tuple[int, int] | None, world_size: int) -> None:
     """Check cross-field and hardware rules; raise ConfigError on the first violation."""
     if world_size < 1:
@@ -295,5 +304,6 @@ def validate_for_runtime(cfg: Config, *, device_capability: tuple[int, int] | No
         raise ConfigError(f"clip_ratio must be in (0, 1), got {p.clip_ratio}")
     if p.kl_coef < 0:
         raise ConfigError(f"kl_coef must be >= 0, got {p.kl_coef}")
+    dist_timeout(cfg)
     if cfg.retrieval.expected_docs < 1:
         raise ConfigError(f"retrieval.expected_docs must be >= 1, got {cfg.retrieval.expected_docs}")

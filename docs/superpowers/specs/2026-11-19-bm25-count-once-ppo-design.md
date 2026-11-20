@@ -268,7 +268,12 @@ A100 / full layout (`configs/runpod_a100_full.yaml`):
   earlier step. `best/` holds the policy only (LoRA: the actor adapter; full FT:
   the gathered actor in bf16 with HF names, about 6.8 GB at 3B) and `meta.json`
   (step, both validation scores, selection metric, reward mode, config sha256,
-  seeds). A resume restores the best-so-far score from `best/meta.json` without
+  seeds, git sha and dirty flag). With 2 ranks the LoRA layout shards the
+  validation queries across ranks (rank r takes rows r::2) and all-reduces the
+  nDCG sums; the full layout validates every row on every rank (FSDP forwards are
+  collectives). All ranks get identical scores and reach the same decision. The
+  process group's collective timeout is explicit (`run.dist_timeout_min`, 60). A
+  resume restores the best-so-far score from `best/meta.json` without
   re-evaluating. Exp 2 reports each run's `best/` policy, so the two runs may be
   compared at different steps; the report shows each run's best step and its
   validation score.

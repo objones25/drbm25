@@ -4,14 +4,18 @@ import socket
 import subprocess
 import sys
 import textwrap
+from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
 from torch import nn
 
+import drbm25.distributed as distributed_module
 from drbm25.distributed import DistInfo, allreduce_mean_grads, init_distributed
 
+TIMEOUT = timedelta(minutes=60)
 DIST_ENV = ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT")
 
 
@@ -23,7 +27,7 @@ def no_dist_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.usefixtures("no_dist_env")
 def test_init_distributed_without_env_is_single_process() -> None:
-    info = init_distributed()
+    info = init_distributed(timeout=TIMEOUT)
     expected_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     assert info == DistInfo(rank=0, world_size=1, local_rank=0, device=expected_device)
     assert not torch.distributed.is_initialized()
@@ -43,8 +47,26 @@ def test_init_distributed_rejects_bad_env(monkeypatch: pytest.MonkeyPatch, env: 
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     with pytest.raises(ValueError, match=match):
-        init_distributed()
+        init_distributed(timeout=TIMEOUT)
     assert not torch.distributed.is_initialized()
+
+
+@pytest.mark.usefixtures("no_dist_env")
+def test_init_distributed_passes_the_timeout_to_the_process_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Rank 0 can spend minutes on a save while others wait in a collective; the timeout must be explicit.
+    seen: dict[str, Any] = {}
+
+    def fake_init(backend: str, **kwargs: Any) -> None:
+        seen.update(kwargs, backend=backend)
+
+    monkeypatch.setattr(distributed_module.tdist, "init_process_group", fake_init)
+    monkeypatch.setattr(distributed_module.torch.cuda, "is_available", lambda: False)
+    for key, value in {"WORLD_SIZE": "2", "RANK": "1", "LOCAL_RANK": "1"}.items():
+        monkeypatch.setenv(key, value)
+    info = init_distributed(timeout=timedelta(minutes=45))
+    assert (info.rank, info.world_size) == (1, 2)
+    assert seen["backend"] == "gloo"
+    assert seen["timeout"] == timedelta(minutes=45)
 
 
 def test_allreduce_single_process_is_identity() -> None:
@@ -65,7 +87,9 @@ _WORKER = textwrap.dedent(
     import torch.distributed as tdist
     from drbm25.distributed import allreduce_mean_grads, init_distributed
 
-    info = init_distributed()
+    from datetime import timedelta
+
+    info = init_distributed(timeout=timedelta(minutes=5))
     p = nn.Parameter(torch.zeros(2))
     q = nn.Parameter(torch.zeros(1))  # never gets a grad on any rank: skipped
     p.grad = torch.full((2,), float(info.rank + 1))

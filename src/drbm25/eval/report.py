@@ -142,6 +142,12 @@ def _best_cells(header: Mapping[str, Any] | None) -> tuple[str, str]:
     return str(best["step"]), f"{score:.4f} ({metric})"
 
 
+def _git_text(git: Mapping[str, Any] | None) -> str:
+    if git is None or git.get("sha") is None:
+        return "unknown"
+    return f"{git['sha']} (dirty)" if git.get("dirty") else str(git["sha"])
+
+
 def _seed_text(seeds: Mapping[str, Any]) -> str:
     return ", ".join(f"{k}={seeds[k]}" for k in ("run_seed", "split_seed") if k in seeds)
 
@@ -186,9 +192,12 @@ def render_markdown(report: Report) -> str:
     trained = [(name, h["best"]) for name, h in report.headers.items() if h.get("best") is not None]
     if trained:
         lines += [
-            "| source | training config sha256 | seeds |",
-            "|---|---|---|",
-            *(f"| {name} | {best['config_sha256']} | {_seed_text(best['seeds'])} |" for name, best in trained),
+            "| source | training config sha256 | seeds | training git sha |",
+            "|---|---|---|---|",
+            *(
+                f"| {name} | {best['config_sha256']} | {_seed_text(best['seeds'])} | {_git_text(best.get('git'))} |"
+                for name, best in trained
+            ),
             "",
         ]
     return "\n".join(lines)

@@ -9,6 +9,7 @@ is simpler and exact.
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
 import torch.distributed as tdist
@@ -33,12 +34,14 @@ def _env_int(name: str) -> int:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
 
 
-def init_distributed() -> DistInfo:
+def init_distributed(*, timeout: timedelta) -> DistInfo:
     """Join the ``env://`` process group when ``WORLD_SIZE`` is set, else run single-process.
 
     Reads ``RANK``, ``WORLD_SIZE`` and ``LOCAL_RANK`` (as set by torchrun; ``MASTER_ADDR``
     and ``MASTER_PORT`` are read by ``init_process_group`` itself). The backend is NCCL when
     CUDA is available and gloo otherwise; the device is ``cuda:LOCAL_RANK`` or CPU.
+    ``timeout`` bounds every collective (NCCL's watchdog kills the job after it); pass it
+    explicitly so a long rank-0-only phase (a checkpoint save) cannot hit a library default.
     """
     has_cuda = torch.cuda.is_available()
     if "WORLD_SIZE" not in os.environ:
@@ -58,10 +61,12 @@ def init_distributed() -> DistInfo:
     if has_cuda:
         device = torch.device("cuda", local_rank)  # lint: ignore[CUDA_HARDCODE] device chosen here, once
         torch.cuda.set_device(device)
-        tdist.init_process_group("nccl", init_method="env://", rank=rank, world_size=world_size, device_id=device)
+        tdist.init_process_group(
+            "nccl", init_method="env://", rank=rank, world_size=world_size, device_id=device, timeout=timeout
+        )
     else:
         device = torch.device("cpu")
-        tdist.init_process_group("gloo", init_method="env://", rank=rank, world_size=world_size)
+        tdist.init_process_group("gloo", init_method="env://", rank=rank, world_size=world_size, timeout=timeout)
     return DistInfo(rank, world_size, local_rank, device)
 
 

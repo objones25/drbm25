@@ -14,8 +14,8 @@ The record source is ``trained-<reward_mode>``, read from the checkpoint. Rewrit
 with ``rollout.max_new_tokens`` from the config.
 
 The output starts with a header line (``drbm25.eval.records``): source, checkpoint path, the
-eval config's sha256 and seed, and for ``best/`` its step, validation scores, training config
-sha256 and seeds.
+eval config's sha256 and seed, the eval code's git sha and dirty flag, and for ``best/`` its
+step, validation scores, training config sha256, seeds and training git sha.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ from drbm25.eval.records import (
     QueryRecord,
     write_records,
 )
-from drbm25.manifest import config_sha256
+from drbm25.manifest import collect_environment, config_sha256
 from drbm25.obs import configure
 from drbm25.ppo.models import LoraPolicyModels
 from drbm25.ppo.trainer import Searcher, score_responses, search_all
@@ -269,18 +269,21 @@ def _best_record(meta: BestMeta) -> dict[str, object]:
         "selection_metric": meta.selection_metric,
         "config_sha256": meta.config_sha256,
         "seeds": meta.seeds,
+        "git": {"sha": meta.git_sha, "dirty": meta.git_dirty},
     }
 
 
 def _header(cfg: Config, source: str, checkpoint: Path | None) -> dict[str, object]:
     """Where the scores come from: the eval config, the checkpoint, and a best/ policy's provenance."""
     best = None if checkpoint is None or not is_best_dir(checkpoint) else _best_record(read_best_meta(checkpoint))
+    env = collect_environment()
     return {
         "format_version": 1,
         "source": source,
         "checkpoint": None if checkpoint is None else str(checkpoint),
         "eval_config_sha256": config_sha256(cfg),
         "eval_seed": cfg.run.seed,
+        "git": {"sha": env.git_sha, "dirty": env.git_dirty},
         "best": best,
     }
 

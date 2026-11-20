@@ -9,6 +9,7 @@ import sys
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from drbm25.bm25.index import read_index_info
 from drbm25.checkpoint import load_best, load_sharded_actor
 from drbm25.config import load_config
 from drbm25.data import DEV_FILE, TRAIN_FILE, Example, load_examples, split_train
+from drbm25.distributed import DistInfo
 from drbm25.obs.runs import STEP_METRIC
 from drbm25.obs.setup import shutdown
 from drbm25.ppo.trainer import NonFiniteError, PPOTrainer
@@ -221,6 +223,14 @@ def test_cli_two_process_gloo(workdir: Path, toy_index: Path) -> None:
     }
     assert len(saves[0]) == 1
     assert saves[1] == []
+    # Validation is sharded across the two ranks and all-reduced: both log the same scores.
+    validations = {
+        rank: [r["message"] for r in _log_records(run_dir, rank) if str(r["message"]).startswith("validation")]
+        for rank in (0, 1)
+    }
+    assert len(validations[0]) == 1
+    assert validations[0] == validations[1]
+    assert (run_dir / "best" / "meta.json").is_file()
 
 
 @pytest.mark.java
@@ -376,6 +386,21 @@ def test_exit_code_file_reads_2_when_main_fails_with_an_exception(
     monkeypatch.setattr(train_module, "_train", boom)
     assert _main(_argv(workdir, toy_index, "failed")) == EXIT_ERROR
     assert (workdir / "out" / "failed" / "exit_code").read_text().strip() == "2"
+
+
+def test_cli_joins_the_process_group_with_the_configured_timeout(
+    workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[timedelta] = []
+
+    def fake_init(*, timeout: timedelta) -> DistInfo:
+        seen.append(timeout)
+        return DistInfo(rank=0, world_size=1, local_rank=0, device=torch.device("cpu"))
+
+    monkeypatch.setattr(train_module, "init_distributed", fake_init)
+    monkeypatch.setattr(train_module, "_train", lambda *_: EXIT_OK)
+    assert _main(_argv(workdir, toy_index, "pg", "--set", "run.dist_timeout_min=7")) == EXIT_OK
+    assert seen == [timedelta(minutes=7)]
 
 
 class _FakeRun:
@@ -585,6 +610,7 @@ def test_cli_keeps_the_step_with_the_highest_validation_score(
     manifest = json.loads((workdir / "out" / "best" / "run_manifest.json").read_text())
     assert meta["config_sha256"] == manifest["config_sha256"]
     assert meta["seeds"] == manifest["seeds"]
+    assert meta["git"] == manifest["git"]  # the code version behind the selected policy
 
 
 @pytest.mark.java

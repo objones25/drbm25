@@ -31,7 +31,8 @@ The policy selected on the validation set is kept apart from the resume checkpoi
         model.safetensors         actor weights only: LoRA actor adapter (lora layout) or the full
                                   actor with HF names in the compute dtype (full layout)
         meta.json                 kind "best", step, both val nDCG@10s, selection metric, reward mode,
-                                  layout, config sha256, seeds, format_version (written last)
+                                  layout, config sha256, seeds, git sha + dirty flag,
+                                  format_version (written last)
 
 ``save_best`` builds ``.tmp-best-<pid>/``, moves the old ``best/`` aside to ``.tmp-old-best-<pid>/``
 and renames the new one into place. A crash between those two renames leaves no ``best/``; the
@@ -476,6 +477,8 @@ class BestMeta:
     layout: BestLayout
     config_sha256: str
     seeds: dict[str, Any]
+    git_sha: str | None  # the code that produced the policy (None outside a git checkout)
+    git_dirty: bool | None
 
     @property
     def selection_metric(self) -> str:
@@ -499,6 +502,7 @@ def _best_meta_json(meta: BestMeta) -> dict[str, object]:
         "layout": meta.layout,
         "config_sha256": meta.config_sha256,
         "seeds": meta.seeds,
+        "git": {"sha": meta.git_sha, "dirty": meta.git_dirty},
     }
 
 
@@ -527,6 +531,8 @@ def read_best_meta(path: Path) -> BestMeta:
         layout=raw["layout"],
         config_sha256=raw["config_sha256"],
         seeds=raw["seeds"],
+        git_sha=raw["git"]["sha"],
+        git_dirty=raw["git"]["dirty"],
     )
 
 

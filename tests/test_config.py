@@ -306,6 +306,18 @@ def test_runpod_profile_uses_micro_batch_8():
     assert validate_for_runtime(cfg, device_capability=(8, 0), world_size=2) is None
 
 
+@pytest.mark.parametrize("path", [EXPANSE, RUNPOD, SMOKE], ids=lambda p: p.stem)
+def test_profiles_set_a_60_minute_process_group_timeout(path: Path):
+    assert load_config(path).run.dist_timeout_min == 60
+
+
+@pytest.mark.parametrize("value", ["0", "-5"])
+def test_rejects_non_positive_dist_timeout(value: str):
+    cfg = load_config(SMOKE, {"run.dist_timeout_min": value})
+    with pytest.raises(ConfigError, match="dist_timeout_min"):
+        validate_for_runtime(cfg, device_capability=None, world_size=1)
+
+
 def test_split_seed_is_required(tmp_path: Path):
     p = _write_variant(tmp_path, lambda r: r["data"].pop("split_seed", None))
     with pytest.raises(ConfigError, match=r"missing key 'data\.split_seed'"):

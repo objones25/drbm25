@@ -37,7 +37,7 @@ import torch.distributed as tdist
 
 from drbm25.bm25.searcher import SearchResult
 from drbm25.checkpoint import TrainState, latest_checkpoint, load_sharded_checkpoint, save_sharded_checkpoint
-from drbm25.config import Config, ScoringMode, load_config, validate_for_runtime
+from drbm25.config import Config, ScoringMode, dist_timeout, load_config, validate_for_runtime
 from drbm25.data import Example
 from drbm25.distributed import DistInfo, init_distributed
 from drbm25.ppo.trainer import PPOTrainer
@@ -180,12 +180,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--ckpt-dir", type=Path, default=Path("runs/memory_check"))
     ns = parser.parse_args(argv)
     overrides = dict(item.split("=", 1) for item in ns.overrides)
-    dist = init_distributed()
+    cfg = load_config(ns.config, overrides)
+    dist = init_distributed(timeout=dist_timeout(cfg))
     if dist.device.type != "cuda":
         print("memory_check needs CUDA", file=sys.stderr)
         return 1
     try:
-        cfg = load_config(ns.config, overrides)
         check_full_layout(cfg)
         check_backend(cfg, dist.device)
         validate_for_runtime(

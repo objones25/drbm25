@@ -2,8 +2,10 @@
 
 Every result below ends with a **Reproducibility** line: the seeds, the config sha256 and the git sha that
 produced it. For trained rows these come from the run's `best/meta.json` (step, validation scores, config
-sha256, seeds) and `run_manifest.json` (git sha and dirty flag, every seed and its derivation), and from the
-eval jsonl headers; the bootstrap seed is printed in `report.md`. The test set for every row is all 2,305
+sha256, seeds, training git sha and dirty flag) and `run_manifest.json` (every seed and its derivation), and
+from the eval jsonl headers (which also record the eval code's git sha); `report.md` prints the bootstrap
+seed and each trained row's config sha256, seeds and training git sha. Template:
+`Reproducibility: run_seed=…, split_seed=…, bootstrap seed …; config sha256 …; training git sha … (eval git sha …).` The test set for every row is all 2,305
 dev queries; validation (checkpoint selection) uses 500 held-out train queries, never dev.
 
 ## Exp 1 baseline: original queries (no rewrite), 2026-11-20

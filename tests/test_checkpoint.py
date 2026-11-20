@@ -358,6 +358,8 @@ def _best_meta(step: int, *, normal: float = 0.3, count_once: float = 0.2) -> Be
         layout="lora",
         config_sha256="ab" * 32,
         seeds={"run_seed": 1234, "split_seed": 1234},
+        git_sha="f" * 40,
+        git_dirty=False,
     )
 
 
@@ -378,6 +380,7 @@ def test_best_round_trips_weights_and_meta(tmp_path: Path) -> None:
     assert on_disk["format_version"] == 1
     assert on_disk["selection_metric"] == "val/ndcg_normal"
     assert {"step", "val_ndcg_normal", "val_ndcg_count_once", "reward_mode", "config_sha256", "seeds"} <= on_disk.keys()
+    assert on_disk["git"] == {"sha": "f" * 40, "dirty": False}
 
 
 def test_best_score_is_the_runs_own_reward_mode_metric() -> None:
@@ -389,6 +392,8 @@ def test_best_score_is_the_runs_own_reward_mode_metric() -> None:
         layout="full",
         config_sha256="0" * 64,
         seeds={},
+        git_sha=None,
+        git_dirty=None,
     )
     assert meta.selection_metric == "val/ndcg_count_once"
     assert meta.score == pytest.approx(0.9)

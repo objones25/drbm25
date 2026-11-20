@@ -155,6 +155,7 @@ def _best_header(source: str, step: int, normal: float, count_once: float, metri
             "selection_metric": metric,
             "config_sha256": "c" * 64,
             "seeds": {"run_seed": 1234, "split_seed": 1234},
+            "git": {"sha": "a" * 40, "dirty": False},
         },
     }
 
@@ -177,7 +178,7 @@ def test_report_table_shows_each_runs_best_step_and_validation_score() -> None:
 def test_report_records_the_bootstrap_seed_and_each_sources_seeds() -> None:
     text = render_markdown(build_report_data(_all_sources(), headers=_headers(), n_resamples=50, seed=7))
     assert "Bootstrap: 50 resamples, seed 7" in text
-    assert "| trained-normal | " + "c" * 64 + " | run_seed=1234, split_seed=1234 |" in text
+    assert "| trained-normal | " + "c" * 64 + " | run_seed=1234, split_seed=1234 | " + "a" * 40 + " |" in text
 
 
 def test_report_bootstrap_seed_drives_the_confidence_intervals() -> None:

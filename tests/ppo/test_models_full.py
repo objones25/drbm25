@@ -372,6 +372,16 @@ def test_lora_trainable_params_bit_identical_across_ranks_after_init_and_step(tm
 
 
 @pytest.mark.slow
+def test_lora_validation_is_sharded_across_ranks_and_matches_one_process(tmp_path: Path) -> None:
+    single, seen_single = cases.lora_validate(ONE_RANK)
+    assert seen_single == 7
+    assert single["val/ndcg_normal"] == pytest.approx(3 / 7)
+    rank0, rank1 = _run_two_ranks_per_rank("lora_validate", tmp_path)
+    assert (rank0["seen"], rank1["seen"]) == (4, 3)  # each rank generates only its slice (rank::2)
+    assert rank0["metrics"] == pytest.approx(single)
+    assert rank1["metrics"] == pytest.approx(single)
+
+
 def test_assert_params_equal_raises_on_mismatch_and_broadcast_fixes_it(tmp_path: Path) -> None:
     results = _run_two_ranks_per_rank("assert_params", tmp_path)
     assert [r["message"] for r in results] == ["ranks hold different values for parameters at indices [0] (of 2)"] * 2

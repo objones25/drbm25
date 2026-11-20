@@ -336,6 +336,8 @@ def _meta(layout: str, mode: ScoringMode = "normal") -> BestMeta:
         layout="lora" if layout == "lora" else "full",
         config_sha256="ab" * 32,
         seeds=_SEEDS,
+        git_sha="f" * 40,
+        git_dirty=True,
     )
 
 
@@ -416,8 +418,10 @@ def test_cli_scores_best_labelled_from_its_meta_and_records_provenance(
         "selection_metric": f"val/ndcg_{mode}",
         "config_sha256": "ab" * 32,
         "seeds": _SEEDS,
+        "git": {"sha": "f" * 40, "dirty": True},
     }
     assert header["eval_seed"] == 1234
+    assert set(header["git"]) == {"sha", "dirty"}  # the eval code's own version
     assert len(header["eval_config_sha256"]) == 64
 
 
@@ -427,3 +431,4 @@ def test_cli_original_header_has_no_best(workdir: Path, toy_index: Path) -> None
     header = read_header(out)
     assert header is not None
     assert (header["source"], header["checkpoint"], header["best"]) == ("original", None, None)
+    assert set(header["git"]) == {"sha", "dirty"}

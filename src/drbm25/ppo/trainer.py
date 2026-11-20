@@ -351,14 +351,33 @@ class PPOTrainer:
         return {key: list(values) for key, values in self._histograms.items()}
 
     def validate_with_samples(self, examples: Sequence[Example]) -> tuple[dict[str, float], list[ValSample]]:
-        """Greedy rollouts scored with nDCG@10 under both modes, plus the first ``N_VAL_SAMPLES`` rows."""
+        """Greedy rollouts scored with nDCG@10 under both modes, plus up to ``N_VAL_SAMPLES`` rows; a collective.
+
+        Every rank must call this with the same ``examples`` and gets the same metrics. The LoRA
+        layout splits the work: rank r rewrites ``examples[r::world_size]`` and the nDCG sums and
+        counts are all-reduced, so no rank waits on another's whole validation (NCCL's watchdog).
+        The full layout rewrites every example on every rank, because each actor forward there is
+        an FSDP collective that needs the same number of generate calls on all ranks. The samples
+        are this rank's first rows.
+        """
         if not examples:
             raise ValueError("validate needs at least one example")
-        rollout = self._engine.generate([build_prompt(e.query) for e in examples], greedy=True)
-        scored = self._score(rollout.response_text, examples, k=self._cfg.retrieval.eval_k)
-        metrics = {f"val/ndcg_{mode}": _mean(scored.ndcg[mode]) for mode in _MODES}
+        sharded = not self._fsdp and self._dist.world_size > 1
+        if sharded and len(examples) < self._dist.world_size:
+            raise ValueError(f"validate needs at least {self._dist.world_size} examples to shard, got {len(examples)}")
+        mine = list(examples[self._dist.rank :: self._dist.world_size]) if sharded else list(examples)
+        rollout = self._engine.generate([build_prompt(e.query) for e in mine], greedy=True)
+        scored = self._score(rollout.response_text, mine, k=self._cfg.retrieval.eval_k)
+        totals = torch.tensor(
+            [*(sum(scored.ndcg[mode]) for mode in _MODES), float(len(mine))], dtype=torch.float64, device=self._dist.device
+        )
+        if sharded:
+            tdist.all_reduce(totals, op=tdist.ReduceOp.SUM)
+        if int(totals[-1].item()) != len(examples):
+            raise AssertionError(f"validation covered {int(totals[-1].item())} of {len(examples)} examples")
+        metrics = {f"val/ndcg_{mode}": float(totals[i] / totals[-1]) for i, mode in enumerate(_MODES)}
         samples = []
-        for i, example in enumerate(examples[:N_VAL_SAMPLES]):
+        for i, example in enumerate(mine[:N_VAL_SAMPLES]):
             parsed = scored.parsed[i]
             terms = self._searcher.analyze(parsed.query) if isinstance(parsed, ParsedRewrite) else []
             samples.append(

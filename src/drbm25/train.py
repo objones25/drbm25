@@ -73,7 +73,15 @@ from drbm25.checkpoint import (
     save_checkpoint,
     save_sharded_checkpoint,
 )
-from drbm25.config import Config, ConfigError, LoraCfg, ScoringMode, load_config, validate_for_runtime
+from drbm25.config import (
+    Config,
+    ConfigError,
+    LoraCfg,
+    ScoringMode,
+    dist_timeout,
+    load_config,
+    validate_for_runtime,
+)
 from drbm25.data import TRAIN_FILE, Example, batch_indices, load_examples, split_train
 from drbm25.distributed import DistInfo, assert_params_equal, broadcast_params, init_distributed
 from drbm25.manifest import (
@@ -488,11 +496,14 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
     until = cfg.run.total_steps if args.until_step is None else min(args.until_step, cfg.run.total_steps)
     local = cfg.ppo.batch_size // dist.world_size
     budget = _Budget(args.deadline_unix, args.reserve_s, cfg.run.ckpt_every, [])
+    env = collect_environment()
     selection = _Selection(
         run_dir=run_dir,
         reward_mode=args.reward_mode,
         config_sha256=config_sha256(cfg),
         seeds=seeds(cfg, world_size=dist.world_size),
+        git_sha=env.git_sha,
+        git_dirty=env.git_dirty,
         best=best,
     )
     extra: dict[str, object] = {}
@@ -503,7 +514,7 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
             reward_mode=args.reward_mode,
             world_size=dist.world_size,
             index_checksum=index_checksum,
-            env=collect_environment(),
+            env=env,
             started_utc=datetime.now(UTC),
         )
         manifest = update_manifest(previous_manifest, manifest, step=state.step)
@@ -559,11 +570,9 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
                 if dist.rank == 0:
                     _log_step(run, run_dir, step, metrics, trainer.histograms())
                 if state.step % cfg.run.val_every == 0 or state.step == cfg.run.total_steps:
-                    # On the full layout every actor forward is an FSDP collective, so all ranks must
-                    # generate the validation rollouts (run is None off rank 0, so only rank 0 logs).
-                    scores = None
-                    if dist.rank == 0 or layout.full is not None:
-                        scores = _validate(run, trainer, val, step)
+                    # Every rank validates (a collective: LoRA shards the queries, FSDP needs every rank
+                    # in each forward) and gets the same scores; run is None off rank 0, so only rank 0 logs.
+                    scores = _validate(run, trainer, val, step)
                     selection.update(scores, step=state.step, layout=layout, dist=dist)
                 if state.step % cfg.run.ckpt_every == 0:
                     save()
@@ -597,35 +606,37 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
 
 @dataclass
 class _Selection:
-    """Best-policy tracking on the validation split (``best`` is meaningful on rank 0)."""
+    """Best-policy tracking on the validation split; every rank tracks the same ``best``."""
 
     run_dir: Path
     reward_mode: ScoringMode
     config_sha256: str
     seeds: dict[str, object]
+    git_sha: str | None
+    git_dirty: bool | None
     best: BestMeta | None
 
-    def update(self, scores: dict[str, float] | None, *, step: int, layout: Layout, dist: DistInfo) -> None:
-        """Replace ``best/`` when rank 0's score strictly beats the stored best; a collective on every rank.
+    def update(self, scores: dict[str, float], *, step: int, layout: Layout, dist: DistInfo) -> None:
+        """Replace ``best/`` when the run's metric strictly beats the stored best; a collective on every rank.
 
-        ``scores`` holds ``val/ndcg_normal`` and ``val/ndcg_count_once`` on every rank that validated
-        (rank 0 always). Rank 0 decides and broadcasts; on the full layout every rank joins the gather.
+        ``scores`` (``val/ndcg_normal``, ``val/ndcg_count_once``) are the same on every rank, so each
+        rank reaches the same decision without a broadcast; ``_check_same_on_all_ranks`` proves it.
+        Rank 0 writes; on the full layout every rank joins the gather of the actor.
         """
-        candidate: BestMeta | None = None
-        if dist.rank == 0:
-            if scores is None:
-                raise RuntimeError("rank 0 must validate before the best-policy decision")
-            candidate = BestMeta(
-                step=step,
-                val_ndcg_normal=scores["val/ndcg_normal"],
-                val_ndcg_count_once=scores["val/ndcg_count_once"],
-                reward_mode=self.reward_mode,
-                layout="full" if layout.full is not None else "lora",
-                config_sha256=self.config_sha256,
-                seeds=self.seeds,
-            )
-        improved = candidate is not None and (self.best is None or candidate.score > self.best.score)
-        if not _broadcast_flag(improved, dist):
+        candidate = BestMeta(
+            step=step,
+            val_ndcg_normal=scores["val/ndcg_normal"],
+            val_ndcg_count_once=scores["val/ndcg_count_once"],
+            reward_mode=self.reward_mode,
+            layout="full" if layout.full is not None else "lora",
+            config_sha256=self.config_sha256,
+            seeds=self.seeds,
+            git_sha=self.git_sha,
+            git_dirty=self.git_dirty,
+        )
+        improved = self.best is None or candidate.score > self.best.score
+        _check_same_on_all_ranks([candidate.score, float(improved)], dist)
+        if not improved:
             return
         weights: dict[str, torch.Tensor] = {}
         if layout.full is not None:
@@ -635,12 +646,24 @@ class _Selection:
             if not isinstance(layout.models, LoraPolicyModels):
                 raise TypeError(f"the lora layout needs LoraPolicyModels, got {type(layout.models).__name__}")
             weights = layout.models.actor_state_dict()
-        if candidate is not None:
+        if dist.rank == 0:
             save_best(self.run_dir, weights=weights, meta=candidate)
             logger.info("new best: step %d, %s = %.4f", step, candidate.selection_metric, candidate.score)
-            self.best = candidate
+        self.best = candidate
         if dist.world_size > 1:
             tdist.barrier()
+
+
+def _check_same_on_all_ranks(values: list[float], dist: DistInfo) -> None:
+    """Raise RuntimeError on every rank unless all ranks hold the same ``values``; a collective."""
+    if dist.world_size == 1:
+        return
+    high = torch.tensor(values, dtype=torch.float64, device=dist.device)
+    low = high.clone()
+    tdist.all_reduce(high, op=tdist.ReduceOp.MAX)
+    tdist.all_reduce(low, op=tdist.ReduceOp.MIN)
+    if not torch.equal(high, low):
+        raise RuntimeError(f"ranks disagree on the best-policy decision: max {high.tolist()} vs min {low.tolist()}")
 
 
 def _load_resume_state(path: Path, layout: Layout, trainer: PPOTrainer) -> LoadedCheckpoint:
@@ -691,12 +714,15 @@ def _validate(run: wandb.Run | None, trainer: PPOTrainer, val: Sequence[Example]
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
-    dist = init_distributed()
     code = EXIT_ERROR
     file_code = EXIT_ERROR  # what the exit_code file gets; stays 1 if the process dies before finally
     run_dir: Path | None = None
+    dist: DistInfo | None = None
     try:
+        # The config comes first: it sets the process group's collective timeout. A config error
+        # therefore fails on every rank before any process group exists, and no exit_code is written.
         cfg = load_config(args.config, args.overrides)
+        dist = init_distributed(timeout=dist_timeout(cfg))
         run_dir = cfg.run.output_dir / args.run_name
         run_dir.mkdir(parents=True, exist_ok=True)
         if dist.rank == 0:
@@ -713,7 +739,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         code = EXIT_ERROR
         file_code = EXIT_CODE_FILE_FAILED
     finally:
-        if run_dir is not None and dist.rank == 0:
+        if run_dir is not None and dist is not None and dist.rank == 0:
             (run_dir / "exit_code").write_text(f"{file_code}\n")
         if tdist.is_initialized():
             tdist.destroy_process_group()
