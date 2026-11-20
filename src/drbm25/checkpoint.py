@@ -9,10 +9,20 @@ Layout::
         optim.pt                  optimizer + scaler state + torch RNG tensors (weights_only)
         meta.json                 train state, python/numpy RNG, format_version (written last)
 
+The full fine-tune layout (``model.train_mode: full``) saves a *sharded* checkpoint instead::
+
+      step_000050/
+        dcp/                      torch.distributed.checkpoint files, one per rank + .metadata
+        rng.pt                    rank 0's torch RNG tensors (weights_only)
+        meta.json                 as above, plus "layout": "sharded" (written last)
+
 A checkpoint is built in ``.tmp-step_NNNNNN-<pid>/``, every file is fsynced, the directory is
 renamed into place with ``os.replace`` and the parent directory is fsynced; only then is
 ``latest`` swapped (temp file + ``os.replace``). A directory is *complete* when it has
 ``meta.json``, so a crash at any point leaves the previous checkpoint usable.
+
+Sharded checkpoints use the same temp-dir / ``meta.json``-last / move-aside / ``latest`` protocol;
+every rank writes its DCP shard into the shared temp dir and rank 0 alone publishes it.
 
 ``save_checkpoint`` is rank-agnostic: in a multi-process run the caller must call it on rank 0
 only. ``numpy.random.Generator`` objects are not captured (they are not global state); keep the
@@ -30,16 +40,23 @@ from typing import Any, cast, get_args
 
 import numpy as np
 import torch
+import torch.distributed as tdist
 from safetensors.torch import load_file, save_file
 from torch import Tensor
+from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
+from torch.distributed.checkpoint.state_dict_saver import save as dcp_save
 
 from drbm25.config import ScoringMode
+from drbm25.distributed import DistInfo
 
 FORMAT_VERSION = 1
 _MODEL_FILE = "model.safetensors"
 _OPTIM_FILE = "optim.pt"
 _META_FILE = "meta.json"
 _LATEST_FILE = "latest"
+_DCP_DIR = "dcp"
+_RNG_FILE = "rng.pt"
+_LAYOUT_SHARDED = "sharded"
 _STEP_PREFIX = "step_"
 _TMP_PREFIX = ".tmp-"
 
@@ -161,7 +178,15 @@ def _write_checkpoint_files(
         },
         tmp / _OPTIM_FILE,
     )
-    meta = {
+    _write_meta(tmp, train_state, rng, layout=None)
+    for name in (_MODEL_FILE, _OPTIM_FILE, _META_FILE):
+        _fsync_path(tmp / name)
+    _fsync_dir(tmp)
+
+
+def _write_meta(tmp: Path, train_state: TrainState, rng: Mapping[str, object], *, layout: str | None) -> None:
+    """Write ``meta.json`` (call last: its presence marks the directory complete)."""
+    meta: dict[str, object] = {
         "format_version": FORMAT_VERSION,
         "train_state": {
             "step": train_state.step,
@@ -172,11 +197,9 @@ def _write_checkpoint_files(
         "rng_python": rng["python"],
         "rng_numpy": rng["numpy"],
     }
-    # meta.json is written last: its presence marks the directory complete.
+    if layout is not None:
+        meta["layout"] = layout
     (tmp / _META_FILE).write_text(json.dumps(meta))
-    for name in (_MODEL_FILE, _OPTIM_FILE, _META_FILE):
-        _fsync_path(tmp / name)
-    _fsync_dir(tmp)
 
 
 def _remove_dir(path: Path) -> None:
@@ -217,7 +240,6 @@ def save_checkpoint(
         raise ValueError(f"keep must be >= 1, got {keep}")
     run_dir.mkdir(parents=True, exist_ok=True)
     name = _step_name(train_state.step)
-    final = run_dir / name
     tmp = run_dir / f"{_TMP_PREFIX}{name}-{os.getpid()}"
     if tmp.exists():
         shutil.rmtree(tmp)
@@ -229,6 +251,12 @@ def save_checkpoint(
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
+    return _publish(run_dir, tmp, name, keep=keep)
+
+
+def _publish(run_dir: Path, tmp: Path, name: str, *, keep: int) -> Path:
+    """Rename the complete ``tmp`` dir to ``run_dir/name``, point ``latest`` at it, prune."""
+    final = run_dir / name
     # os.replace cannot overwrite a non-empty directory, so an existing step is moved aside
     # (atomic) first; a crash before the swap leaves no half-deleted dir that looks complete.
     old = run_dir / f"{_TMP_PREFIX}old-{name}-{os.getpid()}"
@@ -274,6 +302,27 @@ def latest_checkpoint(run_dir: Path) -> Path | None:
 
 def load_checkpoint(path: Path) -> LoadedCheckpoint:
     """Load a checkpoint dir. Raises ``FileNotFoundError`` if incomplete, ``ValueError`` on unknown format."""
+    meta, train_state = _read_meta(path)
+    if meta.get("layout") == _LAYOUT_SHARDED:
+        raise ValueError(f"checkpoint {path} is a sharded (full fine-tune) checkpoint; use load_sharded_checkpoint")
+    optim = torch.load(path / _OPTIM_FILE, map_location="cpu", weights_only=True)
+    return LoadedCheckpoint(
+        path=path,
+        train_state=train_state,
+        model=load_file(str(path / _MODEL_FILE), device="cpu"),
+        optimizers=optim["optimizers"],
+        scaler=optim["scaler"],
+        rng={
+            "python": meta["rng_python"],
+            "numpy": meta["rng_numpy"],
+            "torch_cpu": optim["rng_torch_cpu"],
+            "torch_cuda": optim["rng_torch_cuda"],
+        },
+    )
+
+
+
+def _read_meta(path: Path) -> tuple[dict[str, Any], TrainState]:
     meta_path = path / _META_FILE
     if not meta_path.is_file():
         raise FileNotFoundError(f"checkpoint {path} has no {_META_FILE}; it is missing or incomplete")
@@ -286,22 +335,79 @@ def load_checkpoint(path: Path) -> LoadedCheckpoint:
         raise ValueError(f"checkpoint {path} has no train_state.reward_mode; it predates the field and cannot be used")
     if ts["reward_mode"] not in get_args(ScoringMode):
         raise ValueError(f"checkpoint {path}: train_state.reward_mode {ts['reward_mode']!r} is not a scoring mode")
-    optim = torch.load(path / _OPTIM_FILE, map_location="cpu", weights_only=True)
+    state = TrainState(
+        step=ts["step"], data_cursor=ts["data_cursor"], wandb_run_id=ts["wandb_run_id"], reward_mode=ts["reward_mode"]
+    )
+    return meta, state
+
+
+def _barrier(dist: DistInfo) -> None:
+    if dist.world_size > 1:
+        tdist.barrier()
+
+
+def save_sharded_checkpoint(
+    run_dir: Path, *, train_state: TrainState, state: dict[str, Any], keep: int, dist: DistInfo
+) -> Path:
+    """Write ``run_dir/step_NNNNNN`` from a DCP state dict; a collective, call on EVERY rank.
+
+    ``state`` is a ``torch.distributed.checkpoint`` state dict (e.g.
+    ``FullPolicyModels.sharded_state``). Every rank writes its shard into one shared temp dir
+    (named without a pid, since ranks have different pids); rank 0 then writes ``rng.pt`` and
+    ``meta.json`` and publishes the dir exactly as :func:`save_checkpoint` does. Returns the
+    final path on every rank.
+    """
+    if keep < 1:
+        raise ValueError(f"keep must be >= 1, got {keep}")
+    name = _step_name(train_state.step)
+    tmp = run_dir / f"{_TMP_PREFIX}{name}-sharded"
+    if dist.rank == 0:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir()
+    _barrier(dist)
+    # FileSystemWriter fsyncs every data file (sync_files=True is the default).
+    dcp_save(state, checkpoint_id=tmp / _DCP_DIR)
+    _barrier(dist)
+    if dist.rank == 0:
+        try:
+            rng = capture_rng()
+            torch.save({"torch_cpu": rng["torch_cpu"], "torch_cuda": rng["torch_cuda"]}, tmp / _RNG_FILE)
+            _write_meta(tmp, train_state, rng, layout=_LAYOUT_SHARDED)
+            for path in (*sorted((tmp / _DCP_DIR).iterdir()), tmp / _RNG_FILE, tmp / _META_FILE):
+                _fsync_path(path)
+            _fsync_dir(tmp / _DCP_DIR)
+            _fsync_dir(tmp)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        _publish(run_dir, tmp, name, keep=keep)
+    _barrier(dist)
+    return run_dir / name
+
+
+def load_sharded_checkpoint(path: Path, state: dict[str, Any]) -> LoadedCheckpoint:
+    """Fill ``state`` (same structure as saved, e.g. a fresh ``sharded_state``) in place; a collective.
+
+    The returned ``LoadedCheckpoint`` has empty ``model`` / ``optimizers`` (they are in ``state``),
+    ``scaler=None``, and rank 0's RNG as saved.
+    """
+    meta, train_state = _read_meta(path)
+    if meta.get("layout") != _LAYOUT_SHARDED:
+        raise ValueError(f"checkpoint {path} is not a sharded checkpoint; use load_checkpoint")
+    dcp_load(state, checkpoint_id=path / _DCP_DIR)
+    rng = torch.load(path / _RNG_FILE, map_location="cpu", weights_only=True)
     return LoadedCheckpoint(
         path=path,
-        train_state=TrainState(
-            step=ts["step"],
-            data_cursor=ts["data_cursor"],
-            wandb_run_id=ts["wandb_run_id"],
-            reward_mode=ts["reward_mode"],
-        ),
-        model=load_file(str(path / _MODEL_FILE), device="cpu"),
-        optimizers=optim["optimizers"],
-        scaler=optim["scaler"],
+        train_state=train_state,
+        model={},
+        optimizers={},
+        scaler=None,
         rng={
             "python": meta["rng_python"],
             "numpy": meta["rng_numpy"],
-            "torch_cpu": optim["rng_torch_cpu"],
-            "torch_cuda": optim["rng_torch_cuda"],
+            "torch_cpu": rng["torch_cpu"],
+            "torch_cuda": rng["torch_cuda"],
         },
     )

@@ -25,6 +25,13 @@ Whitening is per rank: with 2 ranks each whitens its own 32 rollouts. That diffe
 whole-batch whitening by the spread of the two halves' statistics; it is accepted here because
 the two halves are i.i.d. samples of the same data order.
 
+Full fine-tune layout (``model.train_mode: full``, ``FullPolicyModels``): FSDP2 reduce-scatters
+and averages the gradients inside ``backward``, so the manual all-reduce is skipped. The update
+ratio needs a copy of the weights from before the step, which at 3B fp32 is 6 GB per rank per
+model; on this layout it is computed on deep-log steps only, for the actor only (the critic's
+key is omitted), from a host-memory copy of this rank's shards. Both layouts drop the gradients
+(``zero_grad(set_to_none=True)``) after the update, before ``sync_weights`` gathers the actor.
+
 Metrics are reduced over ranks (mean; min/max for ``*/min``, ``*/max``, ``ppo/kl_ref_max``
 and ``sys/*``), so the health guards decide the same way on every rank.
 """
@@ -55,7 +62,9 @@ from drbm25.obs.metrics import (
     explained_variance,
     per_layer_grad_and_weight_norms,
     qk_logit_bound,
+    sharded_update_ratio,
     snapshot,
+    snapshot_local_shards_to_cpu,
     update_ratio,
 )
 from drbm25.ppo.gae import gae, kl_penalized_rewards
@@ -268,6 +277,7 @@ class PPOTrainer:
                 f"{self._micro} must divide each other; run validate_for_runtime first"
             )
         self._temperature = cfg.rollout.temperature  # training scores the sampling policy pi_T
+        self._fsdp = cfg.model.train_mode == "full"  # FSDP2 averages grads in backward
         self._low_scale_streak = 0
         self._high_kl_streak = 0
         self._histograms: dict[str, list[float]] = {}
@@ -365,6 +375,10 @@ class PPOTrainer:
     def validate(self, examples: Sequence[Example]) -> dict[str, float]:
         return self.validate_with_samples(examples)[0]
 
+    def optimizers(self) -> dict[str, torch.optim.Optimizer]:
+        """The live optimizers, keyed ``"actor"`` / ``"critic"`` (for sharded checkpoints)."""
+        return {"actor": self._actor_opt, "critic": self._critic_opt}
+
     def optimizer_states(self) -> dict[str, dict[str, Any]]:
         return {"actor": self._actor_opt.state_dict(), "critic": self._critic_opt.state_dict()}
 
@@ -443,7 +457,7 @@ class PPOTrainer:
         ppo = self._cfg.ppo
         n_micro = self._local_mini // self._micro
         stats: dict[str, list[float]] = {}
-        actor_before, critic_before = snapshot(self._actor_params), snapshot(self._critic_params)
+        ratios = self._update_ratio_snapshots(deep=deep)
         layer_norms: dict[str, float] = {}
         for _epoch in range(ppo.ppo_epochs):
             for start in range(0, ids.shape[0], self._local_mini):
@@ -459,13 +473,30 @@ class PPOTrainer:
                 for key, value in optim_stats.items():
                     stats.setdefault(key, []).append(value)
                 layer_norms = norms or layer_norms  # deep steps: the last mini-batch's norms
+        # The grads are not read after the step; dropping them frees memory before sync_weights.
+        self._actor_opt.zero_grad(set_to_none=True)
+        self._critic_opt.zero_grad(set_to_none=True)
         out = {key: _mean(vals) for key, vals in stats.items()}
-        out["optim/actor_update_ratio"] = update_ratio(actor_before, self._actor_params)
-        out["optim/critic_update_ratio"] = update_ratio(critic_before, self._critic_params)
+        out.update(ratios())
         out["optim/actor_lr"] = float(self._actor_opt.param_groups[0]["lr"])
         out["optim/critic_lr"] = float(self._critic_opt.param_groups[0]["lr"])
         out.update(layer_norms)
         return out
+
+    def _update_ratio_snapshots(self, *, deep: bool) -> Callable[[], dict[str, float]]:
+        """Snapshot the weights now; the returned callable gives the update-ratio metrics after the step."""
+        if not self._fsdp:
+            actor_before, critic_before = snapshot(self._actor_params), snapshot(self._critic_params)
+            return lambda: {
+                "optim/actor_update_ratio": update_ratio(actor_before, self._actor_params),
+                "optim/critic_update_ratio": update_ratio(critic_before, self._critic_params),
+            }
+        if not deep:
+            return dict
+        actor_cpu = snapshot_local_shards_to_cpu(self._actor_params)
+        return lambda: {
+            "optim/actor_update_ratio": sharded_update_ratio(actor_cpu, self._actor_params, self._dist),
+        }
 
     def _micro_step(
         self,
@@ -521,8 +552,9 @@ class PPOTrainer:
         The per-layer grad norms are taken after unscale and BEFORE clipping, so they add up
         to the logged (pre-clip) ``optim/*_grad_norm``.
         """
-        allreduce_mean_grads(self._actor_params, self._dist)
-        allreduce_mean_grads(self._critic_params, self._dist)
+        if not self._fsdp:
+            allreduce_mean_grads(self._actor_params, self._dist)
+            allreduce_mean_grads(self._critic_params, self._dist)
         clip = self._cfg.ppo.grad_clip
         if self._scaler is not None:
             self._scaler.unscale_(self._actor_opt)

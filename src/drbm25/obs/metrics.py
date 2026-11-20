@@ -15,10 +15,13 @@ from types import TracebackType
 from typing import Self
 
 import torch
+import torch.distributed as tdist
 from torch import Tensor, nn
+from torch.distributed.tensor import DTensor
 from torch.utils.hooks import RemovableHandle
 from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
 
+from drbm25.distributed import DistInfo
 from drbm25.ppo.losses import validate_token_mask
 
 _SUBMODULES = ("attn", "mlp")
@@ -148,6 +151,43 @@ def update_ratio(before: Sequence[Tensor], params: Sequence[nn.Parameter]) -> fl
     if base == 0.0:
         raise ValueError("snapshot has zero norm: update ratio is undefined")
     return delta / base
+
+
+def _local(tensor: Tensor) -> Tensor:
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def snapshot_local_shards_to_cpu(params: Sequence[nn.Parameter]) -> list[Tensor]:
+    """This rank's shard of each parameter (the whole tensor if not a ``DTensor``), copied to host memory.
+
+    For :func:`sharded_update_ratio`: keeps the pre-step copy off the GPU (6 GB per rank for a
+    3B fp32 model on two ranks).
+    """
+    return [_local(p.detach()).to("cpu", copy=True) for p in params]
+
+
+def sharded_update_ratio(before: Sequence[Tensor], params: Sequence[nn.Parameter], dist: DistInfo) -> float:
+    """:func:`update_ratio` from per-rank shards: squared norms are summed over ranks.
+
+    Exact only when every parameter is sharded over all ranks (FSDP2's default), so each element
+    is counted once; with more than one rank a non-``DTensor`` parameter raises ``ValueError``.
+    A collective when ``dist.world_size > 1``.
+    """
+    if len(before) != len(params):
+        raise ValueError(f"length mismatch: {len(before)} snapshots vs {len(params)} params")
+    if dist.world_size > 1 and not all(isinstance(p, DTensor) for p in params):
+        raise ValueError("sharded_update_ratio needs every parameter sharded (DTensor) across ranks")
+    sums = torch.zeros(2, dtype=torch.float64, device=dist.device)
+    for old, p in zip(before, params, strict=True):
+        new = _local(p.detach()).double()
+        old_on_device = old.to(new.device).double()
+        sums[0] += (new - old_on_device).pow(2).sum().to(sums.device)
+        sums[1] += old_on_device.pow(2).sum().to(sums.device)
+    if dist.world_size > 1:
+        tdist.all_reduce(sums)
+    if float(sums[1]) == 0.0:
+        raise ValueError("snapshot has zero norm: update ratio is undefined")
+    return math.sqrt(float(sums[0])) / math.sqrt(float(sums[1]))
 
 
 @torch.no_grad()

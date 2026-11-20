@@ -114,3 +114,18 @@ Everything below is a sequence of commands to run in a login-node shell. Run `sb
 
 Shell tests: `bats tests/shell/` (needs bats >= 1.5 and bash >= 4 for `mapfile`) and
 `shellcheck scripts/expanse/*.sh scripts/expanse/*.sbatch`.
+
+## A100 layout (2x A100 80GB, full fine-tune)
+
+`configs/runpod_a100_full.yaml` (Qwen2.5-3B, `model.train_mode: full`, `rollout.backend: vllm`) builds
+an FSDP2-sharded fp32 actor and critic, a frozen bf16 reference, and one colocated vLLM 0.19 engine
+per rank. It needs `uv sync --extra vllm`, CUDA, and torchrun (`--nproc_per_node 2`); checkpoints are
+sharded (`step_NNNNNN/dcp/`, written by every rank). Before a long run, measure peak memory per GPU
+for one PPO step (synthetic queries, no index or dataset needed):
+
+```bash
+uv run torchrun --nproc_per_node 2 scripts/memory_check.py --config configs/runpod_a100_full.yaml
+uv run pytest -m gpu tests/rollout/test_vllm_engine.py   # vLLM greedy == HF, weight sync
+```
+
+Do not set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: vLLM's sleep mode refuses it.

@@ -9,11 +9,17 @@ writes the code to ``output_dir/run_name/exit_code``; launchers read that file t
 budget stop (3) from a failure. The file holds 0 done, 3 budget stop, 2 ended by an exception,
 and 1 when the run started and never finished (killed by OOM, a Slurm time limit, teardown).
 
-Run directory ``output_dir/run_name/``: ``step_NNNNNN/`` checkpoints (rank 0), ``metrics.jsonl``
+Run directory ``output_dir/run_name/``: ``step_NNNNNN/`` checkpoints, ``metrics.jsonl``
 (rank 0, one JSON object of floats per step, read by ``scripts/spike_monitor.py``),
 ``train_rank{R}.log`` (JSON log lines per rank, including each step's global batch indices),
-``exit_code``. Only the LoRA layout (``model.train_mode: lora``) with the HF rollout backend is
-built here; the full fine-tune / vLLM layout is added by the A100 task.
+``exit_code``.
+
+Layouts (``model.train_mode``): ``lora`` (V100) -- LoRA actor/critic adapters on one frozen
+base, checkpoints written by rank 0; ``full`` (A100) -- FSDP2-sharded fp32 actor and critic plus
+a frozen reference (``FullPolicyModels``), sharded DCP checkpoints written by every rank; needs
+torchrun and precision bf16 or fp32. Rollout engines (``rollout.backend``): ``hf`` -- transformers
+``generate`` on the live actor (``synced_gpus`` on the full layout, for CPU runs); ``vllm`` -- one
+colocated vLLM engine per rank (CUDA and a real model only), built before the training models.
 """
 
 from __future__ import annotations
@@ -38,18 +44,22 @@ import torch.distributed as tdist
 from safetensors.torch import save_file
 from torch import nn
 from torch.amp.grad_scaler import GradScaler
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from torch.distributed.device_mesh import init_device_mesh
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 import wandb
 from drbm25.bm25.index import read_index_info
 from drbm25.bm25.searcher import Bm25Searcher
 from drbm25.budget import should_stop
 from drbm25.checkpoint import (
+    LoadedCheckpoint,
     TrainState,
     latest_checkpoint,
     load_checkpoint,
+    load_sharded_checkpoint,
     restore_rng,
     save_checkpoint,
+    save_sharded_checkpoint,
 )
 from drbm25.config import Config, ConfigError, LoraCfg, ScoringMode, load_config, validate_for_runtime
 from drbm25.data import DEV_FILE, TRAIN_FILE, Example, batch_indices, load_examples, split_dev
@@ -58,9 +68,12 @@ from drbm25.obs import configure
 from drbm25.obs.context import bind_log_context
 from drbm25.obs.runs import STEP_METRIC, open_run
 from drbm25.obs.wandb_run import log_checkpoint
-from drbm25.ppo.models import LoraPolicyModels
+from drbm25.ppo.models import LoraPolicyModels, PolicyModels
+from drbm25.ppo.models_full import FullPolicyModels
 from drbm25.ppo.trainer import NonFiniteError, PPOTrainer, TrainingHealthError
+from drbm25.rollout.base import RolloutEngine
 from drbm25.rollout.hf_generate import HFGenerateEngine
+from drbm25.rollout.vllm_engine import VLLMDtype, VLLMEngine
 from drbm25.tiny import build_tiny_qwen2, build_tiny_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -80,6 +93,7 @@ _RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _JAVA_VERSION = re.compile(r'version "(\d+)')
 _TMP_PREFIX = ".tmp-"
 _DTYPES: Final = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+_VLLM_DTYPES: Final[dict[str, VLLMDtype]] = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}
 
 
 class StartupCheckError(RuntimeError):
@@ -177,6 +191,12 @@ def check_tokenizer(tokenizer: PreTrainedTokenizerBase) -> None:
 
 
 # ---------------------------------------------------------------------------- building blocks
+def build_tokenizer(cfg: Config) -> PreTrainedTokenizerBase:
+    if cfg.model.name == TINY_MODEL:
+        return build_tiny_tokenizer()
+    return AutoTokenizer.from_pretrained(cfg.model.name, revision=cfg.model.revision, padding_side="left")
+
+
 def build_base(cfg: Config, device: torch.device) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
     if cfg.model.name == TINY_MODEL:
         tiny = build_tiny_qwen2(seed=cfg.run.seed)
@@ -189,18 +209,58 @@ def build_base(cfg: Config, device: torch.device) -> tuple[PreTrainedModel, PreT
         attn_implementation="sdpa",
     )
     nn.Module.to(base, device)
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name, revision=cfg.model.revision, padding_side="left")
-    return base, tokenizer
+    return base, build_tokenizer(cfg)
+
+
+def build_full_models(cfg: Config, dist: DistInfo) -> FullPolicyModels:
+    """Actor and critic in fp32, reference in the compute dtype, loaded on CPU and sharded onto ``dist.device``.
+
+    ``fully_shard`` moves each unit to the device as it shards it, so the GPU never holds a full
+    fp32 copy; host memory holds all three models briefly (about 31 GB per rank at 3B).
+    """
+    compute = _DTYPES[cfg.model.precision]
+    if cfg.model.name == TINY_MODEL:
+        actor, critic, ref = (build_tiny_qwen2(seed=cfg.run.seed) for _ in range(3))
+        backbone: PreTrainedModel = critic.model
+    else:
+        common = {"revision": cfg.model.revision, "attn_implementation": "sdpa"}
+        actor = AutoModelForCausalLM.from_pretrained(cfg.model.name, dtype=torch.float32, **common)
+        backbone = AutoModel.from_pretrained(cfg.model.name, dtype=torch.float32, **common)
+        ref = AutoModelForCausalLM.from_pretrained(cfg.model.name, dtype=compute, **common)
+    mesh = init_device_mesh(dist.device.type, (dist.world_size,))
+    return FullPolicyModels(
+        actor,
+        backbone,
+        ref,
+        mesh=mesh,
+        compute_dtype=compute,
+        gradient_checkpointing=cfg.model.gradient_checkpointing,
+    )
 
 
 def check_layout(cfg: Config, device: torch.device) -> LoraCfg:
+    """The LoRA layout's requirements; returns its LoRA settings (also used by evaluation)."""
     if cfg.model.train_mode != "lora" or cfg.lora is None:
-        raise ConfigError("this CLI builds the LoRA layout only; train_mode 'full' needs the FSDP2 layout (A100 task)")
-    if cfg.rollout.backend != "hf":
-        raise ConfigError("this CLI builds the HF rollout engine only; backend 'vllm' needs the A100 task")
+        raise ConfigError("this builds the LoRA layout only; train_mode 'full' checkpoints need the FSDP2 layout")
     if cfg.model.precision == "fp16" and device.type != "cuda":
         raise ConfigError("precision fp16 needs CUDA (GradScaler); use fp32 on CPU")
     return cfg.lora
+
+
+def check_full_layout(cfg: Config) -> None:
+    if cfg.model.precision == "fp16":
+        raise ConfigError("train_mode 'full' supports precision bf16 or fp32; fp16 would need a sharded GradScaler")
+    if not tdist.is_initialized():
+        raise ConfigError("train_mode 'full' shards with FSDP2 and needs a process group: launch with torchrun")
+
+
+def check_backend(cfg: Config, device: torch.device) -> None:
+    if cfg.rollout.backend != "vllm":
+        return
+    if device.type != "cuda":
+        raise ConfigError("rollout.backend 'vllm' needs CUDA; use backend 'hf' on CPU")
+    if cfg.model.name == TINY_MODEL:
+        raise ConfigError(f"rollout.backend 'vllm' needs a Hugging Face model, not {TINY_MODEL!r}")
 
 
 def _sweep_stale_tmp(run_dir: Path) -> None:
@@ -292,8 +352,49 @@ class _Budget:
         return steps_done + max(self.deadline_unix - self.reserve_s - time.time(), 0.0) / mean_step
 
 
+@dataclass(frozen=True)
+class Layout:
+    models: PolicyModels
+    engine: RolloutEngine
+    full: FullPolicyModels | None  # set on the full layout (sharded checkpoints)
+
+
+def build_layout(cfg: Config, dist: DistInfo) -> Layout:
+    full = cfg.model.train_mode == "full"
+    tokenizer = build_tokenizer(cfg)
+    check_tokenizer(tokenizer)
+    vllm: VLLMEngine | None = None
+    if cfg.rollout.backend == "vllm":
+        # First: vLLM checks that gpu_memory_utilization x total memory is still free.
+        vllm = VLLMEngine.create(
+            cfg.model.name,
+            cfg.model.revision,
+            cfg.rollout,
+            dist,
+            tokenizer=tokenizer,
+            dtype=_VLLM_DTYPES[cfg.model.precision],
+            seed=cfg.run.seed + dist.rank,
+        )
+    if full:
+        full_models = build_full_models(cfg, dist)
+        models: PolicyModels = full_models
+    else:
+        full_models = None
+        base, _ = build_base(cfg, dist.device)
+        lora = check_layout(cfg, dist.device)
+        models = LoraPolicyModels(base, lora, gradient_checkpointing=cfg.model.gradient_checkpointing)
+    engine: RolloutEngine = (
+        vllm if vllm is not None else HFGenerateEngine(models, tokenizer, cfg.rollout, dist.device, synced_gpus=full)
+    )
+    return Layout(models=models, engine=engine, full=full_models)
+
+
 def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
-    lora = check_layout(cfg, dist.device)
+    if cfg.model.train_mode == "full":
+        check_full_layout(cfg)
+    else:
+        check_layout(cfg, dist.device)
+    check_backend(cfg, dist.device)
     validate_for_runtime(cfg, device_capability=_device_capability(dist.device), world_size=dist.world_size)
     check_cuda_arch(dist.device)
     check_java()
@@ -308,10 +409,8 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
     val, _ = split_dev(load_examples(data_dir / DEV_FILE), val_size=cfg.data.val_size)
     _seed(cfg.run.seed + dist.rank)
 
-    base, tokenizer = build_base(cfg, dist.device)
-    check_tokenizer(tokenizer)
-    models = LoraPolicyModels(base, lora, gradient_checkpointing=cfg.model.gradient_checkpointing)
-    engine = HFGenerateEngine(models, tokenizer, cfg.rollout, dist.device)
+    layout = build_layout(cfg, dist)
+    models, engine = layout.models, layout.engine
     r = cfg.retrieval
     searcher = Bm25Searcher(r.index_dir, k1=r.k1, b=r.b, threads=r.search_threads, timeout_s=r.search_timeout_s)
     scaler = GradScaler("cuda") if cfg.model.precision == "fp16" else None
@@ -323,13 +422,11 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
     last_saved: int | None = None
     ckpt_path = latest_checkpoint(run_dir)
     if ckpt_path is not None:
-        ckpt = load_checkpoint(ckpt_path)
+        ckpt = _load_resume_state(ckpt_path, layout, trainer)
         if ckpt.train_state.reward_mode != args.reward_mode:
             raise ValueError(
                 f"{ckpt_path} was trained with reward_mode {ckpt.train_state.reward_mode!r}, not {args.reward_mode!r}"
             )
-        models.load_trainable_state_dict(ckpt.model)
-        trainer.load_optimizer_states(ckpt.optimizers)
         if scaler is not None:
             if ckpt.scaler is None:
                 raise ValueError(f"{ckpt_path} has no GradScaler state but this run uses fp16")
@@ -341,6 +438,9 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
         state = ckpt.train_state
         last_saved = state.step
         logger.info("resumed from %s at step %d (cursor %d)", ckpt_path, state.step, state.data_cursor)
+
+    # vLLM starts from the checkpoint on disk; after a resume the actor differs. A no-op for HF.
+    engine.sync_weights(models)
 
     until = cfg.run.total_steps if args.until_step is None else min(args.until_step, cfg.run.total_steps)
     local = cfg.ppo.batch_size // dist.world_size
@@ -355,7 +455,17 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
 
     def save() -> None:
         nonlocal last_saved
-        if dist.rank == 0:
+        if layout.full is not None:
+            path = save_sharded_checkpoint(
+                run_dir,
+                train_state=state,
+                state=layout.full.sharded_state(trainer.optimizers()),
+                keep=cfg.run.keep_ckpts,
+                dist=dist,
+            )
+            if dist.rank == 0:
+                logger.info("checkpoint %s", path)
+        elif dist.rank == 0:
             path = save_checkpoint(
                 run_dir,
                 train_state=state,
@@ -391,8 +501,10 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
                             logger.info("projected steps within budget: %.0f", metrics["budget/projected_steps"])
                 if dist.rank == 0:
                     _log_step(run, run_dir, step, metrics, trainer.histograms())
-                    if state.step % cfg.run.val_every == 0:
-                        _validate(run, trainer, val, step)
+                # On the full layout every actor forward is an FSDP collective, so all ranks must
+                # generate the validation rollouts (run is None off rank 0, so only rank 0 logs).
+                if state.step % cfg.run.val_every == 0 and (dist.rank == 0 or layout.full is not None):
+                    _validate(run, trainer, val, step)
                 if state.step % cfg.run.ckpt_every == 0:
                     save()
                     if _broadcast_flag(budget.stop(), dist):
@@ -407,7 +519,9 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
             _alert(run, f"{args.run_name}: budget stop", f"stopped at step {state.step}", "WARN")
         else:
             logger.info("reached step %d", state.step)
-            if run is not None and state.step >= cfg.run.total_steps:
+            if layout.full is not None and state.step >= cfg.run.total_steps:
+                logger.info("full fine-tune: the final sharded checkpoint step_%06d is the trained model", state.step)
+            elif run is not None and state.step >= cfg.run.total_steps:
                 adapters = run_dir / "final_adapters.safetensors"
                 save_file(
                     {k: v.detach().cpu().contiguous() for k, v in models.trainable_state_dict().items()}, adapters
@@ -415,6 +529,19 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
                 log_checkpoint(run, adapters, name=f"{args.run_name}-adapters", artifact_type="model")
             _alert(run, f"{args.run_name}: finished", f"reached step {state.step}", "INFO")
     return exit_code
+
+
+def _load_resume_state(path: Path, layout: Layout, trainer: PPOTrainer) -> LoadedCheckpoint:
+    """Load model and optimizer state from ``path`` into the live objects (every rank)."""
+    if layout.full is None:
+        ckpt = load_checkpoint(path)
+        layout.models.load_trainable_state_dict(ckpt.model)
+        trainer.load_optimizer_states(ckpt.optimizers)
+        return ckpt
+    template = layout.full.sharded_state(trainer.optimizers())
+    ckpt = load_sharded_checkpoint(path, template)
+    layout.full.load_sharded_state(template, trainer.optimizers())
+    return ckpt
 
 
 def _log_step(

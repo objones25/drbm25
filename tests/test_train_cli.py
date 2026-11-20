@@ -1,6 +1,7 @@
 """``python -m drbm25.train``: checkpoints, resume, exit codes, startup checks, metrics.jsonl."""
 
 import json
+import math
 import os
 import socket
 import subprocess
@@ -409,18 +410,104 @@ def test_cli_logs_histograms_to_wandb_on_deep_log_steps_only(
     assert "hist/" not in rows  # histograms go to W&B only
 
 
-@pytest.mark.java
-def test_cli_rejects_full_fine_tune_layout(workdir: Path, toy_index: Path) -> None:
+def _full_config(workdir: Path, **model: str) -> Path:
     raw = yaml.safe_load(SMOKE.read_text())
     raw["model"]["train_mode"] = "full"
+    raw["model"].update(model)
     raw["lora"] = None
-    full = workdir / "full.yaml"
-    full.write_text(yaml.safe_dump(raw))
+    path = workdir / "full.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    return path
+
+
+def _first_error(run_dir: Path) -> str:
+    return json.dumps(next(r for r in _log_records(run_dir) if r["level"] == "ERROR"))
+
+
+@pytest.mark.java
+def test_cli_full_layout_needs_torchrun(workdir: Path, toy_index: Path) -> None:
     argv = _argv(workdir, toy_index, "full")
-    argv[argv.index(str(SMOKE))] = str(full)
+    argv[argv.index(str(SMOKE))] = str(_full_config(workdir))
     assert _main(argv) == EXIT_ERROR
-    errors = [r for r in _log_records(workdir / "out" / "full") if r["level"] == "ERROR"]
-    assert "LoRA layout only" in json.dumps(errors[0])
+    assert "launch with torchrun" in _first_error(workdir / "out" / "full")
+
+
+@pytest.mark.java
+def test_cli_full_layout_rejects_fp16(workdir: Path, toy_index: Path) -> None:
+    argv = _argv(workdir, toy_index, "full16")
+    argv[argv.index(str(SMOKE))] = str(_full_config(workdir, precision="fp16"))
+    assert _main(argv) == EXIT_ERROR
+    assert "bf16 or fp32" in _first_error(workdir / "out" / "full16")
+
+
+@pytest.mark.java
+def test_cli_vllm_backend_needs_cuda(workdir: Path, toy_index: Path) -> None:
+    assert _main(_argv(workdir, toy_index, "cpuvllm", "--set", "rollout.backend=vllm")) == EXIT_ERROR
+    assert "needs CUDA" in _first_error(workdir / "out" / "cpuvllm")
+
+
+def _torchrun(workdir: Path, argv: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603 -- this interpreter, fixed module
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--nproc_per_node",
+            "2",
+            "--master_addr",
+            "127.0.0.1",
+            "--master_port",
+            str(_free_port()),
+            "-m",
+            "drbm25.train",
+            *argv,
+        ],
+        env=_subprocess_env(workdir),
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+
+
+@pytest.mark.java
+@pytest.mark.slow
+def test_cli_full_layout_two_ranks_writes_sharded_checkpoints_and_resumes(workdir: Path, toy_index: Path) -> None:
+    full = str(_full_config(workdir))
+
+    def argv(until: int) -> list[str]:
+        out = _argv(workdir, toy_index, "fsdp", "--until-step", str(until), "--set", "ppo.mini_batch_size=2")
+        out[out.index(str(SMOKE))] = full
+        return out
+
+    first = _torchrun(workdir, argv(2))
+    assert first.returncode == EXIT_OK, first.stdout[-4000:] + first.stderr[-4000:]
+    run_dir = workdir / "out" / "fsdp"
+    meta = json.loads((run_dir / "step_000002" / "meta.json").read_text())
+    assert meta["layout"] == "sharded"
+    assert meta["train_state"]["reward_mode"] == "normal"
+    assert sorted(p.name for p in (run_dir / "step_000002" / "dcp").iterdir()) == [
+        ".metadata",
+        "__0_0.distcp",
+        "__1_0.distcp",
+    ]
+    second = _torchrun(workdir, argv(3))
+    assert second.returncode == EXIT_OK, second.stdout[-4000:] + second.stderr[-4000:]
+    assert (run_dir / "latest").read_text().strip() == "step_000003"
+    assert (run_dir / "exit_code").read_text().strip() == "0"
+    records = {rank: _log_records(run_dir, rank) for rank in (0, 1)}
+    steps = {rank: [r["step"] for r in recs if r.get("message") == "batch"] for rank, recs in records.items()}
+    assert steps == {0: [0, 1, 2], 1: [0, 1, 2]}
+    resumed = {rank: any(str(r["message"]).startswith("resumed from") for r in recs) for rank, recs in records.items()}
+    assert resumed == {0: True, 1: True}
+    # val_every = 2: every rank generates the validation rollouts after step index 1 (FSDP collectives).
+    validated = {
+        rank: [r["step"] for r in recs if str(r["message"]).startswith("validation")] for rank, recs in records.items()
+    }
+    assert validated == {0: [1], 1: [1]}
+    rows = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()]
+    assert [row["step"] for row in rows] == [0, 1, 2]
+    assert all(math.isfinite(row["ppo/policy_loss"]) for row in rows)
 
 
 # --------------------------------------------------------------------------- startup checks
