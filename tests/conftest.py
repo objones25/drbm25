@@ -379,3 +379,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 def pytest_report_header(config: pytest.Config) -> list[str]:
     """Print the seed in the run header; it is what lets you reproduce a CI failure."""
     return [f"pytest-expert: seed={SEED} python={sys.version.split()[0]}"]
+
+
+@pytest.fixture
+def tiny_qwen2():
+    """A 2-layer fp32 Qwen2 causal LM (vocab 128, hidden 32) on CPU, seeded, sdpa attention."""
+    from drbm25.tiny import build_tiny_qwen2
+
+    return build_tiny_qwen2(seed=0)
