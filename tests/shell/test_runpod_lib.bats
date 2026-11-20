@@ -1074,3 +1074,89 @@ make_uv_tarball() {
   run -1 --separate-stderr in_lib
   [[ $stderr == *.python-version* ]]
 }
+
+# ---------------------------------------------------------------- unattended (non-interactive) mode
+
+@test "prompt_var with DRBM25_NONINTERACTIVE=1 never reads the tty and fails naming the variable" {
+  SNIPPET='prompt_var HF_TOKEN "Token" --secret'
+  printf 'hf_from_tty\n' >"$DRBM25_TTY"
+  run -1 --separate-stderr in_lib DRBM25_NONINTERACTIVE=1
+  [[ $stderr == *HF_TOKEN* ]]
+  [[ $stderr == *DRBM25_NONINTERACTIVE* ]]
+}
+
+@test "prompt_var is non-interactive when stdin is not a terminal and no DRBM25_TTY is given" {
+  SNIPPET='prompt_var HF_TOKEN "Token" --secret'
+  run -1 --separate-stderr env -i PATH="$PATH" HOME="$HOME" DRBM25_ROOT="$DRBM25_ROOT" \
+    bash -c 'source "$1"; runpod_paths; prompt_var HF_TOKEN Token --secret' _ "$LIB" </dev/null
+  [[ $stderr == *HF_TOKEN* ]]
+}
+
+@test "prompt_var with DRBM25_NONINTERACTIVE=1 keeps values from the environment" {
+  SNIPPET='prompt_var HF_TOKEN "Token" --secret; prompt_var WANDB_ENTITY "Entity" --optional; printf "%s|%s" "$HF_TOKEN" "$WANDB_ENTITY"'
+  run -0 --separate-stderr in_lib DRBM25_NONINTERACTIVE=1 HF_TOKEN=hf_a WANDB_ENTITY=
+  [[ $output == 'hf_a|' ]]
+}
+
+@test "collect_settings rejects a RunPod secret reference that was never substituted" {
+  SNIPPET='collect_settings'
+  run -1 --separate-stderr in_lib DRBM25_NONINTERACTIVE=1 'HF_TOKEN={{ RUNPOD_SECRET_drbm25_hf_token }}' \
+    WANDB_API_KEY=b RUNPOD_API_KEY=c WANDB_PROJECT=p WANDB_ENTITY= BUDGET_USD=90 PRICE_PER_HOUR=2.78 \
+    TERMINATE_ON_FINISH=yes VOLUME_GB=400
+  [[ $stderr == *HF_TOKEN* && $stderr == *drbm25_hf_token* ]]
+}
+
+@test "unattended run_all.sh with a missing variable writes FAILED and terminates the pod without reading the tty" {
+  printf 'hf_from_tty\n' >"$DRBM25_TTY"
+  run -1 --separate-stderr env DRBM25_ROOT="$DRBM25_ROOT" DRBM25_TTY="$DRBM25_TTY" DRBM25_NONINTERACTIVE=1 \
+    RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key bash "$RUN_ALL"
+  [[ $stderr == *"HF_TOKEN is not set"*DRBM25_NONINTERACTIVE* ]]
+  [[ -f $DRBM25_ROOT/FAILED ]]
+  grep -q '^curl .*-X DELETE .*https://api.runpod.io/v2/pods/pod123' "$STUB_LOG"
+  [[ ! -f $DRBM25_ROOT/.env ]] || ! grep -q hf_from_tty "$DRBM25_ROOT/.env"
+}
+
+@test "unattended run_all.sh that finds a FAILED marker terminates the pod instead of leaving it billing" {
+  echo "earlier failure" >"$DRBM25_ROOT/FAILED"
+  run -1 --separate-stderr env DRBM25_ROOT="$DRBM25_ROOT" DRBM25_NONINTERACTIVE=1 \
+    RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key bash "$RUN_ALL"
+  [[ $stderr == *"earlier failure"* ]]
+  [[ $stderr == *--clear-failed* ]]
+  grep -q '^curl .*-X DELETE .*https://api.runpod.io/v2/pods/pod123' "$STUB_LOG"
+  [[ -f $DRBM25_ROOT/FAILED ]]
+}
+
+@test "unattended run_all.sh with a FAILED marker and TERMINATE_ON_FINISH=no does not terminate" {
+  echo "earlier failure" >"$DRBM25_ROOT/FAILED"
+  run -1 --separate-stderr env DRBM25_ROOT="$DRBM25_ROOT" DRBM25_NONINTERACTIVE=1 TERMINATE_ON_FINISH=no \
+    RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key bash "$RUN_ALL"
+  ! grep -q '^curl' "$STUB_LOG"
+}
+
+@test "DRBM25_CLEAR_FAILED=1 moves the FAILED marker into logs/ and lets the launch go on" {
+  echo "earlier failure" >"$DRBM25_ROOT/FAILED"
+  SNIPPET='check_failed_marker'
+  run -0 --separate-stderr in_lib DRBM25_CLEAR_FAILED=1 DRBM25_NONINTERACTIVE=1
+  [[ ! -f $DRBM25_ROOT/FAILED ]]
+  grep -q 'earlier failure' "$DRBM25_ROOT"/logs/FAILED-*
+}
+
+@test "check_failed_marker in an interactive launch still refuses without terminating" {
+  echo "earlier failure" >"$DRBM25_ROOT/FAILED"
+  SNIPPET='check_failed_marker'
+  run -1 --separate-stderr in_lib RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key
+  [[ $stderr == *"NOT terminated"* ]]
+  ! grep -q '^curl' "$STUB_LOG"
+}
+
+@test "launch_start_unix uses DRBM25_POD_START_UNIX (when the pod booted) and falls back to now" {
+  SNIPPET='launch_start_unix'
+  run -0 in_lib DRBM25_POD_START_UNIX=1700000000 DRBM25_NOW_UNIX=1700000500
+  [[ $output == 1700000000 ]]
+  run -0 in_lib DRBM25_NOW_UNIX=1700000500
+  [[ $output == 1700000500 ]]
+  run -0 in_lib DRBM25_POD_START_UNIX=junk DRBM25_NOW_UNIX=1700000500
+  [[ $output == 1700000500 ]]
+  run -0 in_lib DRBM25_POD_START_UNIX=1800000000 DRBM25_NOW_UNIX=1700000500
+  [[ $output == 1700000500 ]]
+}

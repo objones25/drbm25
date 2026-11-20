@@ -38,7 +38,12 @@ through the RunPod API, unless --no-terminate is given or TERMINATE_ON_FINISH=no
 RESERVE_S (default $DEFAULT_RESERVE_S) is the number of seconds before the budget deadline at
 which training stops so evaluation and the report still fit.
 
-Exit status: 0 success, 1 failure (a FAILED marker is left in /workspace/drbm25; a launch that finds one stops without terminating the pod), 2 usage error.
+Unattended (DRBM25_NONINTERACTIVE=1, or stdin is not a terminal; set by pod_bootstrap.sh when launch.sh created
+the pod): nothing is ever asked; a missing setting is a failure (FAILED marker, pod terminated), and a FAILED
+marker from an earlier launch terminates the pod too. DRBM25_CLEAR_FAILED=1 moves that marker into logs/ and
+runs. DRBM25_POD_START_UNIX (the container's start) is used as the start of this launch's spend.
+
+Exit status: 0 success, 1 failure (a FAILED marker is left in /workspace/drbm25; an interactive launch that finds one stops without terminating the pod), 2 usage error.
 EOF2
 }
 
@@ -66,12 +71,13 @@ main() {
 
   # shellcheck source=lib.sh
   source "$SCRIPT_DIR/lib.sh"
-  start_unix=$(date +%s)
+  start_unix=$(launch_start_unix)
   if ((no_terminate)); then export NO_TERMINATE=1; fi
   runpod_paths
-  # A leftover FAILED marker stops the launch before any prompt and does NOT terminate the pod.
+  # A leftover FAILED marker stops the launch before any prompt. Interactively the pod is NOT terminated;
+  # unattended (pod_bootstrap.sh) it is, since nobody is there to fix the cause.
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  refuse_if_failed || exit 1
+  check_failed_marker || exit 1
   cd "$REPO_ROOT"
   mkdir -p "$DRBM25_LOG_DIR"
   logfile=$DRBM25_LOG_DIR/run_all-$(date '+%Y%m%dT%H%M%S').log

@@ -11,7 +11,9 @@
 #
 # Interface (every function returns a status; the ones that print data say so):
 #   runpod_paths               export DRBM25_ROOT and the paths under it (default /workspace/drbm25)
-#   prompt_var NAME PROMPT [--secret] [--optional] [--default V]
+#   prompt_var NAME PROMPT [--secret] [--optional] [--default V]   (never asks when unattended)
+#   noninteractive             true when unattended: DRBM25_NONINTERACTIVE=1, or stdin is not a terminal
+#                              and no DRBM25_TTY is given
 #   write_env_file PATH NAME...  write NAME=value lines (mode 600) for the set variables
 #   load_env_file PATH         export NAME=value lines for allowed names not already set
 #   collect_settings           prompts for what is missing, validates, rewrites the .env
@@ -24,9 +26,12 @@
 #   run_alternating_chunks UNTIL CHUNK   status 0 done, 3 budget stop, 1 failure
 #   eval_stage, train_and_report UNTIL CHUNK
 #   spend_begin / spend_record / spend_total   dollars spent, kept in spend.json on the volume
-#   refuse_if_failed, install_exit_traps
+#   refuse_if_failed, check_failed_marker, install_exit_traps
+#   launch_start_unix          print when billing for this launch began (DRBM25_POD_START_UNIX or now)
 #   on_exit STATUS             record spend, copy logs, then terminate the pod unless told not to
 #
+# Unattended runs (set by scripts/runpod/pod_bootstrap.sh): DRBM25_NONINTERACTIVE=1, DRBM25_CLEAR_FAILED=1,
+# DRBM25_POD_START_UNIX.
 # Test hooks (environment): DRBM25_ROOT, DRBM25_TTY (file read instead of /dev/tty),
 # DRBM25_SLEEP (command used for the terminate backoff), DRBM25_CONFIG.
 
@@ -140,6 +145,16 @@ _quiet() {
   return "$rc"
 }
 
+# Unattended: nobody can answer a prompt. DRBM25_NONINTERACTIVE=1 forces it, =0 rules it out; unset, it
+# follows stdin (a pod's start command has none), unless a test supplies answers through DRBM25_TTY.
+noninteractive() {
+  case ${DRBM25_NONINTERACTIVE-} in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  [[ ! -t 0 && -z ${DRBM25_TTY-} ]]
+}
+
 # Errors are returned explicitly: the body runs inside `||` (via _quiet), where set -e is off.
 _prompt_var_body() {
   local name=$1 prompt=$2
@@ -164,8 +179,13 @@ _prompt_var_body() {
   if [[ -n ${!name-} ]] || { ((optional)) && [[ -n ${!name+set} ]]; }; then
     return 0
   fi
+  # shellcheck disable=SC2310 # a predicate: its status is the answer
+  if noninteractive; then
+    _common_log "error: $name is not set and this run is unattended (DRBM25_NONINTERACTIVE or no terminal), so nobody can be asked; set it in the environment"
+    return 1
+  fi
   if [[ ! -r $tty ]]; then
-    _common_log "error: $name is not set and there is no terminal to ask; set it in the environment or in $DRBM25_ENV_FILE"
+    _common_log "error: $name is not set and there is no terminal to ask; set it in the environment or in ${DRBM25_ENV_FILE:-the .env file}"
     return 1
   fi
   printf '%s (%s)%s: ' "$prompt" "$name" "${default:+ [$default]}" >&2
@@ -249,6 +269,20 @@ _require_positive_number() {
   fi
 }
 
+# A pod created by launch.sh gets its keys as `{{ RUNPOD_SECRET_<name> }}` references that RunPod replaces at
+# boot. A reference that reaches the script unreplaced (a deleted or misnamed secret) must stop the run here,
+# not fail hours later as a bad token.
+_require_substituted_secrets() {
+  local name
+  for name in HF_TOKEN WANDB_API_KEY RUNPOD_API_KEY; do
+    if [[ ${!name-} == *RUNPOD_SECRET_* ]]; then
+      # The value is only a reference, never the secret, so it is safe to print.
+      _common_log "error: $name holds the unreplaced RunPod secret reference '${!name}'; create that secret (scripts/runpod/launch.sh does) and relaunch"
+      return 1
+    fi
+  done
+}
+
 collect_settings() {
   load_env_file "$DRBM25_ENV_FILE"
   prompt_var HF_TOKEN "Hugging Face token (hidden)" --secret
@@ -263,6 +297,7 @@ collect_settings() {
   prompt_var PRICE_PER_HOUR "This pod's price per hour in dollars (for example 2.78)"
   prompt_var TERMINATE_ON_FINISH "Terminate the pod when finished (yes/no)" --default yes
   prompt_var VOLUME_GB "Size of the network volume in GB (optional; lets the disk check use it, since df may show pooled space)" --optional
+  _require_substituted_secrets
   _require_positive_number BUDGET_USD
   _require_positive_number PRICE_PER_HOUR
   if [[ -n $VOLUME_GB && ! $VOLUME_GB =~ ^[1-9][0-9]*$ ]]; then
@@ -325,11 +360,52 @@ refuse_if_failed() {
   fi
 }
 
+# What a launch does with a FAILED marker. Returns 0 to go on, 1 to stop.
+# DRBM25_CLEAR_FAILED=1 (launch.sh --clear-failed, after the cause is fixed) moves the marker into logs/.
+# Unattended, nobody is there to fix anything, so the pod is terminated (unless TERMINATE_ON_FINISH=no)
+# instead of sitting idle and billing; interactively the launch stops and leaves the pod to the user.
+check_failed_marker() {
+  local archived
+  [[ -f $DRBM25_FAILED_FILE ]] || return 0
+  if [[ ${DRBM25_CLEAR_FAILED-} == 1 ]]; then
+    archived=$DRBM25_LOG_DIR/FAILED-$(date '+%Y%m%dT%H%M%S')
+    mkdir -p -- "$DRBM25_LOG_DIR" && mv -f -- "$DRBM25_FAILED_FILE" "$archived" || return 1
+    _runpod_log "DRBM25_CLEAR_FAILED=1: moved the FAILED marker ($(<"$archived")) to $archived"
+    return 0
+  fi
+  # shellcheck disable=SC2310 # a predicate: its status is the answer
+  if ! noninteractive; then
+    refuse_if_failed
+    return 1
+  fi
+  _common_log "error: an earlier launch failed: $(<"$DRBM25_FAILED_FILE")"
+  _common_log "error: fix the cause, then relaunch with: bash scripts/runpod/launch.sh --clear-failed"
+  if [[ ${TERMINATE_ON_FINISH-} == no ]]; then
+    _common_log "error: TERMINATE_ON_FINISH=no, so this pod is left running (and billing)"
+  else
+    # shellcheck disable=SC2310 # best effort: the launch stops either way
+    terminate_pod || true
+  fi
+  return 1
+}
+
 # ---------------------------------------------------------------- spend and time
 
 # Test hook: DRBM25_NOW_UNIX pins the clock.
 _now_unix() {
   if [[ -n ${DRBM25_NOW_UNIX-} ]]; then printf '%s\n' "$DRBM25_NOW_UNIX"; else date +%s; fi
+}
+
+# When billing for this launch began: DRBM25_POD_START_UNIX (pod_bootstrap.sh records the container start,
+# so boot and clone time count), or now. A value that is not a plain number or lies in the future is ignored.
+launch_start_unix() {
+  local now start=${DRBM25_POD_START_UNIX-}
+  now=$(_now_unix)
+  if [[ $start =~ ^[0-9]+$ ]] && ((start <= now)); then
+    printf '%s\n' "$start"
+  else
+    printf '%s\n' "$now"
+  fi
 }
 
 # Dollars spent by earlier launches (spend.json on the volume); 0 when there is none.
