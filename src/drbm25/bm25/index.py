@@ -13,6 +13,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 JSONL_NAME = "collection.jsonl"
+INDEX_INFO_NAME = "INDEX_INFO.json"  # written by drbm25.prepare; excluded from the checksum
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,6 @@ def read_index_info(index_dir: Path) -> IndexInfo:
 
     n_docs = int(LuceneIndexReader(str(index_dir)).stats()["documents"])
     digest = hashlib.sha256()
-    for path in sorted(p for p in index_dir.iterdir() if p.is_file()):
+    for path in sorted(p for p in index_dir.iterdir() if p.is_file() and p.name != INDEX_INFO_NAME):
         digest.update(f"{path.name}\t{path.stat().st_size}\n".encode())
     return IndexInfo(n_docs=n_docs, checksum=digest.hexdigest())
