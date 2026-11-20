@@ -61,20 +61,25 @@ def _restore_logging() -> Iterator[None]:
 
     configure() installs a queue handler and listener thread, binds the console
     handler to the current (captured) stdout, and sets process-wide flags; none of
-    that may leak into the next test.
+    that may leak into the next test. Only handlers drbm25.obs installed are removed
+    from root. dictConfig also strips every pre-existing root handler, including
+    pytest's session-wide ones (live-log null handler, log-file handler), which
+    pytest never reinstalls, so those are put back. pytest's per-phase
+    LogCaptureHandlers are never re-added: pytest adds and removes them itself.
     """
-    from drbm25.obs.setup import DEFAULT_LIBRARY_LEVELS, shutdown
+    from _pytest.logging import LogCaptureHandler
 
-    root = logging.getLogger()  # obs: allow LOG003 -- snapshot/restore of root on purpose
-    handlers, level = list(root.handlers), root.level
+    from drbm25.obs.setup import DEFAULT_LIBRARY_LEVELS, ContextQueueHandler, shutdown
+
+    root = logging.getLogger()  # obs: allow LOG003 -- restore root level on purpose
+    level = root.level
+    session_handlers = [h for h in root.handlers if not isinstance(h, LogCaptureHandler)]
     lib_levels = {n: logging.getLogger(n).level for n in DEFAULT_LIBRARY_LEVELS}
     yield
     shutdown()
-    # Diff against the snapshot instead of replacing the list: pytest's own per-phase
-    # capture handlers come and go on root and must not be re-added or dropped here.
-    for h in [h for h in root.handlers if h not in handlers]:
+    for h in [h for h in root.handlers if isinstance(h, ContextQueueHandler)]:
         root.removeHandler(h)
-    for h in [h for h in handlers if h not in root.handlers]:
+    for h in [h for h in session_handlers if h not in root.handlers]:
         root.addHandler(h)
     root.setLevel(level)
     for n, lvl in lib_levels.items():

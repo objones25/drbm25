@@ -35,12 +35,32 @@ def test_b_sees_clean_state_and_caplog_works(caplog):
 
 _COUNT_TESTS = '''
 import logging
-import pytest
+
+from drbm25.obs import setup
 
 
-@pytest.mark.parametrize("i", range(5))
-def test_n(i):
-    print("ROOT_HANDLERS", len(logging.getLogger().handlers))
+def _obs_handlers():
+    return [h for h in logging.getLogger().handlers if isinstance(h, setup.ContextQueueHandler)]
+
+
+def test_0_before_any_configure(request):
+    assert _obs_handlers() == []
+    print("BASELINE", len(logging.getLogger().handlers))
+
+
+def test_1_configures():
+    setup.configure(level="INFO", force=True)
+    assert len(_obs_handlers()) == 1
+
+
+def test_2_after():
+    assert _obs_handlers() == []
+    print("AFTER", len(logging.getLogger().handlers))
+
+
+def test_3_after():
+    assert _obs_handlers() == []
+    print("AFTER", len(logging.getLogger().handlers))
 '''
 
 
@@ -57,8 +77,8 @@ def test_shutdown_makes_configure_effective_again() -> None:
     assert setup._configured is True
 
 
-def test_root_handler_count_does_not_grow_across_tests(tmp_path: Path) -> None:
-    """Five tests in a fresh pytest process; the root handler count must stay constant."""
+def test_root_handler_count_returns_to_baseline_after_configure(tmp_path: Path) -> None:
+    """A test that calls configure() must leave root exactly as a never-configured run sees it."""
     shutil.copy(CONFTEST, tmp_path / "conftest.py")
     (tmp_path / "test_count.py").write_text(_COUNT_TESTS)
     proc = subprocess.run(  # noqa: S603 -- fixed argv, no external input
@@ -70,9 +90,12 @@ def test_root_handler_count_does_not_grow_across_tests(tmp_path: Path) -> None:
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    counts = [int(line.split()[1]) for line in proc.stdout.splitlines() if "ROOT_HANDLERS" in line]
-    assert len(counts) == 5
-    assert len(set(counts)) == 1, counts
+    counts = {
+        key: [int(line.rsplit(" ", 1)[1]) for line in proc.stdout.splitlines() if key in line]
+        for key in ("BASELINE", "AFTER")
+    }
+    assert len(counts["BASELINE"]) == 1
+    assert counts["AFTER"] == counts["BASELINE"] * 2  # two tests ran after configure
 
 
 def test_configure_in_one_test_does_not_leak_into_the_next(tmp_path: Path) -> None:
