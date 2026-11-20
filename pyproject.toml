@@ -62,7 +62,13 @@ markers = [
     "integration: crosses a process, service, or network boundary; deselected by default",
     "slow: takes more than ~1s",
 ]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # pyserini 2.0.0 trectools/_base.py has '\s' in non-raw strings; Python compiles it with a
+    # SyntaxWarning the first time (fresh venv), which "error" turns into a collection error.
+    # Our own code is covered by ruff W605.
+    "ignore:invalid escape sequence:SyntaxWarning",
+]
 faulthandler_timeout = 120
 pythonpath = ["src"]
 
