@@ -733,33 +733,28 @@ _run_eval() {
 }
 
 # Always re-run: evaluation is deterministic (greedy) and cheap next to the cost of a missed report.
+# Each trained row is the run's best/ policy (selected on the validation split carved from train);
+# the test set is all of dev.
 eval_stage() {
   local normal_dir=$DRBM25_RUNS_DIR/normal count_once_dir=$DRBM25_RUNS_DIR/count_once
-  local out_dir=$DRBM25_RUNS_DIR/eval step step_name
+  local out_dir=$DRBM25_RUNS_DIR/eval run_dir
   runpod_set_args
+  for run_dir in "$normal_dir" "$count_once_dir"; do
+    if [[ ! -f $run_dir/best/meta.json ]]; then
+      _common_log "error: no best/ policy in $run_dir (training never reached a validation step?)"
+      return 1
+    fi
+  done
   mkdir -p "$out_dir"
-  # Both rows of the report must come from the same step; common_step raises when none is shared.
-  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  step=$(_uv python -c '
-import sys
-from pathlib import Path
-from drbm25.eval.report import common_step
-print(common_step(Path(sys.argv[1]), Path(sys.argv[2])))
-' "$normal_dir" "$count_once_dir") || return 1
-  if [[ ! $step =~ ^[0-9]+$ ]]; then
-    _common_log "error: common_step printed '$step', expected a step number"
-    return 1
-  fi
-  step_name=$(printf 'step_%06d' "$step")
-  _runpod_log "evaluating step $step of both runs"
+  _runpod_log "evaluating the best/ policy of both runs"
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   _run_eval original "$out_dir/original.jsonl" || return 1
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   _run_eval untrained "$out_dir/untrained.jsonl" || return 1
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  _run_eval checkpoint "$out_dir/trained-normal.jsonl" "$normal_dir/$step_name" || return 1
+  _run_eval checkpoint "$out_dir/trained-normal.jsonl" "$normal_dir/best" || return 1
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  _run_eval checkpoint "$out_dir/trained-count_once.jsonl" "$count_once_dir/$step_name" || return 1
+  _run_eval checkpoint "$out_dir/trained-count_once.jsonl" "$count_once_dir/best" || return 1
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   _uv_timeout "$EVAL_TIMEOUT_S" python -m drbm25.eval.report \
     --inputs "$out_dir/original.jsonl" "$out_dir/untrained.jsonl" \
@@ -775,7 +770,7 @@ train_and_report() {
   run_alternating_chunks "$1" "$2" || rc=$?
   case $rc in
     0) ;;
-    3) _runpod_log "budget stop: evaluating the last step both runs reached" ;;
+    3) _runpod_log "budget stop: evaluating the best/ policy each run has so far" ;;
     *) return 1 ;;
   esac
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e

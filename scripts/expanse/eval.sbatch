@@ -14,9 +14,9 @@
 #   sbatch --account="$EXPANSE_ACCOUNT" scripts/expanse/eval.sbatch   (from the repo root)
 #
 # eval.sbatch: Exp 1 / Exp 2 scoring after both training runs have finished.
-# Scores the original queries, the untrained model, and the "normal" and "count_once" runs at
-# the largest step both runs have a complete checkpoint for (drbm25.eval.report.common_step),
-# then writes the report. Everything lands in $DRBM25_ROOT/runs/eval/:
+# Scores the original queries, the untrained model, and the best/ policy of the "normal" and
+# "count_once" runs (each selected on the validation split carved from train; the test set is all
+# of dev), then writes the report. Everything lands in $DRBM25_ROOT/runs/eval/:
 #   original.jsonl untrained.jsonl trained-normal.jsonl trained-count_once.jsonl report.md
 # The report is built offline here; add --wandb from the login node (see README).
 # Requires: bash, the env made by prepare_login.sh, EXPANSE_ACCOUNT in the environment.
@@ -60,21 +60,15 @@ count_once_dir=$DRBM25_RUNS_DIR/count_once
 out_dir=$DRBM25_RUNS_DIR/eval
 mkdir -p "$out_dir"
 
-# The step both runs reached. A run that is still behind caps the comparison, which is the
-# point: both rows of the report must come from the same step. Exits non-zero when none is shared.
-step=$("$python" -c '
-import sys
-from pathlib import Path
-from drbm25.eval.report import common_step
-print(common_step(Path(sys.argv[1]), Path(sys.argv[2])))
-' "$normal_dir" "$count_once_dir")
-[[ $step =~ ^[0-9]+$ ]] || die "common_step printed '$step', expected a step number"
-step_name=$(printf 'step_%06d' "$step")
 total_steps=$(config_total_steps "$CONFIG")
-if ((step < total_steps)); then
-  log "warning: evaluating step $step, but total_steps is $total_steps (training not finished?)"
-fi
-log "evaluating step $step ($step_name) of both runs"
+for run_dir in "$normal_dir" "$count_once_dir"; do
+  [[ -f $run_dir/best/meta.json ]] || die "no best/ policy in $run_dir (training never reached a validation step?)"
+  latest=$(latest_step "$run_dir")
+  if ((latest < total_steps)); then
+    log "warning: ${run_dir##*/} is at step $latest of $total_steps (training not finished?); evaluating its best/ so far"
+  fi
+done
+log "evaluating the best/ policy of both runs"
 
 run_eval() {
   local source=$1 out=$2
@@ -85,8 +79,8 @@ run_eval() {
 
 run_eval original "$out_dir/original.jsonl"
 run_eval untrained "$out_dir/untrained.jsonl"
-run_eval checkpoint "$out_dir/trained-normal.jsonl" --checkpoint "$normal_dir/$step_name"
-run_eval checkpoint "$out_dir/trained-count_once.jsonl" --checkpoint "$count_once_dir/$step_name"
+run_eval checkpoint "$out_dir/trained-normal.jsonl" --checkpoint "$normal_dir/best"
+run_eval checkpoint "$out_dir/trained-count_once.jsonl" --checkpoint "$count_once_dir/best"
 
 "$python" -m drbm25.eval.report \
   --inputs "$out_dir/original.jsonl" "$out_dir/untrained.jsonl" \

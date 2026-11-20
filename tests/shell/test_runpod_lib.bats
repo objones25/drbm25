@@ -80,11 +80,15 @@ case $cmd in
     if [[ $code != missing ]]; then echo "$code" >"$out/$run/exit_code"; fi
     echo '{"step": 1}' >>"$out/$run/metrics.jsonl"
     if [[ $code == 0 && -z ${STUB_NO_LATEST-} ]]; then printf 'step_%06d\n' "$step" >"$out/$run/latest"; fi
+    # Validation ran at every chunk boundary, so a finished or budget-stopped chunk has a best/.
+    if [[ ($code == 0 || $code == 3) && -z ${STUB_NO_BEST-} ]]; then
+      mkdir -p "$out/$run/best"
+      printf '{"kind": "best", "step": %s}\n' "$step" >"$out/$run/best/meta.json"
+    fi
     exit 1 # torchrun collapses worker codes
     ;;
   pytest) exit "${STUB_PYTEST_RC:-0}" ;;
   python)
-    if [[ $* == *common_step* ]]; then echo "${STUB_COMMON_STEP:-100}"; fi
     if [[ $* == *deadline_from_budget* ]]; then echo 1234567890; fi
     if [[ $* == *spike_monitor.py* ]]; then exit "${STUB_SPIKE_RC:-0}"; fi
     exit 0
@@ -483,13 +487,14 @@ chunk_env() { printf '%s\n' "DEADLINE_UNIX=2000000000" "RESERVE_S=3600"; }
 
 # ---------------------------------------------------------------- train_and_report
 
-@test "train_and_report evaluates original, untrained and both checkpoints at the common step, then reports" {
+@test "train_and_report evaluates original, untrained and each run's best/ policy, then reports" {
   SNIPPET='runpod_paths; train_and_report 100 50'
-  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_COMMON_STEP=100
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600
   grep -q 'run_eval --config configs/runpod_a100_full.yaml --source original' "$STUB_LOG"
   grep -q -- '--source untrained' "$STUB_LOG"
-  grep -q -- "--source checkpoint --out $DRBM25_ROOT/runs/eval/trained-normal.jsonl --checkpoint $DRBM25_ROOT/runs/normal/step_000100" "$STUB_LOG"
-  grep -q -- "--checkpoint $DRBM25_ROOT/runs/count_once/step_000100" "$STUB_LOG"
+  grep -q -- "--source checkpoint --out $DRBM25_ROOT/runs/eval/trained-normal.jsonl --checkpoint $DRBM25_ROOT/runs/normal/best" "$STUB_LOG"
+  grep -q -- "--source checkpoint --out $DRBM25_ROOT/runs/eval/trained-count_once.jsonl --checkpoint $DRBM25_ROOT/runs/count_once/best" "$STUB_LOG"
+  ! grep -q 'step_0' <(grep run_eval "$STUB_LOG")
   grep -q -- 'drbm25.eval.report --inputs' "$STUB_LOG"
   grep -q -- '--wandb --config configs/runpod_a100_full.yaml' "$STUB_LOG"
 }
@@ -497,12 +502,21 @@ chunk_env() { printf '%s\n' "DEADLINE_UNIX=2000000000" "RESERVE_S=3600"; }
 @test "a budget exit stops the loop and still runs eval on what exists" {
   echo 3 >"$STUB_DIR/exit_count_once_50"
   SNIPPET='runpod_paths; train_and_report 100 50'
-  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_COMMON_STEP=50
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600
   [[ $(train_calls | tr '\n' ' ') == 'normal@50 count_once@50 ' ]]
   grep -q -- '--source original' "$STUB_LOG"
-  grep -q -- "runs/normal/step_000050" "$STUB_LOG"
+  grep -q -- "runs/normal/best" "$STUB_LOG"
+  grep -q -- "runs/count_once/best" "$STUB_LOG"
   grep -q -- 'drbm25.eval.report' "$STUB_LOG"
   [[ ! -e $DRBM25_ROOT/FAILED ]]
+}
+
+@test "eval refuses to score when a run has no best/ policy, and writes FAILED" {
+  SNIPPET='runpod_paths; train_and_report 50 50'
+  run -1 --separate-stderr in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_NO_BEST=1
+  [[ $stderr == *"no best/"* ]]
+  ! grep -q 'run_eval' "$STUB_LOG"
+  grep -q 'evaluation' "$DRBM25_ROOT/FAILED"
 }
 
 @test "a training failure returns 1 and runs no eval" {
@@ -622,7 +636,7 @@ on_exit_env() { printf '%s\n' RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key; }
 
 @test "the report carries the W&B project and entity (W&B)" {
   SNIPPET='train_and_report 50 50'
-  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_COMMON_STEP=50 WANDB_PROJECT=myproj WANDB_ENTITY=myteam
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 WANDB_PROJECT=myproj WANDB_ENTITY=myteam
   grep 'drbm25.eval.report' "$STUB_LOG" | grep -q -- '--set run.wandb_project=myproj'
   grep 'drbm25.eval.report' "$STUB_LOG" | grep -q -- '--set run.wandb_entity=myteam'
 }
@@ -723,8 +737,11 @@ on_exit_env() { printf '%s\n' RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key; }
   run -1 --separate-stderr in_lib STUB_TIMEOUT_RC=124
   [[ $stderr == *"timed out"* ]]
   : >"$STUB_LOG"
+  mkdir -p "$DRBM25_ROOT/runs/normal/best" "$DRBM25_ROOT/runs/count_once/best"
+  echo '{}' >"$DRBM25_ROOT/runs/normal/best/meta.json"
+  echo '{}' >"$DRBM25_ROOT/runs/count_once/best/meta.json"
   SNIPPET='eval_stage'
-  run -0 in_lib STUB_COMMON_STEP=50
+  run -0 in_lib
   [[ $(grep -c '^timeout .*run_eval' "$STUB_LOG") == 4 ]]
   grep -q '^timeout .*eval.report' "$STUB_LOG"
 }

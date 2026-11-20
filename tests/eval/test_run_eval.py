@@ -14,18 +14,20 @@ import pytest
 import torch
 import torch.distributed as tdist
 import yaml
+from transformers import PreTrainedModel
 
 import drbm25.eval.run_eval as run_eval_module
 from drbm25.bm25.searcher import Bm25Searcher, SearchResult, TooManyClausesError
-from drbm25.checkpoint import TrainState, save_checkpoint
+from drbm25.checkpoint import BestMeta, TrainState, save_best, save_checkpoint
 from drbm25.config import LoraCfg, ScoringMode, load_config
 from drbm25.data import DEV_FILE, Example
-from drbm25.eval.records import QueryRecord, read_records
+from drbm25.eval.records import QueryRecord, read_header, read_records
 from drbm25.eval.run_eval import main, score_original, score_rewrites
 from drbm25.ppo.models import LoraPolicyModels
 from drbm25.prompt import build_prompt
 from drbm25.rollout.base import RolloutBatch
-from drbm25.tiny import build_tiny_qwen2
+from drbm25.rollout.hf_generate import HFGenerateEngine
+from drbm25.tiny import build_tiny_qwen2, build_tiny_tokenizer
 
 pytestmark = pytest.mark.java
 
@@ -303,3 +305,125 @@ def test_full_config_refuses_a_lora_checkpoint(workdir: Path) -> None:
     cfg = _load_fsdp_cases().full_cfg()
     with pytest.raises(ValueError, match="not a sharded"):
         run_eval_module._build_engine(cfg, ckpt)
+
+
+# --------------------------------------------------------------------------- best/ (the selected policy)
+_PROMPTS = [build_prompt(q) for q in ("solar panel efficiency", "w4 w9 w12", "heart attack aspirin")]
+_SEEDS = {"run_seed": 1234, "split_seed": 1234}
+
+
+def _push_greedy_away(module: torch.nn.Module, logits_fn: Any, params: list[torch.nn.Parameter]) -> None:
+    """A few large LM steps on fixed text, so the greedy rewrites differ from the untrained model's."""
+    ids = torch.tensor([[5, 9, 12, 4, 7, 5, 9, 12]])
+    mask = torch.ones_like(ids)
+    opt = torch.optim.SGD(params, lr=1.0)
+    module.train()
+    for _ in range(5):
+        logits = logits_fn(ids, mask)
+        loss = torch.nn.functional.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]), ids[:, 1:].reshape(-1))
+        loss.backward()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+    module.eval()
+
+
+def _meta(layout: str, mode: ScoringMode = "normal") -> BestMeta:
+    return BestMeta(
+        step=100,
+        val_ndcg_normal=0.42,
+        val_ndcg_count_once=0.31,
+        reward_mode=mode,
+        layout="lora" if layout == "lora" else "full",
+        config_sha256="ab" * 32,
+        seeds=_SEEDS,
+    )
+
+
+def _lora_best(run_dir: Path, mode: ScoringMode = "normal") -> tuple[Path, LoraPolicyModels]:
+    cfg = load_config(SMOKE)
+    assert cfg.lora is not None
+    models = LoraPolicyModels(build_tiny_qwen2(seed=cfg.run.seed), cfg.lora, gradient_checkpointing=False)
+    _push_greedy_away(models.generation_module(), models.actor_logits, models.actor_parameters())
+    return save_best(run_dir, weights=models.actor_state_dict(), meta=_meta("lora", mode)), models
+
+
+def _full_best(run_dir: Path) -> tuple[Path, PreTrainedModel]:
+    actor = build_tiny_qwen2(seed=0)
+
+    def logits(ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return actor(input_ids=ids, attention_mask=mask).logits
+
+    _push_greedy_away(actor, logits, list(actor.parameters()))
+    return save_best(run_dir, weights=actor.state_dict(), meta=_meta("full", "count_once")), actor
+
+
+def test_lora_best_rewrites_equal_the_live_actor(tmp_path: Path) -> None:
+    cfg = load_config(SMOKE)
+    best, live = _lora_best(tmp_path / "run")
+    want = HFGenerateEngine(live, build_tiny_tokenizer(), cfg.rollout, torch.device("cpu")).generate(_PROMPTS, greedy=True)
+    engine, source = run_eval_module._build_engine(cfg, best)
+    got = engine.generate(_PROMPTS, greedy=True)
+    assert source == "trained-normal"
+    assert got.response_ids.tolist() == want.response_ids.tolist()
+    untrained, _ = run_eval_module._build_engine(cfg, None)
+    assert untrained.generate(_PROMPTS, greedy=True).response_ids.tolist() != want.response_ids.tolist()
+
+
+def test_full_best_rewrites_equal_the_live_actor(tmp_path: Path) -> None:
+    cfg = _load_fsdp_cases().full_cfg()
+    best, live = _full_best(tmp_path / "run")
+    frozen = run_eval_module._FrozenActor(live)
+    want = HFGenerateEngine(frozen, build_tiny_tokenizer(), cfg.rollout, torch.device("cpu")).generate(
+        _PROMPTS, greedy=True
+    )
+    engine, source = run_eval_module._build_engine(cfg, best)
+    got = engine.generate(_PROMPTS, greedy=True)
+    assert source == "trained-count_once"
+    assert got.response_ids.tolist() == want.response_ids.tolist()
+    untrained, _ = run_eval_module._build_engine(cfg, None)
+    assert untrained.generate(_PROMPTS, greedy=True).response_ids.tolist() != want.response_ids.tolist()
+
+
+def test_lora_config_refuses_a_full_best(tmp_path: Path) -> None:
+    best, _ = _full_best(tmp_path / "run")
+    with pytest.raises(ValueError, match="layout 'full'"):
+        run_eval_module._build_engine(load_config(SMOKE), best)
+
+
+def test_full_config_refuses_a_lora_best(tmp_path: Path) -> None:
+    best, _ = _lora_best(tmp_path / "run")
+    with pytest.raises(ValueError, match="layout 'lora'"):
+        run_eval_module._build_engine(_load_fsdp_cases().full_cfg(), best)
+
+
+@pytest.mark.parametrize("mode", ["normal", "count_once"])
+def test_cli_scores_best_labelled_from_its_meta_and_records_provenance(
+    workdir: Path, toy_index: Path, mode: ScoringMode
+) -> None:
+    best, _ = _lora_best(workdir / "out" / mode, mode)
+    out = workdir / "trained.jsonl"
+    argv = _argv(workdir, toy_index, out, "--source", "checkpoint", "--checkpoint", str(best), "--limit", "2")
+    assert main(argv) == 0
+    assert {r.source for r in read_records(out)} == {f"trained-{mode}"}
+    header = read_header(out)
+    assert header is not None
+    assert header["source"] == f"trained-{mode}"
+    assert header["checkpoint"] == str(best)
+    assert header["best"] == {
+        "step": 100,
+        "val_ndcg_normal": pytest.approx(0.42),
+        "val_ndcg_count_once": pytest.approx(0.31),
+        "selection_metric": f"val/ndcg_{mode}",
+        "config_sha256": "ab" * 32,
+        "seeds": _SEEDS,
+    }
+    assert header["eval_seed"] == 1234
+    assert len(header["eval_config_sha256"]) == 64
+
+
+def test_cli_original_header_has_no_best(workdir: Path, toy_index: Path) -> None:
+    out = workdir / "orig.jsonl"
+    assert main(_argv(workdir, toy_index, out, "--source", "original", "--limit", "2")) == 0
+    header = read_header(out)
+    assert header is not None
+    assert (header["source"], header["checkpoint"], header["best"]) == ("original", None, None)

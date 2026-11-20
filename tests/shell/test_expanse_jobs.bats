@@ -158,45 +158,54 @@ run_train() {
 # ---- eval.sbatch ----
 
 setup_eval_python() {
-  # python stub: `-c` prints the common step; `-m drbm25.eval.*` records its arguments.
+  # python stub: `-m drbm25.eval.*` records its arguments. Both runs have a best/ policy and a
+  # finished resume checkpoint unless a test removes them.
   cat >bin/fakepython <<'STUB'
 #!/usr/bin/env bash
-if [[ $1 == -c ]]; then
-  if [[ -n ${STUB_COMMON_FAIL-} ]]; then echo "no common step" >&2; exit 1; fi
-  printf '%s\n' "${STUB_COMMON_STEP:-1751}"
-else
-  printf '%s\n' "$*" >>"$PYTHON_LOG"
-fi
+printf '%s\n' "$*" >>"$PYTHON_LOG"
 STUB
   chmod +x bin/fakepython
   export DRBM25_PYTHON="$PWD/bin/fakepython" PYTHON_LOG="$PWD/python.log"
   : >"$PYTHON_LOG"
+  local mode
+  for mode in normal count_once; do
+    mkdir -p "$DRBM25_ROOT/runs/$mode/best" "$DRBM25_ROOT/runs/$mode/step_001751"
+    echo '{"kind": "best", "step": 1450}' >"$DRBM25_ROOT/runs/$mode/best/meta.json"
+    echo '{}' >"$DRBM25_ROOT/runs/$mode/step_001751/meta.json"
+    echo step_001751 >"$DRBM25_ROOT/runs/$mode/latest"
+  done
 }
 
-@test "eval.sbatch scores all four sources at the common step and builds the report" {
+@test "eval.sbatch scores all four sources, the trained ones from each run's best/, and builds the report" {
   setup_eval_python
   run --separate-stderr bash "$REPO/scripts/expanse/eval.sbatch"
   [[ $status -eq 0 ]]
   log=$(<"$PYTHON_LOG")
   [[ $log == *"--source original --out $DRBM25_ROOT/runs/eval/original.jsonl"* ]]
   [[ $log == *"--source untrained --out $DRBM25_ROOT/runs/eval/untrained.jsonl"* ]]
-  [[ $log == *"--source checkpoint --out $DRBM25_ROOT/runs/eval/trained-normal.jsonl"*"--checkpoint $DRBM25_ROOT/runs/normal/step_001751"* ]]
-  [[ $log == *"--checkpoint $DRBM25_ROOT/runs/count_once/step_001751"* ]]
+  [[ $log == *"--source checkpoint --out $DRBM25_ROOT/runs/eval/trained-normal.jsonl"*"--checkpoint $DRBM25_ROOT/runs/normal/best"* ]]
+  [[ $log == *"--checkpoint $DRBM25_ROOT/runs/count_once/best"* ]]
+  [[ $log != *step_0* ]]
   [[ $log == *"drbm25.eval.report --inputs"*"--out $DRBM25_ROOT/runs/eval/report.md"* ]]
+  [[ $stderr != *warning* ]]
 }
 
-@test "eval.sbatch uses the step common_step returns, zero-padded" {
+@test "eval.sbatch warns when a run's training has not reached total_steps" {
   setup_eval_python
-  STUB_COMMON_STEP=150 run --separate-stderr bash "$REPO/scripts/expanse/eval.sbatch"
+  echo step_000150 >"$DRBM25_ROOT/runs/count_once/latest"
+  mkdir -p "$DRBM25_ROOT/runs/count_once/step_000150"
+  echo '{}' >"$DRBM25_ROOT/runs/count_once/step_000150/meta.json"
+  run --separate-stderr bash "$REPO/scripts/expanse/eval.sbatch"
   [[ $status -eq 0 ]]
-  [[ $(<"$PYTHON_LOG") == *"runs/normal/step_000150"* ]]
-  [[ $stderr == *"warning"* ]]
+  [[ $stderr == *"warning"*"count_once"*"150"* ]]
 }
 
-@test "eval.sbatch stops before scoring when the runs share no checkpoint" {
+@test "eval.sbatch stops before scoring when a run has no best/ policy" {
   setup_eval_python
-  STUB_COMMON_FAIL=1 run --separate-stderr bash "$REPO/scripts/expanse/eval.sbatch"
+  rm -r "$DRBM25_ROOT/runs/count_once/best"
+  run --separate-stderr bash "$REPO/scripts/expanse/eval.sbatch"
   [[ $status -ne 0 ]]
+  [[ $stderr == *"no best/"* ]]
   [[ ! -s $PYTHON_LOG ]]
 }
 

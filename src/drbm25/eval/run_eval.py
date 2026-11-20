@@ -6,9 +6,16 @@
 
 ``original`` scores the dataset queries as they are (CPU, no model). ``untrained`` rewrites them
 with the base model (LoRA adapters at initialisation equal the base). ``checkpoint`` loads a
-``step_NNNNNN`` checkpoint directory first: LoRA adapters (single-file layout) or, with a
-``model.train_mode: full`` config, the actor of a sharded full fine-tune checkpoint (DCP files
-read in this one process); the record source is ``trained-<reward_mode>``, read from the checkpoint. Rewrites are greedy, with ``rollout.max_new_tokens`` from the config.
+policy first: a run's ``best/`` dir (the step selected on the validation split; what the
+launchers evaluate) or a ``step_NNNNNN`` resume checkpoint. A LoRA config loads the actor adapter
+(``best/``) or the adapters of a single-file checkpoint; a ``model.train_mode: full`` config loads
+the full actor from ``best/`` or from a sharded checkpoint (DCP files read in this one process).
+The record source is ``trained-<reward_mode>``, read from the checkpoint. Rewrites are greedy,
+with ``rollout.max_new_tokens`` from the config.
+
+The output starts with a header line (``drbm25.eval.records``): source, checkpoint path, the
+eval config's sha256 and seed, and for ``best/`` its step, validation scores, training config
+sha256 and seeds.
 """
 
 from __future__ import annotations
@@ -24,7 +31,15 @@ from torch import nn
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from drbm25.bm25.searcher import Bm25Searcher, SearchResult
-from drbm25.checkpoint import checkpoint_layout, load_checkpoint, load_sharded_actor
+from drbm25.checkpoint import (
+    BestMeta,
+    checkpoint_layout,
+    is_best_dir,
+    load_best,
+    load_checkpoint,
+    load_sharded_actor,
+    read_best_meta,
+)
 from drbm25.config import Config, ScoringMode, load_config
 from drbm25.data import DEV_FILE, Example, load_examples
 from drbm25.eval.records import (
@@ -33,6 +48,7 @@ from drbm25.eval.records import (
     QueryRecord,
     write_records,
 )
+from drbm25.manifest import config_sha256
 from drbm25.obs import configure
 from drbm25.ppo.models import LoraPolicyModels
 from drbm25.ppo.trainer import Searcher, score_responses, search_all
@@ -133,7 +149,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--source", choices=(SOURCE_ORIGINAL, SOURCE_UNTRAINED, _SOURCE_CHECKPOINT), required=True)
-    parser.add_argument("--checkpoint", type=Path, default=None, help="step_NNNNNN checkpoint directory")
+    parser.add_argument("--checkpoint", type=Path, default=None, help="a run's best/ dir or a step_NNNNNN dir")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=None, help="score only the first N dev queries")
     parser.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE")
@@ -192,15 +208,39 @@ def _build_full_engine(cfg: Config, checkpoint: Path | None, device: torch.devic
     return HFGenerateEngine(_FrozenActor(actor), tokenizer, cfg.rollout, device), source
 
 
+def _build_best_engine(cfg: Config, path: Path, device: torch.device) -> tuple[HFGenerateEngine, str]:
+    """Greedy rewriter from a ``best/`` dir, whose layout must match ``cfg.model.train_mode``."""
+    meta, weights = load_best(path)
+    if meta.layout != cfg.model.train_mode:
+        raise ValueError(f"{path} holds a layout '{meta.layout}' policy; use a config with train_mode '{meta.layout}'")
+    source = trained_source(meta.reward_mode)
+    logger.info("loaded best policy %s (step %d, %s = %.4f, %s)", path, meta.step, meta.selection_metric, meta.score, source)
+    tokenizer = build_tokenizer(cfg)
+    check_tokenizer(tokenizer)
+    if meta.layout == "full":
+        actor = _plain_actor(cfg)
+        actor.load_state_dict(weights, strict=True)
+        nn.Module.to(actor, device=device, dtype=precision_dtype(cfg))  # transformers' decorated .to() confuses pyright
+        return HFGenerateEngine(_FrozenActor(actor), tokenizer, cfg.rollout, device), source
+    lora = check_layout(cfg, device)
+    base, _ = build_base(cfg, device)
+    models = LoraPolicyModels(base, lora, gradient_checkpointing=False)
+    models.load_actor_state_dict(weights)
+    return HFGenerateEngine(models, tokenizer, cfg.rollout, device), source
+
+
 def _build_engine(cfg: Config, checkpoint: Path | None) -> tuple[HFGenerateEngine, str]:
     """Greedy rewriter for ``cfg``'s layout; a checkpoint must be of the matching layout.
 
+    ``best/``: the actor adapter (LoRA) or the full actor (full), see ``_build_best_engine``.
     LoRA (``model.train_mode: lora``): base + adapters from a single-file checkpoint. Full fine-tune
     (``full``): the actor from a sharded checkpoint, loaded in this one process and run with HF
     ``generate`` in ``model.precision``.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(cfg.run.seed)
+    if checkpoint is not None and is_best_dir(checkpoint):
+        return _build_best_engine(cfg, checkpoint, device)
     layout = None if checkpoint is None else checkpoint_layout(checkpoint)
     if cfg.model.train_mode == "full":
         if layout == "single":
@@ -221,6 +261,30 @@ def _build_engine(cfg: Config, checkpoint: Path | None) -> tuple[HFGenerateEngin
     return HFGenerateEngine(models, tokenizer, cfg.rollout, device), source
 
 
+def _best_record(meta: BestMeta) -> dict[str, object]:
+    return {
+        "step": meta.step,
+        "val_ndcg_normal": meta.val_ndcg_normal,
+        "val_ndcg_count_once": meta.val_ndcg_count_once,
+        "selection_metric": meta.selection_metric,
+        "config_sha256": meta.config_sha256,
+        "seeds": meta.seeds,
+    }
+
+
+def _header(cfg: Config, source: str, checkpoint: Path | None) -> dict[str, object]:
+    """Where the scores come from: the eval config, the checkpoint, and a best/ policy's provenance."""
+    best = None if checkpoint is None or not is_best_dir(checkpoint) else _best_record(read_best_meta(checkpoint))
+    return {
+        "format_version": 1,
+        "source": source,
+        "checkpoint": None if checkpoint is None else str(checkpoint),
+        "eval_config_sha256": config_sha256(cfg),
+        "eval_seed": cfg.run.seed,
+        "best": best,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     ns = _parse_args(argv)
     configure(level="INFO", fmt="json")
@@ -232,12 +296,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     examples = load_examples(cfg.data.data_dir / DEV_FILE)[: ns.limit]
     logger.info("scoring %d dev queries, source=%s, index checksum %s", len(examples), ns.source, checksum)
     if ns.source == SOURCE_ORIGINAL:
+        source = SOURCE_ORIGINAL
         records = score_original(examples, searcher, k=r.eval_k)
     else:
         engine, source = _build_engine(cfg, ns.checkpoint)
         records = score_rewrites(examples, engine, searcher, k=r.eval_k, source=source)
     ns.out.parent.mkdir(parents=True, exist_ok=True)
-    write_records(ns.out, records)
+    write_records(ns.out, records, header=_header(cfg, source, ns.checkpoint))
     logger.info("wrote %d records to %s", len(records), ns.out)
     return 0
 

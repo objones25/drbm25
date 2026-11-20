@@ -301,13 +301,6 @@ def _prune(run_dir: Path, *, keep: int, protect: str) -> None:
         _remove_dir(old)
 
 
-def complete_steps(run_dir: Path) -> list[int]:
-    """Steps that have a complete checkpoint in ``run_dir``, ascending."""
-    if not run_dir.is_dir():
-        return []
-    return [int(p.name[len(_STEP_PREFIX) :]) for p in _complete_step_dirs(run_dir)]
-
-
 def latest_checkpoint(run_dir: Path) -> Path | None:
     """The dir named by ``latest`` if complete, else the newest complete ``step_*`` dir."""
     pointer = run_dir / _LATEST_FILE
@@ -517,7 +510,8 @@ def is_best_dir(path: Path) -> bool:
     return json.loads(meta_path.read_text()).get("kind") == _BEST_KIND
 
 
-def _read_best_meta(path: Path) -> BestMeta:
+def read_best_meta(path: Path) -> BestMeta:
+    """The metadata of a ``best/`` dir (ValueError if ``path`` is not one)."""
     if not is_best_dir(path):
         raise ValueError(f"{path} is not a best/ dir (no meta.json with kind 'best')")
     raw = json.loads((path / _META_FILE).read_text())
@@ -539,12 +533,12 @@ def _read_best_meta(path: Path) -> BestMeta:
 def best_meta(run_dir: Path) -> BestMeta | None:
     """``run_dir/best``'s metadata, or None when the run has no best policy yet."""
     path = run_dir / BEST_DIR
-    return _read_best_meta(path) if is_best_dir(path) else None
+    return read_best_meta(path) if is_best_dir(path) else None
 
 
 def load_best(path: Path) -> tuple[BestMeta, dict[str, Tensor]]:
     """The metadata and actor weights (on CPU) of a ``best/`` dir."""
-    meta = _read_best_meta(path)
+    meta = read_best_meta(path)
     return meta, load_file(str(path / _MODEL_FILE), device="cpu")
 
 
