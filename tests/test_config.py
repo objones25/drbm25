@@ -271,3 +271,23 @@ def test_override_rejects_key_below_leaf():
 @pytest.mark.parametrize("path", [EXPANSE, RUNPOD, SMOKE], ids=lambda p: p.stem)
 def test_profile_pins_hf_revision_to_commit_sha(path: Path):
     assert load_config(path).data.hf_revision == "44eb79992e8c5ed4784dbe6559f8b097d7d03855"
+
+
+def test_profiles_state_expected_index_size():
+    assert load_config(EXPANSE).retrieval.expected_docs == 800_000
+    assert load_config(RUNPOD).retrieval.expected_docs == 800_000
+    # The smoke profile runs on the 1,002-doc toy index built by the test suite.
+    assert load_config(SMOKE).retrieval.expected_docs == 1002
+
+
+def test_smoke_profile_uses_lora_layout():
+    cfg = load_config(SMOKE)
+    assert cfg.model.train_mode == "lora"
+    assert cfg.lora is not None
+    assert cfg.lora.dropout == pytest.approx(0.0)
+
+
+def test_rejects_non_positive_expected_docs():
+    cfg = load_config(SMOKE, {"retrieval.expected_docs": "0"})
+    with pytest.raises(ConfigError, match="expected_docs"):
+        validate_for_runtime(cfg, device_capability=None, world_size=1)

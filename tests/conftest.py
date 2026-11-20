@@ -387,3 +387,55 @@ def tiny_qwen2():
     from drbm25.tiny import build_tiny_qwen2
 
     return build_tiny_qwen2(seed=0)
+
+
+# --------------------------------------------------------------------------
+# Toy Lucene index (slide 23: repetition flips the ranking). Session-scoped and shared by
+# tests/bm25, tests/ppo and the train CLI tests, so it lives at the root.
+# --------------------------------------------------------------------------
+TOY_N_FILLER_DOCS = 1000
+TOY_DOC_LEN = 50
+TOY_N_SOLAR_DOCS = 100
+TOY_N_EFFICIENCY_DOCS = 50
+TOY_SEED = 279
+TOY_DOC_A = "docA"  # solar x3
+TOY_DOC_B = "docB"  # solar x1, efficiency x1
+
+
+def _toy_filler(rng: random.Random, n: int) -> list[str]:
+    return [f"w{rng.randrange(200)}" for _ in range(n)]
+
+
+def _toy_rows() -> list[tuple[str, str]]:
+    rng = random.Random(TOY_SEED)
+    # Disjoint doc sets so no filler doc ties with Doc B on both terms.
+    special = rng.sample(range(TOY_N_FILLER_DOCS), TOY_N_SOLAR_DOCS + TOY_N_EFFICIENCY_DOCS)
+    solar_docs = set(special[:TOY_N_SOLAR_DOCS])
+    efficiency_docs = set(special[TOY_N_SOLAR_DOCS:])
+    rows: list[tuple[str, str]] = []
+    for i in range(TOY_N_FILLER_DOCS):
+        if i in solar_docs:
+            tokens = ["solar", *_toy_filler(rng, TOY_DOC_LEN - 1)]
+        elif i in efficiency_docs:
+            tokens = ["efficiency", *_toy_filler(rng, TOY_DOC_LEN - 1)]
+        else:
+            tokens = _toy_filler(rng, TOY_DOC_LEN)
+        rows.append((f"d{i}", " ".join(tokens)))
+    rows.append((TOY_DOC_A, " ".join(["solar"] * 3 + _toy_filler(rng, TOY_DOC_LEN - 3))))
+    rows.append((TOY_DOC_B, " ".join(["solar", "efficiency", *_toy_filler(rng, TOY_DOC_LEN - 2)])))
+    return rows
+
+
+@pytest.fixture(scope="session")
+def toy_index(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The 1,002-doc toy index (``configs/smoke_cpu.yaml`` expects this count)."""
+    from drbm25.bm25.index import build_index, tsv_to_jsonl
+
+    root = tmp_path_factory.mktemp("toy")
+    tsv = root / "collection.tsv"
+    tsv.write_text("".join(f"{doc_id}\t{text}\n" for doc_id, text in _toy_rows()), encoding="utf-8")
+    jsonl_dir = root / "jsonl"
+    tsv_to_jsonl(tsv, jsonl_dir)
+    index_dir = root / "index"
+    build_index(jsonl_dir, index_dir, threads=2)
+    return index_dir

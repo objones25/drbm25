@@ -2,9 +2,13 @@ model:
   name: "tiny-local"
   revision: main
   precision: fp32
-  train_mode: full
+  train_mode: lora
   gradient_checkpointing: false
-lora: null
+lora:
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 ppo:
   batch_size: 4
   mini_batch_size: 2
@@ -17,8 +21,8 @@ ppo:
   gamma: 1.0
   lam: 1.0
   grad_clip: 1.0
-  actor_lr: 1.0e-6
-  critic_lr: 1.0e-5
+  actor_lr: 2.0e-5
+  critic_lr: 1.0e-4
 rollout:
   backend: hf
   temperature: 0.6
@@ -35,6 +39,7 @@ retrieval:
   eval_k: 10
   search_threads: 8
   search_timeout_s: 10
+  expected_docs: 1002
 data:
   hf_dataset: DeepRetrieval/datasets
   hf_revision: 44eb79992e8c5ed4784dbe6559f8b097d7d03855

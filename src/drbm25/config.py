@@ -84,6 +84,7 @@ class RetrievalCfg:
     eval_k: int
     search_threads: int
     search_timeout_s: float
+    expected_docs: int  # document count the index must have (startup check)
 
 
 @dataclass(frozen=True)
@@ -293,3 +294,5 @@ def validate_for_runtime(cfg: Config, *, device_capability: tuple[int, int] | No
         raise ConfigError(f"clip_ratio must be in (0, 1), got {p.clip_ratio}")
     if p.kl_coef < 0:
         raise ConfigError(f"kl_coef must be >= 0, got {p.kl_coef}")
+    if cfg.retrieval.expected_docs < 1:
+        raise ConfigError(f"retrieval.expected_docs must be >= 1, got {cfg.retrieval.expected_docs}")

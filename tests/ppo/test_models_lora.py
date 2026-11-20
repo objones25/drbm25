@@ -539,3 +539,12 @@ def test_build_tiny_qwen2_is_seeded_and_leaves_global_rng_alone() -> None:
     assert a.config.tie_word_embeddings
     assert a.config._attn_implementation == "sdpa"
     assert {p.dtype for p in a.parameters()} == {torch.float32}
+
+
+def test_critic_values_stay_fp32_under_autocast() -> None:
+    # The trainer runs forwards under fp16/bf16 autocast; the value head must not be downcast with them.
+    policy = _policy(build_tiny_qwen2(0))
+    ids, mask = _batch()
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        values = policy.critic_values(ids, mask)
+    assert values.dtype == torch.float32

@@ -255,7 +255,10 @@ class LoraPolicyModels:
                 logits_to_keep=1,
                 use_cache=False,
             )
-            return self._value_head(out.hidden_states[-1].float()).squeeze(-1)
+            hidden = out.hidden_states[-1].float()
+            # Autocast would run the fp32 head in fp16/bf16; the values feed GAE and must stay fp32.
+            with torch.autocast(device_type=hidden.device.type, enabled=False):
+                return self._value_head(hidden).squeeze(-1)
 
         return self._run(CRITIC, forward)
 
