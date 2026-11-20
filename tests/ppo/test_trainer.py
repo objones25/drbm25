@@ -194,6 +194,11 @@ class NanNewLogprobs(LoraPolicyModels):
         return logits * float("nan") if torch.is_grad_enabled() else logits
 
 
+class NanRefLogprobs(LoraPolicyModels):
+    def ref_logits(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
+        return torch.full_like(super().ref_logits(input_ids, attention_mask), float("nan"))
+
+
 class NanValues(LoraPolicyModels):
     def critic_values(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
         values = super().critic_values(input_ids, attention_mask)
@@ -212,9 +217,9 @@ def test_response_logprobs_take_the_positions_that_predict_response_tokens() -> 
     gen = torch.Generator().manual_seed(0)
     logits = torch.randn(1, 5, 7, generator=gen)
     ids = torch.tensor([[1, 2, 3, 4, 5]])
-    expected = torch.stack(
-        [torch.log_softmax(logits[0, 2], -1)[4], torch.log_softmax(logits[0, 3], -1)[5]]
-    ).unsqueeze(0)
+    expected = torch.stack([torch.log_softmax(logits[0, 2], -1)[4], torch.log_softmax(logits[0, 3], -1)[5]]).unsqueeze(
+        0
+    )
     torch.testing.assert_close(response_logprobs(logits, ids, prompt_len=3), expected)
 
 
@@ -328,7 +333,12 @@ def test_step_rejects_wrong_local_batch_size(toy_index: Path) -> None:
 # --------------------------------------------------------------------------- guards
 @pytest.mark.parametrize(
     ("cls", "name"),
-    [(NanOldLogprobs, "logprobs_old"), (NanNewLogprobs, "logprobs_new"), (NanValues, "values_old")],
+    [
+        (NanOldLogprobs, "logprobs_old"),
+        (NanNewLogprobs, "logprobs_new"),
+        (NanRefLogprobs, "logprobs_ref"),
+        (NanValues, "values_old"),
+    ],
 )
 def test_nonfinite_tensor_raises_naming_tensor_and_step(
     toy_index: Path, cls: type[LoraPolicyModels], name: str
@@ -425,8 +435,9 @@ def test_scale_at_the_floor_is_healthy(toy_index: Path) -> None:
     scaler = GradScaler("cpu", init_scale=1.0, growth_interval=10_000)
     trainer, _ = make_trainer(cfg, searcher=ModeSearcher(), scaler=scaler)
     batch = examples(cfg.ppo.batch_size)
-    scales = [trainer.step(batch, step=step)["optim/scaler_scale"] for step in range(1, 7)]
-    assert scales == pytest.approx([1.0] * 6)
+    metrics = [trainer.step(batch, step=step) for step in range(1, 7)]
+    assert [m["optim/scaler_scale"] for m in metrics] == pytest.approx([1.0] * 6)
+    assert [m["optim/scaler_skipped"] for m in metrics] == pytest.approx([0.0] * 6)  # finite grads
 
 
 def test_healthy_scale_resets_the_low_scale_streak(toy_index: Path) -> None:

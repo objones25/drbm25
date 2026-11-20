@@ -13,11 +13,22 @@ import pytest
 import yaml
 
 import drbm25.train as train_module
+from drbm25.bm25.index import read_index_info
+from drbm25.config import load_config
 from drbm25.data import DEV_FILE, TRAIN_FILE
 from drbm25.obs.setup import shutdown
 from drbm25.ppo.trainer import NonFiniteError, PPOTrainer
 from drbm25.tiny import build_tiny_tokenizer
-from drbm25.train import EXIT_BUDGET, EXIT_ERROR, EXIT_OK, StartupCheckError, check_java, check_tokenizer, main
+from drbm25.train import (
+    EXIT_BUDGET,
+    EXIT_ERROR,
+    EXIT_OK,
+    StartupCheckError,
+    check_index,
+    check_java,
+    check_tokenizer,
+    main,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 SMOKE = REPO / "configs" / "smoke_cpu.yaml"
@@ -111,6 +122,7 @@ def test_cli_runs_two_steps_and_writes_checkpoint(workdir: Path, toy_index: Path
 @pytest.mark.slow
 def test_cli_resume_continues_from_checkpoint_with_same_next_batch(workdir: Path, toy_index: Path) -> None:
     assert _main(_argv(workdir, toy_index, "chunked", "--until-step", "2")) == EXIT_OK
+    assert not (workdir / "out" / "chunked" / "final_adapters.safetensors").exists()  # chunk end, not the end
     assert _main(_argv(workdir, toy_index, "chunked", "--until-step", "4")) == EXIT_OK
     assert _main(_argv(workdir, toy_index, "straight", "--until-step", "4")) == EXIT_OK
     chunked, straight = _batches(workdir / "out" / "chunked"), _batches(workdir / "out" / "straight")
@@ -119,9 +131,16 @@ def test_cli_resume_continues_from_checkpoint_with_same_next_batch(workdir: Path
     assert chunked[2] != chunked[0]
     records = _log_records(workdir / "out" / "chunked")
     assert any(str(r["message"]).startswith("resumed from") for r in records)
+    # val_every = 2: validation after the 2nd and 4th steps (step indices 1 and 3).
+    assert [r["step"] for r in records if str(r["message"]).startswith("validation")] == [1, 3]
     rows = [json.loads(line) for line in (workdir / "out" / "chunked" / "metrics.jsonl").read_text().splitlines()]
     assert [row["step"] for row in rows] == [0, 1, 2, 3]
-    ids = {json.loads((workdir / "out" / "chunked" / f"step_00000{s}" / "meta.json").read_text())["train_state"]["wandb_run_id"] for s in (2, 4)}
+    ids = {
+        json.loads((workdir / "out" / "chunked" / f"step_00000{s}" / "meta.json").read_text())["train_state"][
+            "wandb_run_id"
+        ]
+        for s in (2, 4)
+    }
     assert len(ids) == 1  # the resumed run reattached to the same W&B run id
     assert (workdir / "out" / "chunked" / "final_adapters.safetensors").is_file()  # total_steps reached
 
@@ -163,7 +182,9 @@ def test_cli_two_process_gloo(workdir: Path, toy_index: Path) -> None:
     steps = {rank: [r["step"] for r in _log_records(run_dir, rank) if r.get("message") == "batch"] for rank in (0, 1)}
     assert steps == {0: [0, 1], 1: [0, 1]}
     # Rank 0 alone writes checkpoints: each save logs its path on the writing rank only.
-    saves = {rank: [r for r in _log_records(run_dir, rank) if str(r["message"]).startswith("checkpoint")] for rank in (0, 1)}
+    saves = {
+        rank: [r for r in _log_records(run_dir, rank) if str(r["message"]).startswith("checkpoint")] for rank in (0, 1)
+    }
     assert len(saves[0]) == 1
     assert saves[1] == []
 
@@ -210,6 +231,18 @@ def test_cli_stops_at_checkpoint_boundary_when_budget_runs_out(
 
 
 @pytest.mark.java
+def test_cli_sweeps_stale_checkpoint_temps_at_startup(workdir: Path, toy_index: Path) -> None:
+    run_dir = workdir / "out" / "stale"
+    (run_dir / ".tmp-step_000002-999").mkdir(parents=True)
+    (run_dir / ".tmp-step_000002-999" / "model.safetensors").write_bytes(b"partial")
+    (run_dir / ".tmp-latest-999").write_text("step_000002\n")
+    assert _main(_argv(workdir, toy_index, "stale", "--deadline-unix", "0")) == EXIT_BUDGET
+    assert list(run_dir.glob(".tmp-*")) == []
+    removed = [r["message"] for r in _log_records(run_dir) if str(r["message"]).startswith("removed stale")]
+    assert len(removed) == 2
+
+
+@pytest.mark.java
 def test_cli_fails_fast_on_wrong_index_size(workdir: Path, toy_index: Path) -> None:
     code = _main(_argv(workdir, toy_index, "badindex", "--set", "retrieval.expected_docs=5"))
     assert code == EXIT_ERROR
@@ -228,6 +261,8 @@ def test_cli_writes_metrics_jsonl_readable_by_spike_monitor(workdir: Path, toy_i
     metrics = workdir / "out" / "spikes" / "metrics.jsonl"
     rows = [json.loads(line) for line in metrics.read_text().splitlines()]
     assert [row["step"] for row in rows] == [0, 1, 2]
+    # Step 3 is not a ckpt_every boundary, so this checkpoint is the one written at exit.
+    assert (workdir / "out" / "spikes" / "latest").read_text().strip() == "step_000003"
     assert all(isinstance(v, int | float) for row in rows for v in row.values())
     proc = subprocess.run(  # noqa: S603 -- this interpreter, a vendored script
         [sys.executable, str(REPO / "scripts" / "spike_monitor.py"), str(metrics), "--window", "200"],
@@ -298,7 +333,7 @@ def test_check_java_rejects_missing_binary(tmp_path: Path) -> None:
 
 def test_check_java_rejects_other_major_version(tmp_path: Path) -> None:
     fake = tmp_path / "java"
-    fake.write_text('#!/bin/sh\necho \'openjdk version "18.0.1" 2022-04-19\' >&2\n')
+    fake.write_text("#!/bin/sh\necho 'openjdk version \"18.0.1\" 2022-04-19' >&2\n")
     fake.chmod(0o755)
     with pytest.raises(StartupCheckError, match=r"Java 21 is required.*reported 18"):
         check_java(str(fake))
@@ -306,9 +341,23 @@ def test_check_java_rejects_other_major_version(tmp_path: Path) -> None:
 
 def test_check_java_accepts_21(tmp_path: Path) -> None:
     fake = tmp_path / "java"
-    fake.write_text('#!/bin/sh\necho \'openjdk version "21.0.9" 2025-10-21\' >&2\n')
+    fake.write_text("#!/bin/sh\necho 'openjdk version \"21.0.9\" 2025-10-21' >&2\n")
     fake.chmod(0o755)
     assert check_java(str(fake)) is None
+
+
+def test_check_java_rejects_failing_binary(tmp_path: Path) -> None:
+    fake = tmp_path / "java"
+    fake.write_text("#!/bin/sh\necho 'openjdk version \"21.0.9\"' >&2\nexit 1\n")
+    fake.chmod(0o755)
+    with pytest.raises(StartupCheckError, match="cannot run"):
+        check_java(str(fake))
+
+
+@pytest.mark.java
+def test_check_index_returns_the_index_checksum(toy_index: Path) -> None:
+    cfg = load_config(SMOKE, {"retrieval.index_dir": str(toy_index)})
+    assert check_index(cfg) == read_index_info(toy_index).checksum
 
 
 def test_check_tokenizer_rejects_pad_equal_to_eos() -> None:
