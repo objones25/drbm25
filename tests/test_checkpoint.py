@@ -32,7 +32,7 @@ def _save(run_dir: Path, step: int, *, keep: int = 5) -> Path:
     model, optim = _model_and_optim()
     return save_checkpoint(
         run_dir,
-        train_state=TrainState(step=step, data_cursor=step * 2, wandb_run_id="abc"),
+        train_state=TrainState(step=step, data_cursor=step * 2, wandb_run_id="abc", reward_mode="normal"),
         model=model.state_dict(),
         optimizers={"actor": optim.state_dict()},
         scaler=None,
@@ -45,7 +45,7 @@ def test_roundtrip_restores_everything(tmp_path: Path) -> None:
     scaler_state = {"scale": 1024.0, "growth_factor": 2.0, "_growth_tracker": 3}
     path = save_checkpoint(
         tmp_path,
-        train_state=TrainState(step=50, data_cursor=800, wandb_run_id="run-1"),
+        train_state=TrainState(step=50, data_cursor=800, wandb_run_id="run-1", reward_mode="normal"),
         model=model.state_dict(),
         optimizers={"actor": optim.state_dict(), "critic": optim.state_dict()},
         scaler=scaler_state,
@@ -57,7 +57,7 @@ def test_roundtrip_restores_everything(tmp_path: Path) -> None:
 
     assert isinstance(loaded, LoadedCheckpoint)
     assert loaded.path == path
-    assert loaded.train_state == TrainState(step=50, data_cursor=800, wandb_run_id="run-1")
+    assert loaded.train_state == TrainState(step=50, data_cursor=800, wandb_run_id="run-1", reward_mode="normal")
     assert set(loaded.model) == {"weight", "bias"}
     for name, tensor in model.state_dict().items():
         assert torch.equal(loaded.model[name], tensor)
@@ -77,7 +77,7 @@ def test_roundtrip_with_none_scaler_and_none_run_id(tmp_path: Path) -> None:
     model, optim = _model_and_optim()
     path = save_checkpoint(
         tmp_path,
-        train_state=TrainState(step=1, data_cursor=0, wandb_run_id=None),
+        train_state=TrainState(step=1, data_cursor=0, wandb_run_id=None, reward_mode="normal"),
         model=model.state_dict(),
         optimizers={"actor": optim.state_dict()},
         scaler=None,
@@ -92,7 +92,7 @@ def test_saves_shared_storage_tensors(tmp_path: Path) -> None:
     weight = torch.randn(2, 2)
     path = save_checkpoint(
         tmp_path,
-        train_state=TrainState(step=1, data_cursor=0, wandb_run_id=None),
+        train_state=TrainState(step=1, data_cursor=0, wandb_run_id=None, reward_mode="normal"),
         model={"a": weight, "b": weight, "c": weight.t()},
         optimizers={},
         scaler=None,
@@ -310,3 +310,32 @@ def test_crash_while_pruning_never_leaves_half_deleted_complete_dir(
     assert not (tmp_path / "step_000050").exists()  # moved aside, not left half-deleted
     assert latest_checkpoint(tmp_path) == tmp_path / "step_000150"
     assert load_checkpoint(tmp_path / "step_000100").train_state.step == 100
+
+
+def test_reward_mode_round_trips(tmp_path: Path) -> None:
+    path = save_checkpoint(
+        tmp_path,
+        train_state=TrainState(step=1, data_cursor=0, wandb_run_id=None, reward_mode="count_once"),
+        model={},
+        optimizers={},
+        scaler=None,
+        keep=1,
+    )
+    assert load_checkpoint(path).train_state.reward_mode == "count_once"
+
+
+def test_checkpoint_without_reward_mode_is_rejected(tmp_path: Path) -> None:
+    path = save_checkpoint(
+        tmp_path,
+        train_state=TrainState(step=1, data_cursor=0, wandb_run_id=None, reward_mode="normal"),
+        model={},
+        optimizers={},
+        scaler=None,
+        keep=1,
+    )
+    meta_path = path / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    del meta["train_state"]["reward_mode"]
+    meta_path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="reward_mode"):
+        load_checkpoint(path)

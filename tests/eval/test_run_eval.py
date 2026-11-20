@@ -170,7 +170,7 @@ def test_cli_untrained_runs_tiny_model_greedy(workdir: Path, toy_index: Path) ->
     assert all(r.format_error is not None and r.ndcg_normal == pytest.approx(0.0) for r in records)
 
 
-def _write_tiny_checkpoint(workdir: Path, *, break_keys: bool = False) -> Path:
+def _write_tiny_checkpoint(workdir: Path, *, break_keys: bool = False, reward_mode: ScoringMode = "normal") -> Path:
     cfg = load_config(SMOKE)
     assert cfg.lora is not None
     lora: LoraCfg = cfg.lora
@@ -180,7 +180,7 @@ def _write_tiny_checkpoint(workdir: Path, *, break_keys: bool = False) -> Path:
         state = {f"bad.{k}": v for k, v in state.items()}
     return save_checkpoint(
         workdir / "ckpt_run",
-        train_state=TrainState(step=2, data_cursor=8, wandb_run_id=None),
+        train_state=TrainState(step=2, data_cursor=8, wandb_run_id=None, reward_mode=reward_mode),
         model=state,
         optimizers={},
         scaler=None,
@@ -188,30 +188,30 @@ def _write_tiny_checkpoint(workdir: Path, *, break_keys: bool = False) -> Path:
     )
 
 
-def test_cli_checkpoint_loads_trainable_state_and_uses_label(workdir: Path, toy_index: Path) -> None:
-    ckpt = _write_tiny_checkpoint(workdir)
+@pytest.mark.parametrize("mode", ["normal", "count_once"])
+def test_cli_checkpoint_derives_source_from_its_reward_mode(workdir: Path, toy_index: Path, mode: ScoringMode) -> None:
+    ckpt = _write_tiny_checkpoint(workdir, reward_mode=mode)
     out = workdir / "trained.jsonl"
     argv = _argv(workdir, toy_index, out, "--source", "checkpoint", "--checkpoint", str(ckpt))
-    assert main([*argv, "--label", "trained-normal", "--limit", "2"]) == 0
-    assert {r.source for r in read_records(out)} == {"trained-normal"}
+    assert main([*argv, "--limit", "2"]) == 0
+    assert {r.source for r in read_records(out)} == {f"trained-{mode}"}
 
 
 def test_cli_checkpoint_with_wrong_keys_fails(workdir: Path, toy_index: Path) -> None:
     ckpt = _write_tiny_checkpoint(workdir, break_keys=True)
     argv = _argv(workdir, toy_index, workdir / "x.jsonl", "--source", "checkpoint", "--checkpoint", str(ckpt))
     with pytest.raises((KeyError, ValueError, RuntimeError)):
-        main([*argv, "--label", "trained-normal", "--limit", "2"])
+        main([*argv, "--limit", "2"])
 
 
 @pytest.mark.parametrize(
     "extra",
     [
-        ["--source", "checkpoint", "--label", "trained-normal"],
-        ["--source", "checkpoint", "--checkpoint", "x"],
+        ["--source", "checkpoint"],
         ["--source", "original", "--checkpoint", "x"],
-        ["--source", "original", "--label", "trained-normal"],
+        ["--source", "checkpoint", "--checkpoint", "x", "--label", "trained-normal"],
     ],
-    ids=["no-checkpoint", "no-label", "stray-checkpoint", "stray-label"],
+    ids=["no-checkpoint", "stray-checkpoint", "label-removed"],
 )
 def test_cli_rejects_inconsistent_source_arguments(workdir: Path, toy_index: Path, extra: list[str]) -> None:
     with pytest.raises(SystemExit) as exc:

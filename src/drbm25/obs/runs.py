@@ -11,8 +11,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import wandb
-
-from drbm25.config import Config
+from drbm25.config import Config, ScoringMode
 from drbm25.obs.redact import is_secret_name, name_words
 from drbm25.obs.wandb_run import start_run
 
@@ -56,14 +55,14 @@ def open_run(
     cfg: Config,
     *,
     run_name: str,
-    reward_mode: str,
+    reward_mode: ScoringMode,
     resume_id: str | None,
     extra_config: Mapping[str, object],
+    job_type: str | None = None,
 ) -> Iterator[wandb.Run]:
     """Open the W&B run for one training job; an exception in the block marks it failed.
 
-    `reward_mode` becomes the W&B job_type ("normal"/"count_once" for training, "report" for the
-    evaluation report). `WANDB_MODE` (e.g. offline) is honoured. With `resume_id` the run is resumed with
+    The W&B job_type is `reward_mode` unless `job_type` is given (the report passes "report"). `WANDB_MODE` (e.g. offline) is honoured. With `resume_id` the run is resumed with
     resume="must", otherwise started with resume="never".
     """
     config = build_run_config(cfg, extra_config)
@@ -71,7 +70,7 @@ def open_run(
         project=cfg.run.wandb_project,
         entity=cfg.run.wandb_entity,
         group=cfg.run.wandb_group,
-        job_type=reward_mode,
+        job_type=reward_mode if job_type is None else job_type,
         name=run_name,
         config=config,
         run_id=resume_id,

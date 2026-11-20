@@ -10,7 +10,7 @@ MS-S dev queries, scored by both retrieval modes. Original queries only: no mode
 | original | 0.3877 | 0.3877 |
 
 Unrounded: normal 0.3877261, count_once 0.3877292. The modes differ on 30 of 2,305 queries, because
-only 5.2% of original queries repeat an analyzed term; 971 queries score 0 in both modes; no query hit
+only 5.2% of original queries repeat an analyzed term; 971 queries score 0 in normal mode, 970 in count_once, 965 in both; no query hit
 Lucene's clause limit.
 
 Query statistics (analyzed terms, original queries): mean terms 5.22, mean unique terms 5.15,

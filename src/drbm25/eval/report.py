@@ -180,7 +180,9 @@ def _log_to_wandb(cfg_path: Path, report: Report, inputs: Sequence[Path], n_resa
         "n_queries": report.n_queries,
         "n_resamples": n_resamples,
     }
-    with open_run(cfg, run_name="report", reward_mode="report", resume_id=None, extra_config=extra) as run:
+    with open_run(
+        cfg, run_name="report", reward_mode="normal", job_type="report", resume_id=None, extra_config=extra
+    ) as run:
         run.log(
             {
                 "report/ndcg": wandb.Table(

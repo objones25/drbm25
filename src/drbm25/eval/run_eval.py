@@ -6,8 +6,8 @@
 
 ``original`` scores the dataset queries as they are (CPU, no model). ``untrained`` rewrites them
 with the base model (LoRA adapters at initialisation equal the base). ``checkpoint`` loads the
-trainable state of a ``step_NNNNNN`` checkpoint directory first; ``--label`` says which training
-run it came from. Rewrites are greedy, with ``rollout.max_new_tokens`` from the config.
+trainable state of a ``step_NNNNNN`` checkpoint directory first; the record source is
+``trained-<reward_mode>``, read from the checkpoint. Rewrites are greedy, with ``rollout.max_new_tokens`` from the config.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ from drbm25.data import DEV_FILE, Example, load_examples
 from drbm25.eval.records import (
     SOURCE_ORIGINAL,
     SOURCE_UNTRAINED,
-    TRAINED_SOURCES,
     QueryRecord,
     write_records,
 )
@@ -122,16 +121,15 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--source", choices=(SOURCE_ORIGINAL, SOURCE_UNTRAINED, _SOURCE_CHECKPOINT), required=True)
     parser.add_argument("--checkpoint", type=Path, default=None, help="step_NNNNNN checkpoint directory")
-    parser.add_argument("--label", choices=TRAINED_SOURCES, default=None, help="source name for a checkpoint")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=None, help="score only the first N dev queries")
     parser.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE")
     ns = parser.parse_args(argv)
     is_checkpoint = ns.source == _SOURCE_CHECKPOINT
-    if is_checkpoint and (ns.checkpoint is None or ns.label is None):
-        parser.error("--source checkpoint needs --checkpoint and --label")
-    if not is_checkpoint and (ns.checkpoint is not None or ns.label is not None):
-        parser.error("--checkpoint and --label only go with --source checkpoint")
+    if is_checkpoint and ns.checkpoint is None:
+        parser.error("--source checkpoint needs --checkpoint")
+    if not is_checkpoint and ns.checkpoint is not None:
+        parser.error("--checkpoint only goes with --source checkpoint")
     if ns.limit is not None and ns.limit < 1:
         parser.error(f"--limit must be >= 1, got {ns.limit}")
     overrides: dict[str, str] = {}
@@ -144,18 +142,24 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return ns
 
 
-def _build_engine(cfg: Config, checkpoint: Path | None) -> HFGenerateEngine:
+def trained_source(reward_mode: ScoringMode) -> str:
+    return f"trained-{reward_mode}"
+
+
+def _build_engine(cfg: Config, checkpoint: Path | None) -> tuple[HFGenerateEngine, str]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lora = check_layout(cfg, device)
     torch.manual_seed(cfg.run.seed)
     base, tokenizer = build_base(cfg, device)
     check_tokenizer(tokenizer)
     models = LoraPolicyModels(base, lora, gradient_checkpointing=False)
+    source = SOURCE_UNTRAINED
     if checkpoint is not None:
         loaded = load_checkpoint(checkpoint)
         models.load_trainable_state_dict(loaded.model)
-        logger.info("loaded checkpoint %s (step %d)", checkpoint, loaded.train_state.step)
-    return HFGenerateEngine(models, tokenizer, cfg.rollout, device)
+        source = trained_source(loaded.train_state.reward_mode)
+        logger.info("loaded checkpoint %s (step %d, %s)", checkpoint, loaded.train_state.step, source)
+    return HFGenerateEngine(models, tokenizer, cfg.rollout, device), source
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -171,9 +175,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if ns.source == SOURCE_ORIGINAL:
         records = score_original(examples, searcher, k=r.eval_k)
     else:
-        engine = _build_engine(cfg, ns.checkpoint)
-        label = SOURCE_UNTRAINED if ns.source == SOURCE_UNTRAINED else ns.label
-        records = score_rewrites(examples, engine, searcher, k=r.eval_k, source=label)
+        engine, source = _build_engine(cfg, ns.checkpoint)
+        records = score_rewrites(examples, engine, searcher, k=r.eval_k, source=source)
     ns.out.parent.mkdir(parents=True, exist_ok=True)
     write_records(ns.out, records)
     logger.info("wrote %d records to %s", len(records), ns.out)

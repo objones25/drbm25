@@ -34,12 +34,12 @@ from typing import Final, Literal, get_args
 import numpy as np
 import torch
 import torch.distributed as tdist
-import wandb
 from safetensors.torch import save_file
 from torch import nn
 from torch.amp.grad_scaler import GradScaler
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
+import wandb
 from drbm25.bm25.index import read_index_info
 from drbm25.bm25.searcher import Bm25Searcher
 from drbm25.budget import should_stop
@@ -315,11 +315,15 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
         cfg, models=models, engine=engine, searcher=searcher, reward_mode=args.reward_mode, dist=dist, scaler=scaler
     )
 
-    state = TrainState(step=0, data_cursor=0, wandb_run_id=None)
+    state = TrainState(step=0, data_cursor=0, wandb_run_id=None, reward_mode=args.reward_mode)
     last_saved: int | None = None
     ckpt_path = latest_checkpoint(run_dir)
     if ckpt_path is not None:
         ckpt = load_checkpoint(ckpt_path)
+        if ckpt.train_state.reward_mode != args.reward_mode:
+            raise ValueError(
+                f"{ckpt_path} was trained with reward_mode {ckpt.train_state.reward_mode!r}, not {args.reward_mode!r}"
+            )
         models.load_trainable_state_dict(ckpt.model)
         trainer.load_optimizer_states(ckpt.optimizers)
         if scaler is not None:
@@ -361,7 +365,7 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
 
     with _rank0_run(cfg, args, dist, state.wandb_run_id, extra) as run:
         if run is not None:
-            state = TrainState(state.step, state.data_cursor, run.id)
+            state = TrainState(state.step, state.data_cursor, run.id, state.reward_mode)
         exit_code = EXIT_BUDGET if _broadcast_flag(budget.stop(), dist) else EXIT_OK
         try:
             while exit_code == EXIT_OK and state.step < until:
@@ -373,7 +377,7 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
                 metrics = trainer.step(
                     [train[i] for i in indices[dist.rank * local : (dist.rank + 1) * local]], step=step
                 )
-                state = TrainState(step + 1, state.data_cursor + cfg.ppo.batch_size, state.wandb_run_id)
+                state = TrainState(step + 1, state.data_cursor + cfg.ppo.batch_size, state.wandb_run_id, state.reward_mode)
                 if len(budget.step_seconds) < CALIBRATION_STEPS:
                     # Running estimate on each of the first CALIBRATION_STEPS steps; logged once at the end.
                     budget.step_seconds.append(time.perf_counter() - started)

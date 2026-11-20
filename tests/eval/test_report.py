@@ -146,7 +146,7 @@ def _ckpt_run(root: Path, name: str, steps: list[int]) -> Path:
     for step in steps:
         save_checkpoint(
             run_dir,
-            train_state=TrainState(step=step, data_cursor=0, wandb_run_id=None),
+            train_state=TrainState(step=step, data_cursor=0, wandb_run_id=None, reward_mode="normal"),
             model={},
             optimizers={},
             scaler=None,
@@ -202,7 +202,7 @@ def test_wandb_flag_logs_tables_in_a_report_run(tmp_path: Path, monkeypatch: pyt
         paths.append(str(path))
     argv = ["--inputs", *paths, "--out", str(tmp_path / "r.md"), "--n-resamples", "50"]
     assert main([*argv, "--wandb", "--config", str(SMOKE)]) == 0
-    assert opened["reward_mode"] == "report"
+    assert opened["job_type"] == "report"
     (row,) = run.logged
     assert set(row) == {"report/ndcg", "report/paired_ci", "report/query_stats"}
     assert row["report/ndcg"].columns == ["source", "ndcg10_normal", "ndcg10_count_once"]

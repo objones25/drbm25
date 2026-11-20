@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import wandb
 import yaml
 
 import drbm25.train as train_module
+import wandb
 from drbm25.bm25.index import read_index_info
 from drbm25.config import load_config
 from drbm25.data import DEV_FILE, TRAIN_FILE
@@ -119,7 +119,17 @@ def test_cli_runs_two_steps_and_writes_checkpoint(workdir: Path, toy_index: Path
     assert meta["train_state"]["step"] == 2
     assert meta["train_state"]["data_cursor"] == 8
     assert meta["train_state"]["wandb_run_id"]
+    assert meta["train_state"]["reward_mode"] == "normal"
     assert (run_dir / "exit_code").read_text().strip() == "0"
+
+
+@pytest.mark.java
+@pytest.mark.slow
+def test_cli_resume_with_other_reward_mode_fails(workdir: Path, toy_index: Path) -> None:
+    assert _main(_argv(workdir, toy_index, "mix", "--until-step", "2")) == EXIT_OK
+    argv = _argv(workdir, toy_index, "mix", "--until-step", "4")
+    argv[argv.index("--reward-mode") + 1] = "count_once"
+    assert _main(argv) == EXIT_ERROR
 
 
 @pytest.mark.java

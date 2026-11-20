@@ -26,12 +26,14 @@ import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 from torch import Tensor
+
+from drbm25.config import ScoringMode
 
 FORMAT_VERSION = 1
 _MODEL_FILE = "model.safetensors"
@@ -47,6 +49,7 @@ class TrainState:
     step: int
     data_cursor: int
     wandb_run_id: str | None
+    reward_mode: ScoringMode
 
 
 @dataclass(frozen=True)
@@ -164,6 +167,7 @@ def _write_checkpoint_files(
             "step": train_state.step,
             "data_cursor": train_state.data_cursor,
             "wandb_run_id": train_state.wandb_run_id,
+            "reward_mode": train_state.reward_mode,
         },
         "rng_python": rng["python"],
         "rng_numpy": rng["numpy"],
@@ -278,11 +282,18 @@ def load_checkpoint(path: Path) -> LoadedCheckpoint:
     if version != FORMAT_VERSION:
         raise ValueError(f"unsupported checkpoint format_version {version!r}; expected {FORMAT_VERSION}")
     ts = meta["train_state"]
+    if "reward_mode" not in ts:
+        raise ValueError(f"checkpoint {path} has no train_state.reward_mode; it predates the field and cannot be used")
+    if ts["reward_mode"] not in get_args(ScoringMode):
+        raise ValueError(f"checkpoint {path}: train_state.reward_mode {ts['reward_mode']!r} is not a scoring mode")
     optim = torch.load(path / _OPTIM_FILE, map_location="cpu", weights_only=True)
     return LoadedCheckpoint(
         path=path,
         train_state=TrainState(
-            step=ts["step"], data_cursor=ts["data_cursor"], wandb_run_id=ts["wandb_run_id"]
+            step=ts["step"],
+            data_cursor=ts["data_cursor"],
+            wandb_run_id=ts["wandb_run_id"],
+            reward_mode=ts["reward_mode"],
         ),
         model=load_file(str(path / _MODEL_FILE), device="cpu"),
         optimizers=optim["optimizers"],
