@@ -16,15 +16,7 @@ readonly SCRIPT_DIR
 readonly REPO_ROOT=$SCRIPT_DIR/../..
 readonly CONFIG=configs/expanse_v100_lora.yaml
 
-# Eclipse Temurin 21 (LTS), Linux x64. Expanse login and compute nodes are x86_64.
-# URL and SHA-256 come from Adoptium's API
-#   https://api.adoptium.net/v3/assets/latest/21/hotspot?architecture=x64&image_type=jdk&os=linux&vendor=eclipse
-# (fields binary.package.link and binary.package.checksum, queried 2026-11-20); the same digest
-# is in the release's published OpenJDK21U-jdk_x64_linux_hotspot_21.0.13.1_2.tar.gz.sha256.txt
-# and matched the SHA-256 of the file downloaded when this script was written.
-readonly JDK_RELEASE='jdk-21.0.13.1+2' # top-level directory inside the tarball
-readonly JDK_URL='https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13.1%2B2/OpenJDK21U-jdk_x64_linux_hotspot_21.0.13.1_2.tar.gz'
-readonly JDK_SHA256='bb8a93f9ae6e7a693b2b721e85dbeff26ae1a77447985a8d7afcdd9c7cf6222e'
+# JDK_RELEASE, JDK_URL and JDK_SHA256 (Eclipse Temurin 21, Linux x64) come from common.sh.
 readonly DOWNLOAD_TIMEOUT_S=900
 
 log() {

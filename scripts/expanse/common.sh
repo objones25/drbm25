@@ -17,10 +17,24 @@
 #   run_is_complete RUN_DIR TOTAL_STEPS   true if exit_code is 0 and latest step >= TOTAL_STEPS
 #   java_major              print the major version of the `java` on PATH
 #   require_java21          die unless `java` on PATH is version 21
+#   config_run_int CFG KEY  print run.KEY (an integer) from a drbm25 YAML config
 #   config_total_steps CFG  print run.total_steps from a drbm25 YAML config
 #   verify_sha256 FILE HEX  die unless FILE's SHA-256 equals HEX
 
 set -Eeuo pipefail
+
+# Eclipse Temurin 21 (LTS), Linux x64: one pin for scripts/expanse/prepare_login.sh and
+# scripts/runpod/lib.sh. URL and SHA-256 come from Adoptium's API
+#   https://api.adoptium.net/v3/assets/latest/21/hotspot?architecture=x64&image_type=jdk&os=linux&vendor=eclipse
+# (fields binary.package.link and binary.package.checksum, queried 2026-11-20); the same digest
+# is in the release's published OpenJDK21U-jdk_x64_linux_hotspot_21.0.13.1_2.tar.gz.sha256.txt
+# and matched the SHA-256 of the file downloaded when the pin was written.
+# shellcheck disable=SC2034 # read by the scripts that source this file
+readonly JDK_RELEASE='jdk-21.0.13.1+2' # top-level directory inside the tarball
+# shellcheck disable=SC2034
+readonly JDK_URL='https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13.1%2B2/OpenJDK21U-jdk_x64_linux_hotspot_21.0.13.1_2.tar.gz'
+# shellcheck disable=SC2034
+readonly JDK_SHA256='bb8a93f9ae6e7a693b2b721e85dbeff26ae1a77447985a8d7afcdd9c7cf6222e'
 
 _common_log() {
   printf '%s: %s\n' "${0##*/}" "$*" >&2
@@ -165,14 +179,19 @@ require_java21() {
   fi
 }
 
-# Reads run.total_steps with sed so the sbatch scripts need no Python before the job starts.
-config_total_steps() {
-  local config=$1 matches
-  matches=$(sed -n 's/^  total_steps: *\([0-9][0-9]*\) *\(#.*\)\{0,1\}$/\1/p' "$config")
+# Reads an integer key of the run: section with sed so the sbatch scripts need no Python before
+# the job starts. The key must sit indented two spaces under run:.
+config_run_int() {
+  local config=$1 key=$2 matches
+  matches=$(sed -n "s/^  $key: *\([0-9][0-9]*\) *\(#.*\)\{0,1\}\$/\1/p" "$config")
   if [[ ! $matches =~ ^[0-9]+$ ]]; then
-    _common_die "cannot find exactly one 'run.total_steps' in $config (indented two spaces under run:)"
+    _common_die "cannot find exactly one 'run.$key' in $config (indented two spaces under run:)"
   fi
   printf '%s\n' "$matches"
+}
+
+config_total_steps() {
+  config_run_int "$1" total_steps
 }
 
 verify_sha256() {

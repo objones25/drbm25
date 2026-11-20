@@ -218,9 +218,9 @@ STUB
   [[ $stderr == *"EXPANSE_ACCOUNT"* ]]
 }
 
-@test "prepare_login pins an https JDK URL and a 64-hex SHA-256" {
-  run -0 grep -E "^readonly JDK_SHA256='[0-9a-f]{64}'$" "$REPO/scripts/expanse/prepare_login.sh"
-  run -0 grep -E "^readonly JDK_URL='https://" "$REPO/scripts/expanse/prepare_login.sh"
+@test "common.sh pins (for prepare_login and runpod) an https JDK URL and a 64-hex SHA-256" {
+  run -0 grep -E "^readonly JDK_SHA256='[0-9a-f]{64}'$" "$REPO/scripts/expanse/common.sh"
+  run -0 grep -E "^readonly JDK_URL='https://" "$REPO/scripts/expanse/common.sh"
 }
 
 @test "probe.sbatch requires EXPANSE_ACCOUNT" {

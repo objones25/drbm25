@@ -130,3 +130,49 @@ uv run pytest -m gpu tests/rollout/test_vllm_engine.py   # vLLM greedy == HF, we
 ```
 
 Do not set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: vLLM's sleep mode refuses it.
+
+## RunPod one-shot launcher (A100 fallback)
+
+`scripts/runpod/run_all.sh` runs the whole experiment on a fresh 2x A100 80GB pod, alone: it prompts for the
+keys, installs everything, trains the `normal` and `count_once` runs in alternating chunks within a dollar
+budget, evaluates, writes the report and terminates the pod (also after a fatal error).
+
+Prices (RunPod API, as of 2026-11-19): 2x A100 SXM 80GB community $2.78/h, secure $4.38/h; 2x A100 PCIe 80GB
+community $2.38/h, secure $4.18/h. $100 buys about 36-42 h on community cloud and 23-24 h on secure. Community
+stock was listed as low.
+
+1. Create a network volume of at least 100 GB in a data center that has A100 80GB in stock.
+2. Deploy a pod with 2x A100 80GB and that volume mounted at `/workspace`. Create a RunPod API key with
+   `pods:write` (it is used only to terminate the pod).
+3. In the pod: `cd /workspace && git clone <repo-url> repo && cd repo && git checkout feat/ppo-bm25`, then
+   `bash scripts/runpod/run_all.sh`. It asks, with hidden input for secrets, for `HF_TOKEN`, `WANDB_API_KEY`,
+   `WANDB_PROJECT` (default `drbm25`), `WANDB_ENTITY` (optional), `RUNPOD_API_KEY`, `BUDGET_USD`, `PRICE_PER_HOUR`
+   (this pod's price from the list above) and `TERMINATE_ON_FINISH` (default `yes`). Anything already set in the
+   environment is not asked again. The answers go to `/workspace/drbm25/.env` (mode 600, never logged or committed;
+   on a re-run only missing values are asked).
+4. Stages, in order: Java 21 (pinned Temurin tarball, SHA-256 checked) and `uv==0.13.7` from PyPI, `uv sync --frozen
+   --extra vllm`, dataset and BM25 index, model snapshot at the config's pinned revision, GPU smoke test (`pytest
+   -m gpu` on the vLLM and full-model tests, then `scripts/memory_check.py`, which fails with under 2 GiB headroom),
+   training, evaluation, report. Data, model and index stages leave markers in `/workspace/drbm25/.done/` and are
+   skipped on a re-run; Java, uv, `uv sync` and training run every launch (training resumes from the latest
+   checkpoint), and the smoke test runs once per pod.
+5. Budget: the deadline is `start + BUDGET_USD / PRICE_PER_HOUR` hours (`drbm25.budget.deadline_from_budget`),
+   measured from when the script starts. Training stops at the next checkpoint boundary once less than
+   `RESERVE_S` (default 3600 s, an unmeasured estimate for four evaluation runs, the report and the terminate
+   call) is left; override with `RESERVE_S=...`. Both runs advance in chunks of `run.chunk_steps` (50), so they stop
+   within one chunk of each other and the evaluation uses the last step both reached.
+
+Terminating the pod releases GPU billing; the network volume keeps all data.
+Use `--no-terminate` or `TERMINATE_ON_FINISH=no` to keep the pod. If the terminate call fails after 3 attempts the
+script prints the pod id and `https://console.runpod.io/pods`: terminate it there yourself.
+
+Resuming on a new pod: attach the same volume at `/workspace`, clone again and re-run `bash scripts/runpod/run_all.sh`;
+give `BUDGET_USD` the dollars you still want to spend on that pod. A failure leaves `/workspace/drbm25/FAILED`;
+the next launch refuses to start until you fix the cause and delete that file.
+
+Where things are (all under `/workspace/drbm25`): `runs/{normal,count_once}/` (sharded checkpoints, `metrics.jsonl`,
+`train_rank*.log`, `exit_code`), `runs/eval/` (per-query jsonl and `report.md`), `logs/` (the launcher log and
+copies of the run logs, made on exit), `hf/` (model cache), `indexes/`, `data/`, `.env`.
+
+Tests: `bats tests/shell/test_runpod_lib.bats` (curl, uv and sleep are PATH shims) and
+`shellcheck scripts/runpod/*.sh`.

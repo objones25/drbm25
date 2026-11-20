@@ -263,3 +263,17 @@ fake_java() {
   run -1 --separate-stderr in_common
   [[ $stderr == *"nope.bin"* ]]
 }
+
+@test "config_run_int reads run.chunk_steps and run.total_steps from the RunPod config" {
+  SNIPPET="config_run_int '${BATS_TEST_DIRNAME}/../../configs/runpod_a100_full.yaml' chunk_steps; config_run_int '${BATS_TEST_DIRNAME}/../../configs/runpod_a100_full.yaml' total_steps"
+  run -0 in_common
+  [[ ${lines[0]} == 50 ]]
+  [[ ${lines[1]} == 1751 ]]
+}
+
+@test "config_run_int names the missing key" {
+  SNIPPET='config_run_int cfg.yaml chunk_steps'
+  printf 'run:\n  total_steps: 5\n' >cfg.yaml
+  run -1 --separate-stderr in_common
+  [[ $stderr == *"run.chunk_steps"* ]]
+}
