@@ -5,7 +5,7 @@ Built on `start_run` (offline fallback, failed-run marking, log-context binding)
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -59,7 +59,7 @@ def open_run(
     resume_id: str | None,
     extra_config: Mapping[str, object],
     job_type: str | None = None,
-) -> Iterator[wandb.Run]:
+) -> Generator[wandb.Run]:
     """Open the W&B run for one training job; an exception in the block marks it failed.
 
     The W&B job_type is `reward_mode` unless `job_type` is given (the report passes "report"). `WANDB_MODE` (e.g. offline) is honoured. With `resume_id` the run is resumed with

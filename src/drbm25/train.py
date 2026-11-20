@@ -39,7 +39,7 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -307,7 +307,7 @@ def _seed(seed: int) -> None:
 @contextmanager
 def _rank0_run(
     cfg: Config, args: _Args, dist: DistInfo, resume_id: str | None, extra: dict[str, object]
-) -> Iterator[wandb.Run | None]:
+) -> Generator[wandb.Run | None]:
     if dist.rank != 0:
         yield None
         return

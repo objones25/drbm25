@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import sys
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -105,7 +105,7 @@ class _Reporter:
         self.min_headroom_gib = float("inf")
 
     @contextmanager
-    def phase(self, name: str) -> Iterator[None]:
+    def phase(self, name: str) -> Generator[None]:
         torch.cuda.reset_peak_memory_stats(self._dist.device)
         self._sampler.reset()
         yield

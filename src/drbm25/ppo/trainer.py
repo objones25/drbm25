@@ -43,7 +43,7 @@ import math
 import resource
 import sys
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Final, Protocol, get_args
@@ -734,7 +734,7 @@ class PPOTrainer:
             )
 
     @contextmanager
-    def _timed(self, timings: dict[str, float], name: str) -> Iterator[None]:
+    def _timed(self, timings: dict[str, float], name: str) -> Generator[None]:
         start = time.perf_counter()
         yield
         if self._dist.device.type == "cuda":

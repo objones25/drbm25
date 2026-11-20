@@ -31,7 +31,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import uuid
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
@@ -60,7 +60,7 @@ def bind_log_context(**fields: Any) -> contextvars.Token[dict[str, Any]]:
 
 
 @contextmanager
-def log_context(**fields: Any) -> Iterator[dict[str, Any]]:
+def log_context(**fields: Any) -> Generator[dict[str, Any]]:
     """Scope `fields` onto every log record emitted inside the block."""
     token = bind_log_context(**fields)
     try:

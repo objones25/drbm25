@@ -1,7 +1,7 @@
 """The report: input checks, common_step, tables, CIs, W&B logging."""
 
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -190,7 +190,7 @@ def test_wandb_flag_logs_tables_in_a_report_run(tmp_path: Path, monkeypatch: pyt
     opened: dict[str, Any] = {}
 
     @contextmanager
-    def fake_open_run(cfg: object, **kwargs: Any) -> Iterator[_FakeRun]:
+    def fake_open_run(cfg: object, **kwargs: Any) -> Generator[_FakeRun]:
         opened.update(kwargs)
         yield run
 
@@ -213,7 +213,7 @@ def test_wandb_report_applies_set_overrides_to_the_config(tmp_path: Path, monkey
     seen: list[Any] = []
 
     @contextmanager
-    def fake_open_run(cfg: Any, **kwargs: Any) -> Iterator[_FakeRun]:
+    def fake_open_run(cfg: Any, **kwargs: Any) -> Generator[_FakeRun]:
         seen.append(cfg)
         yield _FakeRun()
 

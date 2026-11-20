@@ -7,7 +7,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -398,7 +398,7 @@ def test_cli_logs_histograms_to_wandb_on_deep_log_steps_only(
     fake = _FakeRun()
 
     @contextmanager
-    def fake_open_run(*_: object, **__: object) -> Iterator[_FakeRun]:
+    def fake_open_run(*_: object, **__: object) -> Generator[_FakeRun]:
         yield fake
 
     monkeypatch.setattr(train_module, "open_run", fake_open_run)
@@ -665,7 +665,7 @@ def test_cli_writes_the_manifest_and_sends_it_to_wandb_meta(
     captured: dict[str, Any] = {}
 
     @contextmanager
-    def fake_open_run(*_: object, **kwargs: Any) -> Iterator[_FakeRun]:
+    def fake_open_run(*_: object, **kwargs: Any) -> Generator[_FakeRun]:
         captured.update(kwargs["extra_config"])
         yield _FakeRun()
 

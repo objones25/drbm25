@@ -20,7 +20,7 @@ API facts checked against the installed versions (peft 0.21.2, transformers 4.57
 """
 
 import itertools
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Protocol, runtime_checkable
 
@@ -171,7 +171,7 @@ class LoraPolicyModels:
             p.requires_grad_(True)
 
     @contextmanager
-    def _no_grad_detour(self) -> Iterator[None]:
+    def _no_grad_detour(self) -> Generator[None]:
         """Undo a no-grad forward's side effects on the adapter state, in every mode.
 
         Restores the adapter and train mode that were active before (or, if a checkpointed

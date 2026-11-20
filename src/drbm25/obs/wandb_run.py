@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -88,7 +88,7 @@ def start_run(
     dir: str | None = None,
     step_metrics: Mapping[str, str] | None = None,
     summary_goals: Mapping[str, str] | None = None,
-) -> Iterator[Any]:
+) -> Generator[Any]:
     """Start a run, yield it, and close it exactly once.
 
     The context manager form is the one to use: on a normal exit it finishes the
