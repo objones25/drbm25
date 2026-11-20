@@ -22,6 +22,8 @@ STUB
   cat >root/venv/bin/torchrun <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$TORCHRUN_LOG"
+# STUB_NODIR: die before drbm25.train would create the run directory (import error, bad node).
+if [[ -n ${STUB_NODIR-} ]]; then exit "${STUB_RC:-1}"; fi
 run_dir="$DRBM25_RUNS_DIR/${STUB_RUN:-normal}"
 mkdir -p "$run_dir"
 [[ -z ${STUB_CODE-} ]] || printf '%s\n' "$STUB_CODE" >"$run_dir/exit_code"
@@ -356,4 +358,13 @@ STUB
 @test "train.sbatch prefers DRBM25_REPO_ROOT over SLURM_SUBMIT_DIR" {
   STUB_CODE=0 SLURM_SUBMIT_DIR=/nonexistent DRBM25_REPO_ROOT="$(cd "$REPO" && pwd)" run_train normal
   [[ $status -eq 0 ]]
+}
+
+@test "train.sbatch writes FAILED and dies cleanly when torchrun fails before the run dir exists" {
+  STUB_NODIR=1 STUB_RC=1 run_train normal
+  [[ $status -eq 1 ]]
+  [[ -f $DRBM25_ROOT/runs/normal/FAILED ]]
+  [[ $(<"$DRBM25_ROOT/runs/normal/FAILED") == *"exit_code missing"* ]]
+  [[ $stderr == *"error: no usable exit_code file"* ]]
+  [[ $stderr != *"No such file or directory"* ]]
 }

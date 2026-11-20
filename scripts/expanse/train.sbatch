@@ -117,7 +117,7 @@ torchrun=${DRBM25_TORCHRUN:-$UV_PROJECT_ENVIRONMENT/bin/torchrun}
 
 start_step=$(latest_step "$run_dir")
 log "job ${SLURM_JOB_ID:-local}: $run_name ($reward_mode) from step $start_step, HF offline=${HF_HUB_OFFLINE-0}"
-mkdir -p "$DRBM25_RUNS_DIR" "$WANDB_DIR"
+mkdir -p "$run_dir" "$WANDB_DIR"
 
 # torchrun's exit status collapses to 1, so the status is taken from rank 0's exit_code file.
 torchrun_rc=0
@@ -128,6 +128,8 @@ torchrun_rc=0
 mark_failed() {
   local now
   now=$(date '+%Y-%m-%dT%H:%M:%S')
+  # The run dir normally exists (created above), but never let the marker write be the failure.
+  mkdir -p "$run_dir"
   printf 'job %s failed at %s: %s (torchrun exited %s)\n' "${SLURM_JOB_ID:-local}" "$now" "$1" "$torchrun_rc" >"$failed_marker"
   die "$1; wrote $failed_marker, so later jobs in the chain stop immediately; see $run_dir/train_rank0.log"
 }
