@@ -33,11 +33,21 @@ echo "curl $*" >>"$STUB_LOG"
 n=$(cat "$STUB_DIR/curl_n" 2>/dev/null || echo 0)
 echo $((n + 1)) >"$STUB_DIR/curl_n"
 if ((n < ${STUB_CURL_FAILS:-0})); then exit 22; fi
+# A download: copy the fixture tarball to the --output path.
+if [[ -n ${STUB_CURL_TARBALL-} ]]; then
+  while (($#)); do
+    if [[ $1 == --output ]]; then cp "$STUB_CURL_TARBALL" "$2"; fi
+    shift
+  done
+fi
 exit 0
 EOF
   cat >"$bin/sleep_stub" <<'EOF'
 #!/usr/bin/env bash
 echo "sleep $*" >>"$STUB_LOG"
+# STUB_SLEEP_SIGNAL: deliver a second SIGINT to the script while it is inside on_exit.
+if [[ -n ${STUB_SLEEP_SIGNAL-} ]]; then kill -INT "$PPID"; fi
+exit 0
 EOF
   # uv run --no-sync CMD...: torchrun writes exit_code from $STUB_DIR/exit_<run>_<step> (default 0).
   cat >"$bin/uv" <<'EOF'
@@ -49,6 +59,12 @@ shift
 case $cmd in
   torchrun)
     if [[ $* == *memory_check.py* ]]; then exit "${STUB_MEM_RC:-0}"; fi
+    if [[ -n ${STUB_TRAIN_SLEEP-} ]]; then
+      sleep "$STUB_TRAIN_SLEEP" &
+      echo $! >"$STUB_DIR/child_pid"
+      wait $!
+      exit 1
+    fi
     run='' step='' out=''
     while (($#)); do
       case $1 in
@@ -75,6 +91,15 @@ case $cmd in
     ;;
 esac
 EOF
+  # sha256sum shim: prints $STUB_SHA256 (default: the pinned uv digest) for any file.
+  cat >"$bin/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+echo "${STUB_SHA256:-c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83}  $1"
+EOF
+  cat >"$bin/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "${STUB_UNAME_M:-x86_64}"
+EOF
   # GNU timeout shim: STUB_TIMEOUT_RC makes it report a timeout without running the command.
   cat >"$bin/timeout" <<'EOF'
 #!/usr/bin/env bash
@@ -82,6 +107,10 @@ echo "timeout $*" >>"$STUB_LOG"
 if [[ -n ${STUB_TIMEOUT_RC-} ]]; then exit "$STUB_TIMEOUT_RC"; fi
 while [[ $1 == --* ]]; do shift; done
 shift
+# Like GNU timeout, become a process group leader so the command is in its own group.
+if [[ -n ${STUB_TIMEOUT_GROUP-} ]]; then
+  exec python3 -c 'import os, sys; os.setpgid(0, 0); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+fi
 exec "$@"
 EOF
   cat >"$bin/df" <<'EOF'
@@ -97,7 +126,7 @@ EOF
 in_lib() {
   env -i PATH="$PATH" HOME="$HOME" STUB_LOG="$STUB_LOG" STUB_DIR="$STUB_DIR" \
     DRBM25_ROOT="$DRBM25_ROOT" DRBM25_SLEEP="$DRBM25_SLEEP" DRBM25_TTY="$DRBM25_TTY" \
-    DRBM25_NOW_UNIX="${DRBM25_NOW_UNIX-}" \
+    DRBM25_NOW_UNIX="${DRBM25_NOW_UNIX-}" STUB_CURL_TARBALL="${STUB_CURL_TARBALL-}" \
     "$@" bash -c 'source "$1"; shift; runpod_paths; eval "$1"' _ "$LIB" "$SNIPPET"
 }
 
@@ -218,6 +247,7 @@ RUNPOD_API_KEY=rp_a
 WANDB_PROJECT=drbm25
 TERMINATE_ON_FINISH=yes
 WANDB_ENTITY=
+VOLUME_GB=
 EOF
   SNIPPET='collect_settings; printf "%s" "$WANDB_API_KEY"'
   printf 'wb_new\n' >"$DRBM25_TTY"
@@ -714,4 +744,141 @@ on_exit_env() { printf '%s\n' RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key; }
   run -1 --separate-stderr env DRBM25_ROOT="$DRBM25_ROOT" DRBM25_TTY="$DRBM25_TTY" RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key bash "$RUN_ALL"
   [[ $stderr == *FAILED* ]]
   ! grep -q '^curl' "$STUB_LOG"
+}
+
+# ---------------------------------------------------------------- fix round 2
+
+wait_dead() { # PID: up to 5 s for the process to disappear
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$1" 2>/dev/null || return 0
+    command sleep 0.5
+  done
+  return 1
+}
+
+@test "SIGINT during a long timed command reaches on_exit promptly, kills the command's group and terminates the pod" {
+  SNIPPET='install_exit_traps; (command sleep 1; kill -INT $$) & run_alternating_chunks 50 50'
+  SECONDS=0
+  run -130 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=600 STUB_TRAIN_SLEEP=25 STUB_TIMEOUT_GROUP=1 RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key
+  ((SECONDS < 20))
+  grep -q 'curl .*-X DELETE .*pods/pod123' "$STUB_LOG"
+  wait_dead "$(cat "$STUB_DIR/child_pid")"
+}
+
+@test "SIGHUP and SIGTERM during a long timed command do the same" {
+  SNIPPET='install_exit_traps; (command sleep 1; kill -HUP $$) & run_alternating_chunks 50 50'
+  SECONDS=0
+  run -129 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=600 STUB_TRAIN_SLEEP=25 STUB_TIMEOUT_GROUP=1 RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key
+  ((SECONDS < 20))
+  grep -q 'curl .*-X DELETE' "$STUB_LOG"
+  wait_dead "$(cat "$STUB_DIR/child_pid")"
+  : >"$STUB_LOG"
+  rm -f "$DRBM25_ROOT/FAILED"
+  SNIPPET='install_exit_traps; (command sleep 1; kill -TERM $$) & run_alternating_chunks 50 50'
+  SECONDS=0
+  run -143 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=600 STUB_TRAIN_SLEEP=25 STUB_TIMEOUT_GROUP=1 RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key
+  ((SECONDS < 20))
+  grep -q 'curl .*-X DELETE' "$STUB_LOG"
+}
+
+@test "a second SIGINT while on_exit runs does not skip terminate_pod" {
+  SNIPPET='install_exit_traps; kill -INT $$'
+  run -130 in_lib RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key STUB_CURL_FAILS=1 STUB_SLEEP_SIGNAL=1
+  [[ $(grep -c '^curl' "$STUB_LOG") == 2 ]]
+  grep -q '^sleep 5' "$STUB_LOG"
+}
+
+@test "exit 137 well before the limit is reported as a SIGKILL (out of memory?), not as a timeout" {
+  SNIPPET='rc=0; run_alternating_chunks 50 50 || rc=$?; echo "rc=$rc"'
+  run -0 --separate-stderr in_lib DEADLINE_UNIX=2000000000 RESERVE_S=600 STUB_TIMEOUT_RC=137 DRBM25_NOW_UNIX=1000
+  [[ $output == *rc=1* ]]
+  grep -q 'SIGKILL' "$DRBM25_ROOT/FAILED"
+  ! grep -qi 'timed out' "$DRBM25_ROOT/FAILED"
+}
+
+@test "VOLUME_GB makes the disk preflight use the created volume size, not only df" {
+  head -c 2097152 /dev/zero >"$DRBM25_ROOT/blob"
+  SNIPPET='rc=0; run_alternating_chunks 50 50 || rc=$?; echo "rc=$rc"'
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=600 VOLUME_GB=50
+  [[ $output == *rc=1* ]]
+  grep -q 'VOLUME_GB' "$DRBM25_ROOT/FAILED"
+  [[ -z $(train_calls) ]]
+  rm -f "$DRBM25_ROOT/FAILED"
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=600 VOLUME_GB=400
+  [[ $(train_calls | tr '\n' ' ') == 'normal@50 count_once@50 ' ]]
+}
+
+@test "collect_settings rejects a non-numeric VOLUME_GB" {
+  SNIPPET='collect_settings'
+  run -1 --separate-stderr in_lib HF_TOKEN=a WANDB_API_KEY=b RUNPOD_API_KEY=c WANDB_PROJECT=p BUDGET_USD=90 PRICE_PER_HOUR=2.78 VOLUME_GB=big
+  [[ $stderr == *VOLUME_GB* ]]
+}
+
+# ---------------------------------------------------------------- uv from the pinned release tarball
+
+make_uv_tarball() {
+  local d=$BATS_TEST_TMPDIR/uvpkg
+  mkdir -p "$d/uv-x86_64-unknown-linux-gnu"
+  printf '#!/bin/sh\necho "uv 0.13.7 (stub)"\n' >"$d/uv-x86_64-unknown-linux-gnu/uv"
+  chmod +x "$d/uv-x86_64-unknown-linux-gnu/uv"
+  tar -czf "$BATS_TEST_TMPDIR/uv.tgz" -C "$d" uv-x86_64-unknown-linux-gnu
+  export STUB_CURL_TARBALL=$BATS_TEST_TMPDIR/uv.tgz
+}
+
+@test "install_uv downloads the pinned release tarball over https, verifies it and installs uv into DRBM25_ROOT/bin" {
+  make_uv_tarball
+  SNIPPET='install_uv; command -v uv; uv --version'
+  run -0 --separate-stderr in_lib
+  grep -q 'curl .*--proto =https .*--output .* https://github.com/astral-sh/uv/releases/download/0.13.7/uv-x86_64-unknown-linux-gnu.tar.gz' "$STUB_LOG"
+  [[ -x $DRBM25_ROOT/bin/uv ]]
+  [[ ${lines[0]} == "$DRBM25_ROOT/bin/uv" ]]
+  [[ ${lines[1]} == 'uv 0.13.7'* ]]
+  ! grep -q pip "$STUB_LOG"
+}
+
+@test "install_uv refuses a tarball whose SHA-256 differs from the pin and installs nothing" {
+  make_uv_tarball
+  SNIPPET='install_uv'
+  run -1 --separate-stderr in_lib STUB_SHA256=0000000000000000000000000000000000000000000000000000000000000000
+  [[ $stderr == *"SHA-256 mismatch"* ]]
+  [[ ! -e $DRBM25_ROOT/bin/uv ]]
+}
+
+@test "install_uv skips the download when the pinned version is already in DRBM25_ROOT/bin" {
+  make_uv_tarball
+  SNIPPET='install_uv; : >"$STUB_LOG"; install_uv'
+  run -0 in_lib
+  ! grep -q '^curl' "$STUB_LOG"
+}
+
+@test "install_uv refuses a machine that is not x86_64" {
+  make_uv_tarball
+  SNIPPET='install_uv'
+  run -1 --separate-stderr in_lib STUB_UNAME_M=aarch64
+  [[ $stderr == *x86_64* ]]
+  ! grep -q '^curl' "$STUB_LOG"
+}
+
+@test "runpod_paths keeps Python on the volume and uv on managed Pythons only" {
+  SNIPPET='printf "%s\n%s\n" "$UV_PYTHON_INSTALL_DIR" "$UV_PYTHON_PREFERENCE"'
+  run -0 in_lib
+  [[ ${lines[0]} == "$DRBM25_ROOT/python" ]]
+  [[ ${lines[1]} == only-managed ]]
+}
+
+@test "sync_deps installs the .python-version Python with uv before uv sync --frozen --extra vllm" {
+  printf '3.12\n' >.python-version
+  SNIPPET='sync_deps'
+  run -0 in_lib
+  install_line=$(grep -n '^uv python install 3.12$' "$STUB_LOG" | cut -d: -f1)
+  sync_line=$(grep -n '^uv sync --frozen --extra vllm$' "$STUB_LOG" | cut -d: -f1)
+  [[ -n $install_line && -n $sync_line ]]
+  ((install_line < sync_line))
+}
+
+@test "sync_deps fails when there is no .python-version" {
+  SNIPPET='sync_deps'
+  run -1 --separate-stderr in_lib
+  [[ $stderr == *.python-version* ]]
 }

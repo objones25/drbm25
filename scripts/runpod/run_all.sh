@@ -4,8 +4,8 @@
 # reward). Run it alone on a fresh 2x A100 80GB pod whose network volume is mounted at /workspace.
 #
 # Usage: see usage() below, or run with --help.
-# Requires: bash 3.2+, curl, tar, python3 with pip, apt-free (Java and uv are installed from pinned
-# downloads), CUDA GPUs. Must be run from a clone of the repository.
+# Requires: bash 3.2+, curl, tar, GNU timeout, CUDA GPUs (Java, uv and Python 3.12 are installed from pinned
+# downloads). Must be run from a clone of the repository.
 # bash-target: 3.2
 
 set -Eeuo pipefail

@@ -32,18 +32,24 @@
 # shellcheck disable=SC2312 # status is checked explicitly here, not left to set -e
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../expanse/common.sh"
 
-# uv from PyPI: 0.13.7 was published 2026-11-03 (PyPI upload time), over two weeks before the
-# 2026-11-20 pin date; 0.13.8 and 0.13.9 are newer than that cut-off.
+# uv: the astral-sh/uv GitHub release tarball for x86_64 Linux, pinned by URL and SHA-256, installed into
+# $DRBM25_ROOT/bin (no pip, so PEP 668 "externally-managed" Pythons do not matter, and nothing is piped
+# to a shell). 0.13.7 was uploaded to PyPI on 2026-11-03, more than two weeks before 2026-11-20. The
+# digest is the content of the release's published uv-x86_64-unknown-linux-gnu.tar.gz.sha256 and equals
+# the SHA-256 of the tarball downloaded on 2026-11-20 when the pin was written.
 readonly UV_VERSION=0.13.7
+readonly UV_URL='https://github.com/astral-sh/uv/releases/download/0.13.7/uv-x86_64-unknown-linux-gnu.tar.gz'
+readonly UV_SHA256='c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83'
 readonly RUNPOD_CONSOLE_URL=https://console.runpod.io/pods
 readonly RUNPOD_CONFIG_DEFAULT=configs/runpod_a100_full.yaml
 # BUDGET_USD and PRICE_PER_HOUR are deliberately not stored: a relaunch must ask for the budget that
 # is left (see spend_total), or it could silently reuse the whole budget again.
 # Only these names are read from the .env, so a damaged file cannot set PATH or LD_PRELOAD.
-readonly RUNPOD_SETTING_NAMES=(HF_TOKEN WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY RUNPOD_API_KEY TERMINATE_ON_FINISH)
+readonly RUNPOD_SETTING_NAMES=(HF_TOKEN WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY RUNPOD_API_KEY TERMINATE_ON_FINISH VOLUME_GB)
 readonly TERMINATE_ATTEMPTS=3
 # Sleeps between the 3 attempts (after attempt 1 and after attempt 2).
 readonly TERMINATE_BACKOFF_S=(5 15)
+readonly KILL_GRACE_S=10          # on_exit: TERM, then KILL this much later, for a timed command
 readonly KILL_AFTER_S=60           # SIGKILL this long after the TERM that `timeout` sends
 readonly TRAIN_TIMEOUT_MARGIN_S=1800
 readonly TRAIN_TIMEOUT_MIN_S=900
@@ -67,6 +73,9 @@ runpod_paths() {
   export DRBM25_JDK_DIR="$DRBM25_ROOT/jdk"
   export WANDB_DIR="$DRBM25_ROOT/wandb"
   export UV_CACHE_DIR="$DRBM25_ROOT/uv-cache"
+  # uv provides its own Python (on the volume), so the image's system Python and torch are irrelevant.
+  export UV_PYTHON_INSTALL_DIR="$DRBM25_ROOT/python"
+  export UV_PYTHON_PREFERENCE=only-managed
   # The cache is on the network volume and the venv is not: hardlinks cannot cross filesystems.
   export UV_LINK_MODE=copy
   DRBM25_DONE_DIR="$DRBM25_ROOT/.done"
@@ -224,8 +233,13 @@ collect_settings() {
   prompt_var BUDGET_USD "REMAINING dollar budget for this launch (already spent by earlier launches: \$$spent; for example 90)"
   prompt_var PRICE_PER_HOUR "This pod's price per hour in dollars (for example 2.78)"
   prompt_var TERMINATE_ON_FINISH "Terminate the pod when finished (yes/no)" --default yes
+  prompt_var VOLUME_GB "Size of the network volume in GB (optional; lets the disk check use it, since df may show pooled space)" --optional
   _require_positive_number BUDGET_USD
   _require_positive_number PRICE_PER_HOUR
+  if [[ -n $VOLUME_GB && ! $VOLUME_GB =~ ^[1-9][0-9]*$ ]]; then
+    _common_log "error: VOLUME_GB must be a whole number of GB (for example 400), got '$VOLUME_GB'"
+    return 1
+  fi
   case $TERMINATE_ON_FINISH in
     yes | no) ;;
     *)
@@ -338,18 +352,32 @@ _timeout_bin() {
   fi
 }
 
-# Runs "$@" for at most SECS seconds (GNU timeout). A hang (NCCL, vLLM) then ends as a failure.
+# Runs "$@" for at most SECS seconds (GNU timeout) in the background and waits for it, because a
+# trapped signal (Ctrl-C, closed terminal, TERM) only interrupts `wait`, not a foreground command.
+# TIMEOUT_PID is the timeout process (a process group leader); on_exit kills its group.
+# TIMEOUT_FIRED is 1 when the time limit, not something else, ended the command.
 _with_timeout() {
-  local secs=$1 bin rc=0
+  local secs=$1 bin rc=0 started elapsed
   shift
+  TIMEOUT_FIRED=0
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   bin=$(_timeout_bin) || {
     _common_log "error: GNU timeout not found (on macOS install coreutils for gtimeout)"
     return 1
   }
-  "$bin" --kill-after="$KILL_AFTER_S" "$secs" "$@" || rc=$?
-  if ((rc == 124 || rc == 137)); then
+  started=$(_now_unix)
+  "$bin" --kill-after="$KILL_AFTER_S" "$secs" "$@" &
+  TIMEOUT_PID=$!
+  wait "$TIMEOUT_PID" || rc=$?
+  TIMEOUT_PID=''
+  elapsed=$(($(_now_unix) - started))
+  # 124: the limit was hit. 137: SIGKILL, either sent by timeout after TERM was ignored (then the
+  # limit has passed) or by something else such as the out-of-memory killer (then it has not).
+  if ((rc == 124 || (rc == 137 && elapsed >= secs))); then
+    TIMEOUT_FIRED=1
     _runpod_log "error: command timed out after ${secs}s (hang?): $1 $2 ..."
+  elif ((rc == 137)); then
+    _runpod_log "error: command was killed with SIGKILL after ${elapsed}s, before the ${secs}s limit (out-of-memory kill?): $1 $2 ..."
   fi
   return "$rc"
 }
@@ -372,6 +400,17 @@ _check_disk() {
     fi
   fi
   free_kb=$(df -Pk "$DRBM25_ROOT" | awk 'NR == 2 {print $4}')
+  # df on a network volume may show pooled space, so a user-given volume size also bounds free space.
+  if [[ -n ${VOLUME_GB-} ]]; then
+    used_kb=$(du -sk "$DRBM25_ROOT" | awk '{print $1}')
+    if [[ $free_kb =~ ^[0-9]+$ ]] && ((VOLUME_GB * 1048576 - used_kb < free_kb)); then
+      free_kb=$((VOLUME_GB * 1048576 - used_kb))
+      if ((free_kb < need_kb)); then
+        mark_failed "not enough disk before training $mode: VOLUME_GB=$VOLUME_GB minus ${used_kb} KB used leaves ${free_kb} KB, need ${need_kb} KB; use a bigger volume"
+        return 1
+      fi
+    fi
+  fi
   if [[ ! $free_kb =~ ^[0-9]+$ ]]; then
     mark_failed "cannot read free disk space of $DRBM25_ROOT (df printed '$free_kb')"
     return 1
@@ -464,27 +503,49 @@ install_java21() {
   require_java21
 }
 
-# uv comes from PyPI at a pinned version (pip install uv==X), not from a downloaded installer script.
+_install_uv_tarball() (
+  local bindir=$1 staging tarball machine
+  machine=$(uname -m)
+  [[ $machine == x86_64 ]] || {
+    _common_log "error: the pinned uv release is for x86_64, this machine is $machine"
+    exit 1
+  }
+  mkdir -p "$bindir"
+  staging=$(mktemp -d "$bindir/.install.XXXXXX")
+  trap 'rm -rf -- "${staging:?}"' EXIT
+  tarball=$staging/uv.tar.gz
+  _runpod_log "downloading $UV_URL"
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --max-time 300 --output "$tarball" "$UV_URL"
+  verify_sha256 "$tarball" "$UV_SHA256"
+  tar -xzf "$tarball" -C "$staging"
+  [[ -x $staging/uv-x86_64-unknown-linux-gnu/uv ]] || {
+    _common_log "error: tarball did not contain uv-x86_64-unknown-linux-gnu/uv"
+    exit 1
+  }
+  mv -f -- "$staging/uv-x86_64-unknown-linux-gnu/uv" "$bindir/uv"
+)
+
+# uv lives in $DRBM25_ROOT/bin on the volume, so a new pod only puts it on PATH.
 install_uv() {
-  local user_bin
+  local bindir=$DRBM25_ROOT/bin
+  export PATH="$bindir:$PATH"
   # shellcheck disable=SC2312 # status is checked explicitly here, not left to set -e
-  if command -v uv >/dev/null 2>&1 && [[ $(uv --version) == "uv $UV_VERSION"* ]]; then
+  if [[ -x $bindir/uv && $("$bindir/uv" --version) == "uv $UV_VERSION"* ]]; then
     return 0
   fi
-  _runpod_log "installing uv==$UV_VERSION with pip"
-  if ! python3 -m pip install --quiet --disable-pip-version-check "uv==$UV_VERSION"; then
-    _common_log "error: pip could not install uv==$UV_VERSION (on an externally-managed Python, install uv $UV_VERSION by hand)"
-    return 1
-  fi
-  user_bin=$(python3 -m site --user-base)/bin
-  export PATH="$user_bin:$PATH"
-  command -v uv >/dev/null 2>&1 || {
-    _common_log "error: uv is installed but not on PATH"
-    return 1
-  }
+  _install_uv_tarball "$bindir"
 }
 
+# Python 3.12 comes from uv (version from .python-version), installed once onto the volume.
 sync_deps() {
+  local py
+  if [[ ! -f .python-version ]]; then
+    _common_log "error: no .python-version in $PWD; run from the repository root"
+    return 1
+  fi
+  py=$(<.python-version)
+  uv python install "$py"
   uv sync --frozen --extra vllm
 }
 
@@ -584,8 +645,12 @@ _train_chunk() {
     --deadline-unix "$DEADLINE_UNIX" --reserve-s "$RESERVE_S" "${RUNPOD_SET_ARGS[@]}" || torchrun_rc=$?
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   spend_record || true
-  if ((torchrun_rc == 124 || torchrun_rc == 137)); then
+  if ((TIMEOUT_FIRED)); then
     mark_failed "$mode training timed out after ${limit}s (hang?); see $run_dir/train_rank0.log"
+    return 1
+  fi
+  if ((torchrun_rc == 137)); then
+    mark_failed "$mode training was killed with SIGKILL before the ${limit}s limit (out of memory?); see $run_dir/train_rank0.log"
     return 1
   fi
   # torchrun collapses worker exit codes; rank 0 writes the real one to exit_code.
@@ -735,6 +800,22 @@ _copy_logs() {
   done
 }
 
+# Stops the command `_with_timeout` is waiting on: TERM to its process group, a short grace, then KILL.
+# GNU timeout leads its own group, so this reaches torchrun and its workers. Best effort.
+_kill_timed_command() {
+  local pid=${TIMEOUT_PID-} i
+  if [[ -z $pid ]]; then return 0; fi
+  _runpod_log "stopping the running command (process group $pid)"
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  for ((i = 0; i < KILL_GRACE_S; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    "${DRBM25_SLEEP:-sleep}" 1
+  done
+  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  TIMEOUT_PID=''
+}
+
 # Traps: any exit, including a closed terminal (HUP), INT and TERM, copies logs and terminates the pod.
 # SIGPIPE is ignored so a dead pipe or terminal cannot kill the script halfway through on_exit.
 install_exit_traps() {
@@ -751,6 +832,9 @@ install_exit_traps() {
 on_exit() {
   local status=${1:-0}
   set +e +u
+  # A second Ctrl-C, hangup or TERM must not cut on_exit short; children (curl) inherit the ignore.
+  trap '' HUP INT TERM
+  _kill_timed_command
   # audit-bash disable=B102 # this only removes an inherited ERR trap; set -E comes from common.sh
   trap - ERR
   if ((status != 0)) && [[ ! -f ${DRBM25_FAILED_FILE-} ]]; then

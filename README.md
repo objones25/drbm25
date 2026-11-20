@@ -141,6 +141,10 @@ Prices (RunPod API, as of 2026-11-19): 2x A100 SXM 80GB community $2.78/h, secur
 community $2.38/h, secure $4.18/h. $100 buys about 36-42 h on community cloud and 23-24 h on secure. Community
 stock was listed as low.
 
+Template and stock: the official "Runpod Pytorch 2.8.0" image `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (host CUDA
+   12.8-13.4 allowed). Check GPU stock first: as of 2026-11-20 the RunPod API showed 2x A100 SXM 80GB available only on
+   SECURE cloud in US-MD-1, with availability LOW; community cloud and PCIe showed none. A network volume is tied to its
+   data center, so confirm that the data center currently has 2x A100 80GB in stock BEFORE creating the volume.
 1. Create a network volume of at least **400 GB** in a data center that has A100 80GB in stock. Size estimate
    (not measured on a pod yet): a full fine-tune checkpoint holds fp32 parameters plus two Adam moments for the
    actor and the critic, about 74 GB; `run.keep_ckpts` is 1, but a save needs the old checkpoint beside the new one,
@@ -165,8 +169,10 @@ stock was listed as low.
    dollars still left to spend, shown next to what earlier launches already spent, and `PRICE_PER_HOUR` (this pod's
    price from the list above). Those two are never saved. After the prompts all output goes to
    `/workspace/drbm25/logs/run_all-<time>.log`; follow it with `tail -f`.
-4. Stages, in order: Java 21 (pinned Temurin tarball, SHA-256 checked) and `uv==0.13.7` from PyPI, `uv sync --frozen
-   --extra vllm`, dataset and index, model snapshot at the config's pinned revision, GPU smoke test (`pytest
+4. Stages, in order: Java 21 (pinned Temurin tarball, SHA-256 checked), uv 0.13.7 (pinned GitHub release tarball for x86_64 Linux,
+   SHA-256 checked, installed into `/workspace/drbm25/bin`; no pip, so Ubuntu 24.04's externally-managed Python does not
+   matter), Python 3.12 from `uv python install` (onto the volume, `UV_PYTHON_PREFERENCE=only-managed`, so the image's
+   system Python and preinstalled torch are never used), `uv sync --frozen --extra vllm`, dataset and index, model snapshot at the config's pinned revision, GPU smoke test (`pytest
    -m gpu` on the vLLM and full-model tests, then `scripts/memory_check.py`, which fails with under 2 GiB headroom),
    training, evaluation, report. Data and model stages leave markers in `/workspace/drbm25/.done/` and are skipped on
    a re-run; Java, uv, `uv sync` and training run every launch (training resumes from the latest checkpoint), and the
@@ -181,7 +187,16 @@ stock was listed as low.
    `run.chunk_steps` (50), so they stop within one chunk of each other and the evaluation uses the last step both
    reached.
 6. Hangs: each training chunk runs under GNU `timeout` (time to the deadline plus 30 min), evaluation commands under
-   2 h and each smoke command under 1 h. A timeout is a failure: `FAILED` is written and the pod is terminated.
+   2 h and each smoke command under 1 h. A timeout is a failure: `FAILED` is written and the pod is terminated. A `SIGKILL` before the limit (exit 137, for example
+   the out-of-memory killer) is reported as that, not as a timeout.
+
+Ctrl-C, a closed terminal (SIGHUP) or SIGTERM stops the running command (its process group gets TERM, then KILL after
+10 s), records spend, copies logs and terminates the pod; further signals during that cleanup are ignored.
+
+`df` on a RunPod network volume may report pooled rather than per-volume space. Set `VOLUME_GB` to the size you created
+(the launcher asks, optional, and saves it in `.env`) and the preflight also requires
+`VOLUME_GB - used` (from `du -sk /workspace/drbm25`) to cover the next checkpoint. On the pod, compare
+`du -sh /workspace` with the volume size you created.
 
 Terminating the pod releases GPU billing; the network volume keeps all data. Use `--no-terminate` or
 `TERMINATE_ON_FINISH=no` to keep the pod. If the terminate call fails after 3 attempts (waits of 5 s and 15 s) the
