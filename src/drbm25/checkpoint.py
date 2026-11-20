@@ -33,16 +33,18 @@ import json
 import os
 import random
 import shutil
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast, get_args
+from typing import Any, Literal, cast, get_args
 
 import numpy as np
 import torch
 import torch.distributed as tdist
 from safetensors.torch import load_file, save_file
-from torch import Tensor
+from torch import Tensor, nn
+from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.checkpoint.state_dict_saver import save as dcp_save
 
@@ -57,6 +59,7 @@ _LATEST_FILE = "latest"
 _DCP_DIR = "dcp"
 _RNG_FILE = "rng.pt"
 _LAYOUT_SHARDED = "sharded"
+_ACTOR_MODEL_PREFIX = "actor.model."  # FullPolicyModels.sharded_state()["actor"]["model"], flattened by DCP
 _STEP_PREFIX = "step_"
 _TMP_PREFIX = ".tmp-"
 
@@ -411,3 +414,39 @@ def load_sharded_checkpoint(path: Path, state: dict[str, Any]) -> LoadedCheckpoi
             "torch_cuda": rng["torch_cuda"],
         },
     )
+
+
+CheckpointLayout = Literal["single", "sharded"]
+
+
+def checkpoint_layout(path: Path) -> CheckpointLayout:
+    """``"sharded"`` for a full fine-tune (DCP) checkpoint, ``"single"`` for a rank-0 LoRA one."""
+    meta, _ = _read_meta(path)
+    return "sharded" if meta.get("layout") == _LAYOUT_SHARDED else "single"
+
+
+def load_sharded_actor(path: Path, model: nn.Module) -> TrainState:
+    """Load the actor weights of a sharded checkpoint into a plain HF ``model`` (in place), in ONE process.
+
+    No process group is needed (``dcp.load(..., no_dist=True)``); DCP reassembles the full tensors
+    from every rank's shard file. The saved keys are ``actor.model.<name>`` with ``name`` exactly
+    as in the plain model's ``state_dict()`` (``FullPolicyModels`` shards the HF model in place),
+    so any missing or unexpected name raises ``KeyError``. Optimizer and critic state are not read.
+    """
+    meta, train_state = _read_meta(path)
+    if meta.get("layout") != _LAYOUT_SHARDED:
+        raise ValueError(f"checkpoint {path} is not a sharded (full fine-tune) checkpoint")
+    saved = {
+        key[len(_ACTOR_MODEL_PREFIX) :]
+        for key in FileSystemReader(path / _DCP_DIR).read_metadata().state_dict_metadata
+        if key.startswith(_ACTOR_MODEL_PREFIX)
+    }
+    own = model.state_dict()  # detached views of the live parameters: DCP loads into them in place
+    missing, unexpected = sorted(own.keys() - saved), sorted(saved - own.keys())
+    if missing or unexpected:
+        raise KeyError(f"actor weights in {path} do not match the model: missing={missing} unexpected={unexpected}")
+    with warnings.catch_warnings():
+        # torch 2.10 warns on every single-process load, even with no_dist=True; that is the intent here.
+        warnings.filterwarnings("ignore", message="torch.distributed is disabled", category=UserWarning)
+        dcp_load({"actor": {"model": own}}, checkpoint_id=path / _DCP_DIR, no_dist=True)
+    return train_state

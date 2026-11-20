@@ -1,12 +1,21 @@
 """Scoring original queries and rewrites, and the run_eval CLI (toy index, tiny model)."""
 
+import importlib.util
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import pytest
 import torch
+import torch.distributed as tdist
+import yaml
 
+import drbm25.eval.run_eval as run_eval_module
 from drbm25.bm25.searcher import Bm25Searcher, SearchResult, TooManyClausesError
 from drbm25.checkpoint import TrainState, save_checkpoint
 from drbm25.config import LoraCfg, ScoringMode, load_config
@@ -14,6 +23,7 @@ from drbm25.data import DEV_FILE, Example
 from drbm25.eval.records import QueryRecord, read_records
 from drbm25.eval.run_eval import main, score_original, score_rewrites
 from drbm25.ppo.models import LoraPolicyModels
+from drbm25.prompt import build_prompt
 from drbm25.rollout.base import RolloutBatch
 from drbm25.tiny import build_tiny_qwen2
 
@@ -217,3 +227,79 @@ def test_cli_rejects_inconsistent_source_arguments(workdir: Path, toy_index: Pat
     with pytest.raises(SystemExit) as exc:
         main(_argv(workdir, toy_index, workdir / "x.jsonl", *extra))
     assert exc.value.code == 2
+
+
+# --------------------------------------------------------------------------- full fine-tune (sharded) checkpoints
+_CASES_FILE = Path(__file__).resolve().parents[1] / "ppo" / "fsdp_cases.py"
+
+
+def _load_fsdp_cases() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("fsdp_cases", _CASES_FILE)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sharded_checkpoint(out: Path) -> dict[str, Any]:
+    """Two gloo ranks train a tiny full-layout actor, save it sharded, and record its greedy rewrites."""
+    proc = subprocess.run(  # noqa: S603 -- this interpreter and a script in this repo
+        [sys.executable, str(_CASES_FILE), "eval_ckpt", str(out)],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"), "HF_HUB_OFFLINE": "1"},
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-4000:]
+    return torch.load(out / "result.pt", weights_only=True)
+
+
+@pytest.mark.slow
+def test_full_checkpoint_rewrites_match_the_live_actor(tmp_path: Path) -> None:
+    saved = _sharded_checkpoint(tmp_path)
+    cases = _load_fsdp_cases()
+    cfg = cases.full_cfg()
+    assert not tdist.is_initialized()  # a fresh single process, no process group
+    prompts = [build_prompt(q) for q in cases.EVAL_QUERIES]
+    engine, source = run_eval_module._build_engine(cfg, Path(saved["path"]))
+    got = engine.generate(prompts, greedy=True)
+    assert source == "trained-count_once"
+    assert got.response_ids.tolist() == saved["response_ids"].tolist()
+    assert list(got.response_text) == saved["texts"]
+    untrained, untrained_source = run_eval_module._build_engine(cfg, None)
+    assert untrained_source == "untrained"
+    assert untrained.generate(prompts, greedy=True).response_ids.tolist() != saved["response_ids"].tolist()
+
+
+@pytest.mark.slow
+def test_cli_scores_a_full_checkpoint(tmp_path: Path, workdir: Path, toy_index: Path) -> None:
+    saved = _sharded_checkpoint(tmp_path)
+    full = workdir / "full.yaml"
+    raw = yaml.safe_load(SMOKE.read_text())
+    raw["model"]["train_mode"] = "full"
+    raw["lora"] = None
+    full.write_text(yaml.safe_dump(raw))
+    out = workdir / "full.jsonl"
+    argv = _argv(workdir, toy_index, out, "--source", "checkpoint", "--checkpoint", saved["path"], "--limit", "2")
+    argv[argv.index(str(SMOKE))] = str(full)
+    assert main(argv) == 0
+    assert {r.source for r in read_records(out)} == {"trained-count_once"}
+
+
+def test_lora_config_refuses_a_sharded_checkpoint(tmp_path: Path) -> None:
+    run = tmp_path / "step_000001"
+    run.mkdir()
+    train_state = {"step": 1, "data_cursor": 4, "wandb_run_id": None, "reward_mode": "normal"}
+    meta = {"format_version": 1, "layout": "sharded", "train_state": train_state, "rng_python": [], "rng_numpy": {}}
+    (run / "meta.json").write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="train_mode 'full'"):
+        run_eval_module._build_engine(load_config(SMOKE), run)
+
+
+def test_full_config_refuses_a_lora_checkpoint(workdir: Path) -> None:
+    ckpt = _write_tiny_checkpoint(workdir)
+    cfg = _load_fsdp_cases().full_cfg()
+    with pytest.raises(ValueError, match="not a sharded"):
+        run_eval_module._build_engine(cfg, ckpt)

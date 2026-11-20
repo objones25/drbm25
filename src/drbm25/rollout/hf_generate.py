@@ -15,14 +15,21 @@ and ``_get_logits_processor``):
 """
 
 from collections.abc import Sequence
+from typing import Protocol
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from transformers import LogitsProcessor, LogitsProcessorList, PreTrainedTokenizerBase
 
 from drbm25.config import RolloutCfg
 from drbm25.ppo.models import PolicyModels
 from drbm25.rollout.base import RolloutBatch, encode_prompts, finalize_rollout, right_pad, special_ids
+
+
+class GenerationSource(Protocol):
+    """All the HF engine reads from the models: a module to call ``generate`` on."""
+
+    def generation_module(self) -> nn.Module: ...
 
 
 class HFGenerateEngine:
@@ -39,7 +46,7 @@ class HFGenerateEngine:
 
     def __init__(
         self,
-        models: PolicyModels,
+        models: GenerationSource,
         tokenizer: PreTrainedTokenizerBase,
         cfg: RolloutCfg,
         device: torch.device,

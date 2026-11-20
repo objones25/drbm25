@@ -121,7 +121,8 @@ Shell tests: `bats tests/shell/` (needs bats >= 1.5 and bash >= 4 for `mapfile`)
 an FSDP2-sharded fp32 actor and critic, a frozen bf16 reference, and one colocated vLLM 0.19 engine
 per rank. It needs `uv sync --extra vllm`, CUDA, and torchrun (`--nproc_per_node 2`); checkpoints are
 sharded (`step_NNNNNN/dcp/`, written by every rank). Before a long run, measure peak memory per GPU
-for one PPO step (synthetic queries, no index or dataset needed):
+(sampled through generation) over two PPO steps, a validation pass, a sharded save and a resume
+(synthetic queries, no index or dataset needed; exits 1 when the headroom is under 2 GiB):
 
 ```bash
 uv run torchrun --nproc_per_node 2 scripts/memory_check.py --config configs/runpod_a100_full.yaml

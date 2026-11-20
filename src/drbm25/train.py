@@ -63,7 +63,7 @@ from drbm25.checkpoint import (
 )
 from drbm25.config import Config, ConfigError, LoraCfg, ScoringMode, load_config, validate_for_runtime
 from drbm25.data import DEV_FILE, TRAIN_FILE, Example, batch_indices, load_examples, split_dev
-from drbm25.distributed import DistInfo, init_distributed
+from drbm25.distributed import DistInfo, assert_params_equal, broadcast_params, init_distributed
 from drbm25.obs import configure
 from drbm25.obs.context import bind_log_context
 from drbm25.obs.runs import STEP_METRIC, open_run
@@ -191,6 +191,10 @@ def check_tokenizer(tokenizer: PreTrainedTokenizerBase) -> None:
 
 
 # ---------------------------------------------------------------------------- building blocks
+def precision_dtype(cfg: Config) -> torch.dtype:
+    return _DTYPES[cfg.model.precision]
+
+
 def build_tokenizer(cfg: Config) -> PreTrainedTokenizerBase:
     if cfg.model.name == TINY_MODEL:
         return build_tiny_tokenizer()
@@ -359,6 +363,32 @@ class Layout:
     full: FullPolicyModels | None  # set on the full layout (sharded checkpoints)
 
 
+def init_layout(cfg: Config, dist: DistInfo) -> Layout:
+    """Build the layout with the SAME seed on every rank, then seed each rank differently for sampling.
+
+    LoRA ``A`` matrices are initialised from the global RNG; built after a per-rank seed they would
+    differ across ranks, and averaging gradients over different weights makes the ranks drift.
+    """
+    _seed(cfg.run.seed)
+    layout = build_layout(cfg, dist)
+    sync_replicated_params(layout, dist)
+    _seed(cfg.run.seed + dist.rank)
+    return layout
+
+
+def sync_replicated_params(layout: Layout, dist: DistInfo) -> None:
+    """LoRA layout: broadcast rank 0's trainable params and assert all ranks match (a collective).
+
+    Belt and braces after construction and after a resume load. The full layout is skipped: FSDP2
+    parameters are shards of a full copy that is built identically on every rank.
+    """
+    if layout.full is not None:
+        return
+    params = [*layout.models.actor_parameters(), *layout.models.critic_parameters()]
+    broadcast_params(params, dist)
+    assert_params_equal(params, dist)
+
+
 def build_layout(cfg: Config, dist: DistInfo) -> Layout:
     full = cfg.model.train_mode == "full"
     tokenizer = build_tokenizer(cfg)
@@ -407,9 +437,7 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
     data_dir = cfg.data.data_dir
     train = load_examples(data_dir / TRAIN_FILE)
     val, _ = split_dev(load_examples(data_dir / DEV_FILE), val_size=cfg.data.val_size)
-    _seed(cfg.run.seed + dist.rank)
-
-    layout = build_layout(cfg, dist)
+    layout = init_layout(cfg, dist)  # seeds: shared for construction, then seed + rank
     models, engine = layout.models, layout.engine
     r = cfg.retrieval
     searcher = Bm25Searcher(r.index_dir, k1=r.k1, b=r.b, threads=r.search_threads, timeout_s=r.search_timeout_s)
@@ -431,6 +459,7 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
             if ckpt.scaler is None:
                 raise ValueError(f"{ckpt_path} has no GradScaler state but this run uses fp16")
             scaler.load_state_dict(ckpt.scaler)
+        sync_replicated_params(layout, dist)
         if dist.rank == 0:
             restore_rng(ckpt.rng)  # saved from rank 0; other ranks reseed from the step below
         else:
@@ -520,7 +549,11 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
         else:
             logger.info("reached step %d", state.step)
             if layout.full is not None and state.step >= cfg.run.total_steps:
-                logger.info("full fine-tune: the final sharded checkpoint step_%06d is the trained model", state.step)
+                logger.info(
+                    "full fine-tune: the final sharded checkpoint step_%06d is the trained model "
+                    "(score it with drbm25.eval.run_eval --source checkpoint; weights stay on disk, no W&B upload)",
+                    state.step,
+                )
             elif run is not None and state.step >= cfg.run.total_steps:
                 adapters = run_dir / "final_adapters.safetensors"
                 save_file(

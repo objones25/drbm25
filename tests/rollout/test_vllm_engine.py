@@ -61,6 +61,9 @@ class FakeLLM:
     script: list[_Completion] = field(default_factory=list)
     calls: list[tuple[str, Any]] = field(default_factory=list)
     loaded: list[tuple[str, Tensor]] = field(default_factory=list)
+    param_names: set[str] | None = None  # the "model"'s parameters; None: exactly the loaded names
+    config: Any = None
+    prefix_cache_reset: bool = True
 
     def generate(
         self, prompts: Sequence[Mapping[str, list[int]]], *, sampling_params: Any, use_tqdm: bool
@@ -77,6 +80,10 @@ class FakeLLM:
         self.loaded.extend(weights)
         return {name for name, _ in self.loaded}
 
+    def named_parameters(self) -> list[tuple[str, None]]:
+        names = self.param_names if self.param_names is not None else {name for name, _ in self.loaded}
+        return [(name, None) for name in sorted(names)]
+
     def sleep(self, level: int = 1) -> None:
         self.calls.append(("sleep", level))
 
@@ -85,7 +92,7 @@ class FakeLLM:
 
     def reset_prefix_cache(self) -> bool:
         self.calls.append(("reset_prefix_cache", None))
-        return True
+        return self.prefix_cache_reset
 
 
 def _engine(llm: FakeLLM, cfg: RolloutCfg | None = None) -> VLLMEngine:
@@ -205,6 +212,44 @@ def test_sync_weights_on_an_awake_engine_skips_wake_up() -> None:
         LoraPolicyModels(build_tiny_qwen2(0), LoraCfg(4, 8, 0.0, ("q_proj",)), gradient_checkpointing=False)
     )
     assert _names(llm) == ["apply_model", "reset_prefix_cache"]
+
+
+@dataclass
+class _Weights:
+    weights: dict[str, Tensor]
+
+    def merged_actor_state_dict(self) -> dict[str, Tensor]:
+        return self.weights
+
+
+@dataclass
+class _TiedConfig:
+    tie_word_embeddings: bool
+
+
+def test_sync_weights_raises_on_a_partial_sync() -> None:
+    llm = FakeLLM(param_names={"a.weight", "b.weight"})
+    with pytest.raises(RuntimeError, match=r"partial weight sync.*'b\.weight'"):
+        _engine(llm).sync_weights(_Weights({"a.weight": torch.zeros(1)}))
+    assert "reset_prefix_cache" not in _names(llm)
+
+
+def test_sync_weights_allows_a_tied_lm_head_to_be_skipped() -> None:
+    llm = FakeLLM(param_names={"a.weight", "lm_head.weight"}, config=_TiedConfig(tie_word_embeddings=True))
+    _engine(llm).sync_weights(_Weights({"a.weight": torch.zeros(1)}))
+    assert _names(llm) == ["apply_model", "reset_prefix_cache"]
+
+
+def test_sync_weights_requires_an_untied_lm_head() -> None:
+    llm = FakeLLM(param_names={"a.weight", "lm_head.weight"}, config=_TiedConfig(tie_word_embeddings=False))
+    with pytest.raises(RuntimeError, match=r"lm_head\.weight"):
+        _engine(llm).sync_weights(_Weights({"a.weight": torch.zeros(1)}))
+
+
+def test_sync_weights_raises_when_the_prefix_cache_is_not_reset() -> None:
+    llm = FakeLLM(prefix_cache_reset=False)
+    with pytest.raises(RuntimeError, match="prefix cache"):
+        _engine(llm).sync_weights(_Weights({"a.weight": torch.zeros(1)}))
 
 
 def test_engine_satisfies_protocol() -> None:

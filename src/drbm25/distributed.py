@@ -87,3 +87,37 @@ def allreduce_mean_grads(params: Sequence[nn.Parameter], dist: DistInfo) -> None
             continue
         tdist.all_reduce(p.grad, op=tdist.ReduceOp.SUM)
         p.grad.div_(dist.world_size)
+
+
+def broadcast_params(params: Sequence[nn.Parameter], dist: DistInfo) -> None:
+    """Overwrite every rank's ``params`` with rank 0's values (in place); a collective.
+
+    For replicated (non-FSDP) layouts, whose ranks must start bit-identical: the manual gradient
+    average keeps them equal only if they start equal.
+    """
+    if dist.world_size == 1:
+        return
+    with torch.no_grad():
+        for p in params:
+            tdist.broadcast(p.data, src=0)
+
+
+def assert_params_equal(params: Sequence[nn.Parameter], dist: DistInfo) -> None:
+    """Raise ``RuntimeError`` on every rank unless all ranks hold the same ``params``; a collective.
+
+    Compares float64 checksums (sum and sum of squares per parameter) with an all-reduce of MAX
+    and MIN; bit-identical tensors give identical checksums.
+    """
+    if dist.world_size == 1:
+        return
+    with torch.no_grad():
+        sums = torch.stack(
+            [torch.stack([p.detach().double().sum(), p.detach().double().pow(2).sum()]) for p in params]
+        ).to(dist.device)
+    high, low = sums.clone(), sums.clone()
+    tdist.all_reduce(high, op=tdist.ReduceOp.MAX)
+    tdist.all_reduce(low, op=tdist.ReduceOp.MIN)
+    differ = (high != low).any(dim=1)
+    if bool(differ.any()):
+        bad = differ.nonzero().flatten().tolist()
+        raise RuntimeError(f"ranks hold different values for parameters at indices {bad[:10]} (of {len(params)})")

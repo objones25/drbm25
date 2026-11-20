@@ -5,9 +5,10 @@
         [--limit N] [--set key=value ...]
 
 ``original`` scores the dataset queries as they are (CPU, no model). ``untrained`` rewrites them
-with the base model (LoRA adapters at initialisation equal the base). ``checkpoint`` loads the
-trainable state of a ``step_NNNNNN`` checkpoint directory first; the record source is
-``trained-<reward_mode>``, read from the checkpoint. Rewrites are greedy, with ``rollout.max_new_tokens`` from the config.
+with the base model (LoRA adapters at initialisation equal the base). ``checkpoint`` loads a
+``step_NNNNNN`` checkpoint directory first: LoRA adapters (single-file layout) or, with a
+``model.train_mode: full`` config, the actor of a sharded full fine-tune checkpoint (DCP files
+read in this one process); the record source is ``trained-<reward_mode>``, read from the checkpoint. Rewrites are greedy, with ``rollout.max_new_tokens`` from the config.
 """
 
 from __future__ import annotations
@@ -19,9 +20,11 @@ from pathlib import Path
 from typing import Final, get_args
 
 import torch
+from torch import nn
+from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from drbm25.bm25.searcher import Bm25Searcher, SearchResult
-from drbm25.checkpoint import load_checkpoint
+from drbm25.checkpoint import checkpoint_layout, load_checkpoint, load_sharded_actor
 from drbm25.config import Config, ScoringMode, load_config
 from drbm25.data import DEV_FILE, Example, load_examples
 from drbm25.eval.records import (
@@ -37,7 +40,17 @@ from drbm25.prompt import build_prompt
 from drbm25.reward import ParsedRewrite, ndcg_at_k
 from drbm25.rollout.base import RolloutEngine
 from drbm25.rollout.hf_generate import HFGenerateEngine
-from drbm25.train import build_base, check_index, check_java, check_layout, check_tokenizer
+from drbm25.tiny import build_tiny_qwen2
+from drbm25.train import (
+    TINY_MODEL,
+    build_base,
+    build_tokenizer,
+    check_index,
+    check_java,
+    check_layout,
+    check_tokenizer,
+    precision_dtype,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -146,10 +159,56 @@ def trained_source(reward_mode: ScoringMode) -> str:
     return f"trained-{reward_mode}"
 
 
+class _FrozenActor:
+    """A plain HF causal LM as a ``GenerationSource`` (evaluation of a full fine-tune actor)."""
+
+    def __init__(self, model: PreTrainedModel) -> None:
+        self._model = model
+
+    def generation_module(self) -> nn.Module:
+        self._model.eval()
+        return self._model
+
+
+def _plain_actor(cfg: Config) -> PreTrainedModel:
+    """The untrained actor, fp32 on CPU (a checkpoint is loaded into it before the cast)."""
+    if cfg.model.name == TINY_MODEL:
+        return build_tiny_qwen2(seed=cfg.run.seed)
+    return AutoModelForCausalLM.from_pretrained(
+        cfg.model.name, revision=cfg.model.revision, dtype=torch.float32, attn_implementation="sdpa"
+    )
+
+
+def _build_full_engine(cfg: Config, checkpoint: Path | None, device: torch.device) -> tuple[HFGenerateEngine, str]:
+    tokenizer = build_tokenizer(cfg)
+    check_tokenizer(tokenizer)
+    actor = _plain_actor(cfg)
+    source = SOURCE_UNTRAINED
+    if checkpoint is not None:
+        state = load_sharded_actor(checkpoint, actor)
+        source = trained_source(state.reward_mode)
+        logger.info("loaded full fine-tune actor from %s (step %d, %s)", checkpoint, state.step, source)
+    nn.Module.to(actor, device=device, dtype=precision_dtype(cfg))  # transformers' decorated .to() confuses pyright
+    return HFGenerateEngine(_FrozenActor(actor), tokenizer, cfg.rollout, device), source
+
+
 def _build_engine(cfg: Config, checkpoint: Path | None) -> tuple[HFGenerateEngine, str]:
+    """Greedy rewriter for ``cfg``'s layout; a checkpoint must be of the matching layout.
+
+    LoRA (``model.train_mode: lora``): base + adapters from a single-file checkpoint. Full fine-tune
+    (``full``): the actor from a sharded checkpoint, loaded in this one process and run with HF
+    ``generate`` in ``model.precision``.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lora = check_layout(cfg, device)
     torch.manual_seed(cfg.run.seed)
+    layout = None if checkpoint is None else checkpoint_layout(checkpoint)
+    if cfg.model.train_mode == "full":
+        if layout == "single":
+            raise ValueError(f"{checkpoint} is not a sharded (full fine-tune) checkpoint; use the LoRA config")
+        return _build_full_engine(cfg, checkpoint, device)
+    if layout == "sharded":
+        raise ValueError(f"{checkpoint} is a sharded full fine-tune checkpoint: use a config with train_mode 'full'")
+    lora = check_layout(cfg, device)
     base, tokenizer = build_base(cfg, device)
     check_tokenizer(tokenizer)
     models = LoraPolicyModels(base, lora, gradient_checkpointing=False)

@@ -1,6 +1,6 @@
 model:
   name: "Qwen/Qwen2.5-3B-Instruct"
-  revision: main
+  revision: aa8e72537993ba99e69dfaafa59ed015b17504d1  # Qwen/Qwen2.5-3B-Instruct HEAD, looked up 2026-11-20 (last modified 2024-09-25)
   precision: bf16
   train_mode: full
   gradient_checkpointing: true

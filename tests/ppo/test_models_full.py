@@ -21,11 +21,13 @@ import torch.distributed as tdist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.testing import assert_close
+from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from drbm25.checkpoint import (
     TrainState,
     latest_checkpoint,
     load_checkpoint,
+    load_sharded_actor,
     load_sharded_checkpoint,
     save_sharded_checkpoint,
 )
@@ -62,6 +64,23 @@ def mesh(tmp_path_factory: pytest.TempPathFactory) -> Iterator[DeviceMesh]:
         yield init_device_mesh("cpu", (1,))
     finally:
         tdist.destroy_process_group()
+
+
+def _run_two_ranks_per_rank(case: str, out: Path) -> list[dict[str, Any]]:
+    _run_case(case, out)
+    return [torch.load(out / f"result_rank{r}.pt", weights_only=True) for r in range(2)]
+
+
+def _run_case(case: str, out: Path) -> None:
+    proc = subprocess.run(  # noqa: S603 -- this interpreter and a script in this repo
+        [sys.executable, str(CASES_FILE), case, str(out)],
+        env={**os.environ, "PYTHONPATH": str(SRC), "HF_HUB_OFFLINE": "1"},  # JAVA_HOME: the trainer imports pyserini
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-4000:]
 
 
 def _run_two_ranks(case: str, out: Path) -> dict[str, Any]:
@@ -326,3 +345,45 @@ def test_load_sharded_checkpoint_refuses_single_file_dir(tmp_path: Path) -> None
     path = save_checkpoint(tmp_path, train_state=state, model={"w": torch.zeros(2)}, optimizers={}, scaler=None, keep=1)
     with pytest.raises(ValueError, match="not a sharded"):
         load_sharded_checkpoint(path, {})
+
+
+# --------------------------------------------------------------------------- LoRA layout: same weights on every rank
+@pytest.mark.slow
+def test_lora_construction_gives_every_rank_the_same_weights(tmp_path: Path) -> None:
+    """Fails when the per-rank seed is applied before the adapters are initialised (broadcast disabled)."""
+    rank0, rank1 = _run_two_ranks_per_rank("lora_init_construction", tmp_path)
+    assert sorted(rank0["init"]) == sorted(rank1["init"])
+    assert_close(rank1["init"], rank0["init"], rtol=0, atol=0)
+
+
+@pytest.mark.slow
+def test_lora_trainable_params_bit_identical_across_ranks_after_init_and_step(tmp_path: Path) -> None:
+    rank0, rank1 = _run_two_ranks_per_rank("lora_init", tmp_path)
+    assert_close(rank1["init"], rank0["init"], rtol=0, atol=0)
+    assert_close(rank1["stepped"], rank0["stepped"], rtol=0, atol=0)
+    moved = [k for k in rank0["init"] if not torch.equal(rank0["init"][k], rank0["stepped"][k])]
+    assert len(moved) > len(rank0["init"]) // 2  # the step really changed the adapters
+
+
+@pytest.mark.slow
+def test_assert_params_equal_raises_on_mismatch_and_broadcast_fixes_it(tmp_path: Path) -> None:
+    results = _run_two_ranks_per_rank("assert_params", tmp_path)
+    assert [r["message"] for r in results] == ["ranks hold different values for parameters at indices [0] (of 2)"] * 2
+    assert [r["after"].tolist() for r in results] == [[0.0, 0.0, 0.0]] * 2  # rank 0's values everywhere
+
+
+@pytest.mark.filterwarnings(DCP_WARNING)
+def test_load_sharded_actor_into_plain_model(mesh: DeviceMesh, tmp_path: Path) -> None:
+    models = cases.build_models(mesh, seed=0)
+    opts = {
+        "actor": torch.optim.AdamW(models.actor_parameters()),
+        "critic": torch.optim.AdamW(models.critic_parameters()),
+    }
+    state = TrainState(step=1, data_cursor=4, wandb_run_id=None, reward_mode="count_once")
+    path = save_sharded_checkpoint(tmp_path, train_state=state, state=models.sharded_state(opts), keep=1, dist=ONE_RANK)
+    plain = build_tiny_qwen2(seed=99)  # different init: equality below proves the load
+    assert load_sharded_actor(path, plain) == state
+    assert_close(plain.state_dict(), models.merged_actor_state_dict(), rtol=0, atol=0)
+    one_layer = Qwen2ForCausalLM(Qwen2Config(**{**plain.config.to_dict(), "num_hidden_layers": 1, "layer_types": None}))
+    with pytest.raises(KeyError, match=r"unexpected=\['model\.layers\.1\."):
+        load_sharded_actor(path, one_layer)

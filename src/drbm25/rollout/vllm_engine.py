@@ -22,8 +22,9 @@ from the vLLM v0.19.0 source (``raw.githubusercontent.com/vllm-project/vllm/v0.1
     ``fn(model_runner.get_model())`` in-process (``v1/executor/uniproc_executor.py``,
     ``v1/worker/worker_base.py``), so tensors are passed by reference.
     ``Qwen2ForCausalLM.load_weights(Iterable[(hf_name, tensor)])`` maps HF names (fusing
-    q/k/v and gate/up) and skips ``lm_head.`` when embeddings are tied
-    (``model_executor/models/qwen2.py``). TRL's colocate mode (v1.10.0, which supports
+    q/k/v and gate/up), skips ``lm_head.`` when embeddings are tied, and returns the set of vLLM
+    parameter names it wrote (``model_executor/models/qwen2.py``, ``AutoWeightsLoader`` in
+    ``models/utils.py``). TRL's colocate mode (v1.10.0, which supports
     vllm>=0.17,<=0.26) loads weights through the same model object.
   * ``LLM.sleep(level=1)`` offloads weights to CPU and discards the KV cache;
     ``wake_up(tags)`` takes ``"weights"`` / ``"kv_cache"``; ``reset_prefix_cache()``. Sleep mode
@@ -182,15 +183,27 @@ class VLLMEngine:
 
     # ------------------------------------------------------------------ RolloutEngine
     def sync_weights(self, models: MergedActor) -> None:
-        """Load ``models.merged_actor_state_dict()`` into the engine's model (a collective on FSDP)."""
+        """Load ``models.merged_actor_state_dict()`` into the engine's model (a collective on FSDP).
+
+        Raises ``RuntimeError`` if any vLLM parameter was not written (a tied ``lm_head`` is the
+        only allowed gap) or if the prefix cache could not be reset: either would leave rollouts
+        sampling from a mix of old and new weights without any visible error.
+        """
         weights = models.merged_actor_state_dict()
         self._wake(_WEIGHTS)
 
-        def load(model: Any) -> set[str]:
-            return model.load_weights(weights.items())
+        def load(model: Any) -> list[str]:
+            loaded = set(model.load_weights(weights.items()))  # vLLM parameter names it wrote
+            expected = {name for name, _ in model.named_parameters()}
+            if getattr(getattr(model, "config", None), "tie_word_embeddings", False):
+                expected = {name for name in expected if not name.startswith("lm_head.")}
+            return sorted(expected - loaded)
 
-        self._llm.apply_model(load)
-        self._llm.reset_prefix_cache()  # cached KV blocks were computed with the old weights
+        (missing,) = self._llm.apply_model(load)
+        if missing:
+            raise RuntimeError(f"partial weight sync: {len(missing)} vLLM parameters not loaded, e.g. {missing[:10]}")
+        if not self._llm.reset_prefix_cache():  # cached KV blocks were computed with the old weights
+            raise RuntimeError("vLLM could not reset its prefix cache after the weight sync")
 
     def generate(self, prompts: Sequence[str], *, greedy: bool) -> RolloutBatch:
         prompt_ids, prompt_mask = encode_prompts(

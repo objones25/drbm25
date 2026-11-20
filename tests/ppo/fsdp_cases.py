@@ -208,7 +208,103 @@ def case_ppo_step(rank: int, mesh: DeviceMesh, out: Path) -> None:
         torch.save({"actor": actor, "critic": critic, "metrics": metrics}, out / "result.pt")
 
 
-CASES: Final = {"actor_step": case_actor_step, "checkpoint": case_checkpoint, "ppo_step": case_ppo_step}
+def _lora_init(rank: int, out: Path, *, broadcast: bool) -> None:
+    """``train.init_layout`` on the LoRA smoke config; every rank saves its trainable state."""
+    import drbm25.train as train_module
+
+    if not broadcast:
+        # Construction alone must already give every rank the same weights.
+        def no_broadcast(params: object, dist: object) -> None:
+            del params, dist
+
+        train_module.broadcast_params = no_broadcast
+    cfg = load_config(SMOKE)
+    dist = DistInfo(rank, WORLD, rank, CPU)
+    layout = train_module.init_layout(cfg, dist)
+    init = layout.models.trainable_state_dict()
+    stepped: dict[str, Tensor] = {}
+    if broadcast:
+        trainer = PPOTrainer(
+            cfg, models=layout.models, engine=FixedEngine(), searcher=HitSearcher(), reward_mode="normal", dist=dist,
+            scaler=None,
+        )  # fmt: skip
+        # Different prompts per rank, so the ranks' gradients differ and only the all-reduce keeps them equal.
+        local = cfg.ppo.batch_size // WORLD
+        examples = [
+            Example(qid=f"r{rank}q{i}", query=f"w{rank + 3} w9", relevant_ids=frozenset({"hit"})) for i in range(local)
+        ]
+        trainer.step(examples, step=0)
+        stepped = layout.models.trainable_state_dict()
+    torch.save({"init": init, "stepped": stepped}, out / f"result_rank{rank}.pt")
+
+
+def case_lora_init(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    del mesh
+    _lora_init(rank, out, broadcast=True)
+
+
+def case_lora_init_construction(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    del mesh
+    _lora_init(rank, out, broadcast=False)
+
+
+def case_assert_params(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    """assert_params_equal raises on different values and passes after broadcast_params."""
+    del mesh
+    from drbm25.distributed import assert_params_equal, broadcast_params
+
+    dist = DistInfo(rank, WORLD, rank, CPU)
+    params = [torch.nn.Parameter(torch.full((3,), float(rank))), torch.nn.Parameter(torch.ones(2))]
+    try:
+        assert_params_equal(params, dist)
+        message = ""
+    except RuntimeError as exc:
+        message = str(exc)
+    broadcast_params(params, dist)
+    assert_params_equal(params, dist)
+    torch.save({"message": message, "after": params[0].detach().clone()}, out / f"result_rank{rank}.pt")
+
+
+EVAL_QUERIES: Final = ("solar panel efficiency", "w4 w9 w12", "heart attack aspirin")
+
+
+def case_eval_ckpt(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    """Train the actor a little, save a sharded checkpoint, record the live actor's greedy rewrites."""
+    from drbm25.prompt import build_prompt
+    from drbm25.rollout.hf_generate import HFGenerateEngine
+
+    cfg = full_cfg()
+    dist = DistInfo(rank, WORLD, rank, CPU)
+    models = build_models(mesh, seed=0)
+    opts = {
+        "actor": torch.optim.AdamW(models.actor_parameters(), lr=0.05, weight_decay=0.0),
+        "critic": torch.optim.AdamW(models.critic_parameters(), lr=LR, weight_decay=0.0),
+    }
+    ids, attn = lm_batch()
+    for _ in range(3):
+        lm_loss(models.actor_logits(ids, attn), ids).backward()
+        opts["actor"].step()
+        opts["actor"].zero_grad(set_to_none=True)
+    state = TrainState(step=5, data_cursor=20, wandb_run_id=None, reward_mode="count_once")
+    path = save_sharded_checkpoint(out / "run", train_state=state, state=models.sharded_state(opts), keep=1, dist=dist)
+    engine = HFGenerateEngine(models, build_tiny_tokenizer(), cfg.rollout, CPU, synced_gpus=True)
+    live = engine.generate([build_prompt(q) for q in EVAL_QUERIES], greedy=True)
+    if rank == 0:
+        torch.save(
+            {"path": str(path), "response_ids": live.response_ids, "texts": list(live.response_text)},
+            out / "result.pt",
+        )
+
+
+CASES: Final = {
+    "eval_ckpt": case_eval_ckpt,
+    "assert_params": case_assert_params,
+    "actor_step": case_actor_step,
+    "checkpoint": case_checkpoint,
+    "ppo_step": case_ppo_step,
+    "lora_init": case_lora_init,
+    "lora_init_construction": case_lora_init_construction,
+}
 
 
 def _worker(rank: int, case: str, port: int, out: str) -> None:
