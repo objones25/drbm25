@@ -37,9 +37,12 @@ Each run directory `runs/<run>/` holds:
   `best/model.safetensors` holds the actor only (LoRA: the actor adapter; full fine-tune: the actor in
   bf16 with HF names, about 6.8 GB at 3B); `best/meta.json` records the step, both validation scores,
   the selection metric, the reward mode, the config sha256, the seeds and the git sha and dirty flag. A
-  resume keeps the stored best. With 2 ranks, validation is a collective: on the LoRA layout each rank
-  rewrites every other validation query and the nDCG sums are all-reduced; on the full layout every rank
-  rewrites all of them (FSDP forwards are collectives). Every rank gets the same scores and decision.
+  resume keeps the stored best. With 2 ranks, validation is a collective: whenever each rank generates
+  on its own (the LoRA layout, or `rollout.backend: vllm` on either layout, which is the A100 config)
+  each rank rewrites every other validation query and the nDCG sums and counts are all-reduced, so two
+  vLLM engines never have to produce bit-identical greedy text; only the full layout with the `hf`
+  backend has every rank rewrite all of them (its FSDP forwards inside `generate` are collectives).
+  Every rank gets the same reduced scores and decision.
 - `run_manifest.json`: every seed with its derivation (`run.seed`: model construction, data order, per-rank
   sampling and vLLM seeds `run.seed + rank`; `data.split_seed`: the train/validation split), the resolved
   config and its sha256, git sha and dirty flag, dataset and model revisions, index checksum and size,

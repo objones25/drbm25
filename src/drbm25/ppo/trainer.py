@@ -353,16 +353,19 @@ class PPOTrainer:
     def validate_with_samples(self, examples: Sequence[Example]) -> tuple[dict[str, float], list[ValSample]]:
         """Greedy rollouts scored with nDCG@10 under both modes, plus up to ``N_VAL_SAMPLES`` rows; a collective.
 
-        Every rank must call this with the same ``examples`` and gets the same metrics. The LoRA
-        layout splits the work: rank r rewrites ``examples[r::world_size]`` and the nDCG sums and
-        counts are all-reduced, so no rank waits on another's whole validation (NCCL's watchdog).
-        The full layout rewrites every example on every rank, because each actor forward there is
-        an FSDP collective that needs the same number of generate calls on all ranks. The samples
-        are this rank's first rows.
+        Every rank must call this with the same ``examples`` and gets the same metrics. When each
+        rank generates independently (the LoRA layout, or the vLLM backend on any layout) the work
+        is split: rank r rewrites ``examples[r::world_size]`` and the nDCG sums and counts are
+        all-reduced, so no rank waits on another's whole validation (NCCL's watchdog) and the
+        result does not depend on separate vLLM engines producing bit-identical greedy text.
+        Only the full layout with the ``hf`` backend rewrites every example on every rank, because
+        there each actor forward inside ``generate`` is an FSDP collective that needs the same
+        number of calls on all ranks. The samples are this rank's first rows.
         """
         if not examples:
             raise ValueError("validate needs at least one example")
-        sharded = not self._fsdp and self._dist.world_size > 1
+        generate_is_collective = self._fsdp and self._cfg.rollout.backend == "hf"
+        sharded = not generate_is_collective and self._dist.world_size > 1
         if sharded and len(examples) < self._dist.world_size:
             raise ValueError(f"validate needs at least {self._dist.world_size} examples to shard, got {len(examples)}")
         mine = list(examples[self._dist.rank :: self._dist.world_size]) if sharded else list(examples)

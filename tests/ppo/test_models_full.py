@@ -382,6 +382,18 @@ def test_lora_validation_is_sharded_across_ranks_and_matches_one_process(tmp_pat
     assert rank1["metrics"] == pytest.approx(single)
 
 
+@pytest.mark.slow
+def test_full_vllm_validation_is_sharded_so_per_rank_engines_cannot_disagree(tmp_path: Path) -> None:
+    """vLLM engines are independent per rank; validation must shard and all-reduce, not compare."""
+    rank0, rank1 = _run_two_ranks_per_rank("full_vllm_validate", tmp_path)
+    assert (rank0["seen"], rank1["seen"]) == (4, 3)  # each rank generates only its slice (rank::2)
+    # rank 0's slice (0, 2, 4, 6) hits at 0 and 4; rank 1 answers w4 on its 3 rows: 5 of 7.
+    for result in (rank0, rank1):
+        assert result["message"] == ""
+        assert result["metrics"]["val/ndcg_normal"] == pytest.approx(5 / 7)
+        assert result["metrics"]["val/ndcg_count_once"] == pytest.approx(5 / 7)
+
+
 def test_assert_params_equal_raises_on_mismatch_and_broadcast_fixes_it(tmp_path: Path) -> None:
     results = _run_two_ranks_per_rank("assert_params", tmp_path)
     assert [r["message"] for r in results] == ["ranks hold different values for parameters at indices [0] (of 2)"] * 2

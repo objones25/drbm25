@@ -570,8 +570,9 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
                 if dist.rank == 0:
                     _log_step(run, run_dir, step, metrics, trainer.histograms())
                 if state.step % cfg.run.val_every == 0 or state.step == cfg.run.total_steps:
-                    # Every rank validates (a collective: LoRA shards the queries, FSDP needs every rank
-                    # in each forward) and gets the same scores; run is None off rank 0, so only rank 0 logs.
+                    # Every rank validates (a collective: per-rank generation -- LoRA or vLLM -- shards the
+                    # queries, FSDP + hf generate needs every rank in each forward) and gets the same reduced
+                    # scores; run is None off rank 0, so only rank 0 logs.
                     scores = _validate(run, trainer, val, step)
                     selection.update(scores, step=state.step, layout=layout, dist=dist)
                 if state.step % cfg.run.ckpt_every == 0:

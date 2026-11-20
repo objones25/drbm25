@@ -151,6 +151,49 @@ def lora_validate(dist: DistInfo) -> tuple[dict[str, float], int]:
     return trainer.validate(val_examples()), engine.seen
 
 
+class PerRankEngine(EchoW4Engine):
+    """Rank 0 echoes like ``EchoW4Engine``; rank 1 always answers ``w4``: valid rewrites that differ per rank.
+
+    Models independent per-rank vLLM engines whose greedy output is not bit-identical across instances.
+    """
+
+    def __init__(self, rank: int) -> None:
+        super().__init__()
+        self._rank = rank
+
+    def generate(self, prompts: Sequence[str], *, greedy: bool) -> RolloutBatch:
+        if self._rank == 0:
+            return super().generate(prompts, greedy=greedy)
+        self.seen += len(prompts)
+        texts = tuple('</think>\n<answer>{"query": "w4"}</answer>' for _ in prompts)
+        z = torch.zeros(len(prompts), 1, dtype=torch.long)
+        return RolloutBatch(z, z, z, z, texts, torch.zeros(len(prompts), dtype=torch.bool))
+
+
+def full_vllm_validate(mesh: DeviceMesh, dist: DistInfo) -> tuple[dict[str, float], int, str]:
+    """Full-layout ``validate`` with ``rollout.backend: vllm`` and per-rank engines that disagree.
+
+    Returns the metrics, the prompts this rank generated, and the message (empty if none) of the
+    best-policy consistency check run on the validation score, as ``train`` does.
+    """
+    import drbm25.train as train_module
+
+    cfg = load_config(SMOKE, {"model.train_mode": "full", "rollout.backend": "vllm"})
+    cfg = dataclasses.replace(cfg, lora=None)
+    engine = PerRankEngine(dist.rank)
+    trainer = PPOTrainer(
+        cfg, models=build_models(mesh), engine=engine, searcher=HitSearcher(), reward_mode="normal", dist=dist,
+        scaler=None,
+    )  # fmt: skip
+    metrics = trainer.validate(val_examples())
+    try:
+        train_module._check_same_on_all_ranks([metrics["val/ndcg_normal"]], dist)  # pyright: ignore[reportPrivateUsage]
+        message = ""
+    except RuntimeError as exc:
+        message = str(exc)
+    return metrics, engine.seen, message
+
+
 def ppo_step(mesh: DeviceMesh, dist: DistInfo, cfg: Config) -> tuple[FullPolicyModels, dict[str, float]]:
     """One PPOTrainer step on the full layout; every rank gets the same 2 examples."""
     torch.manual_seed(0)
@@ -295,6 +338,11 @@ def case_lora_validate(rank: int, mesh: DeviceMesh, out: Path) -> None:
     torch.save({"metrics": metrics, "seen": seen}, out / f"result_rank{rank}.pt")
 
 
+def case_full_vllm_validate(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    metrics, seen, message = full_vllm_validate(mesh, DistInfo(rank, WORLD, rank, CPU))
+    torch.save({"metrics": metrics, "seen": seen, "message": message}, out / f"result_rank{rank}.pt")
+
+
 def case_assert_params(rank: int, mesh: DeviceMesh, out: Path) -> None:
     """assert_params_equal raises on different values and passes after broadcast_params."""
     del mesh
@@ -352,6 +400,7 @@ CASES: Final = {
     "lora_init": case_lora_init,
     "lora_init_construction": case_lora_init_construction,
     "lora_validate": case_lora_validate,
+    "full_vllm_validate": case_full_vllm_validate,
 }
 
 
