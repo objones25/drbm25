@@ -78,6 +78,52 @@ def test_prepare_failed_build_leaves_no_index(cfg: Config, fake_download: Any, m
     assert not cfg.retrieval.index_dir.exists()
 
 
+def _info_path(cfg: Config) -> Path:
+    return cfg.retrieval.index_dir / "INDEX_INFO.json"
+
+
+@pytest.mark.java
+def test_prepare_crash_before_move_leaves_no_index_dir(
+    cfg: Config, fake_download: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_a: object, **_k: object) -> None:
+        raise RuntimeError("crash while writing info")
+
+    monkeypatch.setattr(prepare_mod, "_write_index_info", boom)
+    with pytest.raises(RuntimeError, match="crash while writing info"):
+        prepare(cfg, expected_docs=TOY_DOCS)
+    assert not cfg.retrieval.index_dir.exists()
+
+
+@pytest.mark.java
+def test_prepare_index_dir_always_has_info(cfg: Config, fake_download: Any) -> None:
+    prepare(cfg, expected_docs=TOY_DOCS)
+    assert _info_path(cfg).is_file()
+    assert not list(cfg.retrieval.index_dir.glob("*.tmp"))
+
+
+@pytest.mark.java
+def test_prepare_rejects_index_missing_info(cfg: Config, fake_download: Any) -> None:
+    prepare(cfg, expected_docs=TOY_DOCS)
+    _info_path(cfg).unlink()
+    with pytest.raises(ValueError, match=r"no INDEX_INFO\.json"):
+        prepare(cfg, expected_docs=TOY_DOCS)
+
+
+@pytest.mark.java
+@pytest.mark.parametrize(
+    ("field", "bad_value"), [("n_docs", 99), ("checksum", "deadbeef"), ("hf_revision", "other-rev")]
+)
+def test_prepare_rejects_mismatched_info(cfg: Config, fake_download: Any, field: str, bad_value: object) -> None:
+    prepare(cfg, expected_docs=TOY_DOCS)
+    record = json.loads(_info_path(cfg).read_text(encoding="utf-8"))
+    good = record[field]
+    record[field] = bad_value
+    _info_path(cfg).write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(ValueError, match=rf"{field} mismatch: recorded {bad_value!r}, expected {good!r}"):
+        prepare(cfg, expected_docs=TOY_DOCS)
+
+
 @pytest.mark.integration
 @pytest.mark.java
 def test_prepare_real_800k_index() -> None:
