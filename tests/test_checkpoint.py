@@ -9,13 +9,20 @@ import pytest
 import torch
 from torch import nn
 
+import drbm25.checkpoint as checkpoint_module
 from drbm25.checkpoint import (
+    BestMeta,
     LoadedCheckpoint,
     TrainState,
+    best_meta,
     capture_rng,
+    is_best_dir,
     latest_checkpoint,
+    load_best,
     load_checkpoint,
+    recover_best,
     restore_rng,
+    save_best,
     save_checkpoint,
 )
 
@@ -339,3 +346,123 @@ def test_checkpoint_without_reward_mode_is_rejected(tmp_path: Path) -> None:
     meta_path.write_text(json.dumps(meta))
     with pytest.raises(ValueError, match="reward_mode"):
         load_checkpoint(path)
+
+
+# --------------------------------------------------------------------------- best/ (the selected policy)
+def _best_meta(step: int, *, normal: float = 0.3, count_once: float = 0.2) -> BestMeta:
+    return BestMeta(
+        step=step,
+        val_ndcg_normal=normal,
+        val_ndcg_count_once=count_once,
+        reward_mode="normal",
+        layout="lora",
+        config_sha256="ab" * 32,
+        seeds={"run_seed": 1234, "split_seed": 1234},
+    )
+
+
+def _weights(value: float) -> dict[str, torch.Tensor]:
+    return {"layer.lora_A.actor.weight": torch.full((2, 3), value), "layer.lora_B.actor.weight": torch.zeros(3, 2)}
+
+
+def test_best_round_trips_weights_and_meta(tmp_path: Path) -> None:
+    path = save_best(tmp_path, weights=_weights(1.5), meta=_best_meta(100, normal=0.5))
+    assert path == tmp_path / "best"
+    assert is_best_dir(path)
+    meta, weights = load_best(path)
+    assert meta == _best_meta(100, normal=0.5)
+    assert meta.selection_metric == "val/ndcg_normal"
+    assert meta.score == pytest.approx(0.5)
+    torch.testing.assert_close(weights, _weights(1.5), rtol=0, atol=0)
+    on_disk = json.loads((path / "meta.json").read_text())
+    assert on_disk["format_version"] == 1
+    assert on_disk["selection_metric"] == "val/ndcg_normal"
+    assert {"step", "val_ndcg_normal", "val_ndcg_count_once", "reward_mode", "config_sha256", "seeds"} <= on_disk.keys()
+
+
+def test_best_score_is_the_runs_own_reward_mode_metric() -> None:
+    meta = BestMeta(
+        step=1,
+        val_ndcg_normal=0.1,
+        val_ndcg_count_once=0.9,
+        reward_mode="count_once",
+        layout="full",
+        config_sha256="0" * 64,
+        seeds={},
+    )
+    assert meta.selection_metric == "val/ndcg_count_once"
+    assert meta.score == pytest.approx(0.9)
+
+
+def test_best_meta_is_none_without_a_best_dir(tmp_path: Path) -> None:
+    assert best_meta(tmp_path) is None
+    assert best_meta(tmp_path / "missing") is None
+    assert not is_best_dir(tmp_path)
+
+
+def test_resaving_best_replaces_it(tmp_path: Path) -> None:
+    save_best(tmp_path, weights=_weights(1.0), meta=_best_meta(50))
+    save_best(tmp_path, weights=_weights(2.0), meta=_best_meta(100))
+    found = best_meta(tmp_path)
+    assert found is not None
+    assert found.step == 100
+    torch.testing.assert_close(load_best(tmp_path / "best")[1], _weights(2.0), rtol=0, atol=0)
+    assert list(tmp_path.glob(".tmp-*")) == []
+
+
+def test_crash_while_writing_best_keeps_the_previous_best(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    save_best(tmp_path, weights=_weights(1.0), meta=_best_meta(50))
+
+    def crash(*_: object, **__: object) -> None:
+        raise OSError("simulated crash")
+
+    monkeypatch.setattr(checkpoint_module, "save_file", crash)
+    with pytest.raises(OSError, match="simulated crash"):
+        save_best(tmp_path, weights=_weights(2.0), meta=_best_meta(100))
+    monkeypatch.undo()
+    meta, weights = load_best(tmp_path / "best")
+    assert meta.step == 50
+    torch.testing.assert_close(weights, _weights(1.0), rtol=0, atol=0)
+
+
+def test_crash_between_move_aside_and_swap_leaves_the_previous_best_recoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_best(tmp_path, weights=_weights(1.0), meta=_best_meta(50))
+    monkeypatch.setattr(os, "replace", _replace_crashing_into(tmp_path / "best"))
+    with pytest.raises(OSError, match="simulated crash"):
+        save_best(tmp_path, weights=_weights(2.0), meta=_best_meta(100))
+    monkeypatch.undo()
+
+    assert recover_best(tmp_path) is True  # what training does at startup, before sweeping .tmp-*
+    meta, weights = load_best(tmp_path / "best")
+    assert meta.step == 50
+    torch.testing.assert_close(weights, _weights(1.0), rtol=0, atol=0)
+
+
+def test_recover_best_is_a_noop_when_best_is_complete(tmp_path: Path) -> None:
+    save_best(tmp_path, weights=_weights(1.0), meta=_best_meta(50))
+    stale = tmp_path / ".tmp-old-best-999"
+    shutil.copytree(tmp_path / "best", stale)
+    assert recover_best(tmp_path) is False
+    found = best_meta(tmp_path)
+    assert found is not None
+    assert found.step == 50
+
+
+def test_load_best_rejects_a_step_checkpoint(tmp_path: Path) -> None:
+    path = _save(tmp_path, 50)
+    assert not is_best_dir(path)
+    with pytest.raises(ValueError, match="not a best"):
+        load_best(path)
+
+
+def test_keep_one_leaves_one_step_dir_and_never_touches_best(tmp_path: Path) -> None:
+    save_best(tmp_path, weights=_weights(1.0), meta=_best_meta(50))
+    for step in (50, 100, 150, 200):
+        _save(tmp_path, step, keep=1)
+    assert sorted(p.name for p in tmp_path.glob("step_*")) == ["step_000200"]
+    found = best_meta(tmp_path)
+    assert found is not None
+    assert found.step == 50
+    torch.testing.assert_close(load_best(tmp_path / "best")[1], _weights(1.0), rtol=0, atol=0)

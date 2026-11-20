@@ -9,10 +9,17 @@ writes the code to ``output_dir/run_name/exit_code``; launchers read that file t
 budget stop (3) from a failure. The file holds 0 done, 3 budget stop, 2 ended by an exception,
 and 1 when the run started and never finished (killed by OOM, a Slurm time limit, teardown).
 
-Run directory ``output_dir/run_name/``: ``step_NNNNNN/`` checkpoints, ``metrics.jsonl``
-(rank 0, one JSON object of floats per step, read by ``scripts/spike_monitor.py``),
-``train_rank{R}.log`` (JSON log lines per rank, including each step's global batch indices),
-``exit_code``.
+Run directory ``output_dir/run_name/``: ``step_NNNNNN/`` resume checkpoints (``run.keep_ckpts``
+of them), ``best/`` (the policy with the highest validation score so far, see below),
+``run_manifest.json`` (every seed, the resolved config and its sha256, versions; see
+``drbm25.manifest``), ``metrics.jsonl`` (rank 0, one JSON object of floats per step, read by
+``scripts/spike_monitor.py``), ``train_rank{R}.log`` (JSON log lines per rank, including each
+step's global batch indices), ``exit_code``.
+
+Best policy: every ``run.val_every`` steps and at ``run.total_steps`` the actor is validated
+(greedy, nDCG@10 under both modes) on ``data.val_size`` train queries held out of training. When
+``val/ndcg_<reward_mode>`` strictly beats the stored best, ``best/`` is replaced atomically (ties
+keep the earlier step). A resume restores the best-so-far score from ``best/meta.json``.
 
 Layouts (``model.train_mode``): ``lora`` (V100) -- LoRA actor/critic adapters on one frozen
 base, checkpoints written by rank 0; ``full`` (A100) -- FSDP2-sharded fp32 actor and critic plus
@@ -35,6 +42,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, Literal, get_args
 
@@ -52,18 +60,32 @@ from drbm25.bm25.index import read_index_info
 from drbm25.bm25.searcher import Bm25Searcher
 from drbm25.budget import should_stop
 from drbm25.checkpoint import (
+    BestMeta,
     LoadedCheckpoint,
     TrainState,
+    best_meta,
     latest_checkpoint,
     load_checkpoint,
     load_sharded_checkpoint,
+    recover_best,
     restore_rng,
+    save_best,
     save_checkpoint,
     save_sharded_checkpoint,
 )
 from drbm25.config import Config, ConfigError, LoraCfg, ScoringMode, load_config, validate_for_runtime
 from drbm25.data import TRAIN_FILE, Example, batch_indices, load_examples, split_train
 from drbm25.distributed import DistInfo, assert_params_equal, broadcast_params, init_distributed
+from drbm25.manifest import (
+    build_manifest,
+    check_seeds_unchanged,
+    collect_environment,
+    config_sha256,
+    read_manifest,
+    seeds,
+    update_manifest,
+    write_manifest,
+)
 from drbm25.obs import configure
 from drbm25.obs.context import bind_log_context
 from drbm25.obs.runs import STEP_METRIC, open_run
@@ -88,7 +110,6 @@ TINY_MODEL: Final = "tiny-local"
 REQUIRED_JAVA_MAJOR: Final = 21
 CALIBRATION_STEPS: Final = 10
 _JAVA_TIMEOUT_S: Final = 30.0
-_GIT_TIMEOUT_S: Final = 10.0
 _RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _JAVA_VERSION = re.compile(r'version "(\d+)')
 _TMP_PREFIX = ".tmp-"
@@ -277,22 +298,6 @@ def _sweep_stale_tmp(run_dir: Path) -> None:
         logger.info("removed stale checkpoint temp %s", path)
 
 
-def _git_sha() -> str | None:
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],  # noqa: S607 -- git from PATH is intended
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_S,
-            check=True,
-            cwd=Path(__file__).resolve().parent,
-        )
-    except (OSError, subprocess.SubprocessError):
-        logger.warning("git SHA unavailable; W&B config records null", exc_info=True)
-        return None
-    return proc.stdout.strip()
-
-
 def _seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -429,7 +434,11 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
     check_cuda_arch(dist.device)
     check_java()
     index_checksum = check_index(cfg)
+    previous_manifest = read_manifest(run_dir)
+    check_seeds_unchanged(previous_manifest, seeds(cfg, world_size=dist.world_size))  # every rank: fail together
     if dist.rank == 0:
+        if recover_best(run_dir):  # before the sweep, which would delete the moved-aside best
+            logger.warning("restored best/ that a crash had left moved aside")
         _sweep_stale_tmp(run_dir)
     if dist.world_size > 1:
         tdist.barrier()
@@ -467,6 +476,11 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
         state = ckpt.train_state
         last_saved = state.step
         logger.info("resumed from %s at step %d (cursor %d)", ckpt_path, state.step, state.data_cursor)
+    best = best_meta(run_dir)
+    if best is not None:
+        if best.reward_mode != args.reward_mode:
+            raise ValueError(f"{run_dir}/best was selected for reward_mode {best.reward_mode!r}, not {args.reward_mode!r}")
+        logger.info("best so far: step %d, %s = %.4f", best.step, best.selection_metric, best.score)
 
     # vLLM starts from the checkpoint on disk; after a resume the actor differs. A no-op for HF.
     engine.sync_weights(models)
@@ -474,13 +488,27 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
     until = cfg.run.total_steps if args.until_step is None else min(args.until_step, cfg.run.total_steps)
     local = cfg.ppo.batch_size // dist.world_size
     budget = _Budget(args.deadline_unix, args.reserve_s, cfg.run.ckpt_every, [])
-    extra: dict[str, object] = {
-        "git_sha": _git_sha(),
-        "index_checksum": index_checksum,
-        "dataset_revision": cfg.data.hf_revision,
-        "world_size": dist.world_size,
-        "reward_mode": args.reward_mode,
-    }
+    selection = _Selection(
+        run_dir=run_dir,
+        reward_mode=args.reward_mode,
+        config_sha256=config_sha256(cfg),
+        seeds=seeds(cfg, world_size=dist.world_size),
+        best=best,
+    )
+    extra: dict[str, object] = {}
+    if dist.rank == 0:
+        manifest = build_manifest(
+            cfg,
+            run_name=args.run_name,
+            reward_mode=args.reward_mode,
+            world_size=dist.world_size,
+            index_checksum=index_checksum,
+            env=collect_environment(),
+            started_utc=datetime.now(UTC),
+        )
+        manifest = update_manifest(previous_manifest, manifest, step=state.step)
+        write_manifest(run_dir, manifest)
+        extra = manifest  # the same dict goes to W&B config["meta"]
 
     def save() -> None:
         nonlocal last_saved
@@ -530,10 +558,13 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
                             logger.info("projected steps within budget: %.0f", metrics["budget/projected_steps"])
                 if dist.rank == 0:
                     _log_step(run, run_dir, step, metrics, trainer.histograms())
-                # On the full layout every actor forward is an FSDP collective, so all ranks must
-                # generate the validation rollouts (run is None off rank 0, so only rank 0 logs).
-                if state.step % cfg.run.val_every == 0 and (dist.rank == 0 or layout.full is not None):
-                    _validate(run, trainer, val, step)
+                if state.step % cfg.run.val_every == 0 or state.step == cfg.run.total_steps:
+                    # On the full layout every actor forward is an FSDP collective, so all ranks must
+                    # generate the validation rollouts (run is None off rank 0, so only rank 0 logs).
+                    scores = None
+                    if dist.rank == 0 or layout.full is not None:
+                        scores = _validate(run, trainer, val, step)
+                    selection.update(scores, step=state.step, layout=layout, dist=dist)
                 if state.step % cfg.run.ckpt_every == 0:
                     save()
                     if _broadcast_flag(budget.stop(), dist):
@@ -562,6 +593,54 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
                 log_checkpoint(run, adapters, name=f"{args.run_name}-adapters", artifact_type="model")
             _alert(run, f"{args.run_name}: finished", f"reached step {state.step}", "INFO")
     return exit_code
+
+
+@dataclass
+class _Selection:
+    """Best-policy tracking on the validation split (``best`` is meaningful on rank 0)."""
+
+    run_dir: Path
+    reward_mode: ScoringMode
+    config_sha256: str
+    seeds: dict[str, object]
+    best: BestMeta | None
+
+    def update(self, scores: dict[str, float] | None, *, step: int, layout: Layout, dist: DistInfo) -> None:
+        """Replace ``best/`` when rank 0's score strictly beats the stored best; a collective on every rank.
+
+        ``scores`` holds ``val/ndcg_normal`` and ``val/ndcg_count_once`` on every rank that validated
+        (rank 0 always). Rank 0 decides and broadcasts; on the full layout every rank joins the gather.
+        """
+        candidate: BestMeta | None = None
+        if dist.rank == 0:
+            if scores is None:
+                raise RuntimeError("rank 0 must validate before the best-policy decision")
+            candidate = BestMeta(
+                step=step,
+                val_ndcg_normal=scores["val/ndcg_normal"],
+                val_ndcg_count_once=scores["val/ndcg_count_once"],
+                reward_mode=self.reward_mode,
+                layout="full" if layout.full is not None else "lora",
+                config_sha256=self.config_sha256,
+                seeds=self.seeds,
+            )
+        improved = candidate is not None and (self.best is None or candidate.score > self.best.score)
+        if not _broadcast_flag(improved, dist):
+            return
+        weights: dict[str, torch.Tensor] = {}
+        if layout.full is not None:
+            # A collective; to host memory so the GPU holds one gathered tensor at a time.
+            weights = layout.full.merged_actor_state_dict(device=torch.device("cpu"))
+        elif dist.rank == 0:
+            if not isinstance(layout.models, LoraPolicyModels):
+                raise TypeError(f"the lora layout needs LoraPolicyModels, got {type(layout.models).__name__}")
+            weights = layout.models.actor_state_dict()
+        if candidate is not None:
+            save_best(self.run_dir, weights=weights, meta=candidate)
+            logger.info("new best: step %d, %s = %.4f", step, candidate.selection_metric, candidate.score)
+            self.best = candidate
+        if dist.world_size > 1:
+            tdist.barrier()
 
 
 def _load_resume_state(path: Path, layout: Layout, trainer: PPOTrainer) -> LoadedCheckpoint:
@@ -595,17 +674,19 @@ def _log_step(
         run.log({**metrics, **hists, STEP_METRIC: step})
 
 
-def _validate(run: wandb.Run | None, trainer: PPOTrainer, val: Sequence[Example], step: int) -> None:
+def _validate(run: wandb.Run | None, trainer: PPOTrainer, val: Sequence[Example], step: int) -> dict[str, float]:
+    """Greedy validation under both modes; logs to W&B on rank 0 and returns the ``val/*`` metrics."""
     metrics, samples = trainer.validate_with_samples(val)
     logger.info(
         "validation ndcg normal=%.4f count_once=%.4f", metrics["val/ndcg_normal"], metrics["val/ndcg_count_once"]
     )
     if run is None:
-        return
+        return metrics
     table = wandb.Table(columns=["query", "rewrite", "analyzed_terms", "reward_normal", "reward_count_once"])
     for s in samples:
         table.add_data(s.query, s.rewrite, s.analyzed_terms, s.reward_normal, s.reward_count_once)
     run.log({**metrics, "samples": table, STEP_METRIC: step})
+    return metrics
 
 
 def main(argv: Sequence[str] | None = None) -> int:

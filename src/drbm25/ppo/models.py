@@ -307,6 +307,27 @@ class LoraPolicyModels:
             for name, p in params.items():
                 p.copy_(state[name])
 
+    def _named_actor(self) -> dict[str, nn.Parameter]:
+        actor = {id(p) for p in self._actor}
+        return {name: p for name, p in self._base.named_parameters() if id(p) in actor}
+
+    def actor_state_dict(self) -> dict[str, Tensor]:
+        """Detached copies of the actor adapter only (the selected policy; no critic, no value head)."""
+        return {name: p.detach().clone() for name, p in self._named_actor().items()}
+
+    def load_actor_state_dict(self, state: Mapping[str, Tensor]) -> None:
+        """Inverse of :meth:`actor_state_dict`; the critic and value head are left as they are."""
+        params = self._named_actor()
+        missing, unexpected = sorted(params.keys() - state.keys()), sorted(state.keys() - params.keys())
+        if missing or unexpected:
+            raise KeyError(f"actor state mismatch: missing={missing} unexpected={unexpected}")
+        for name, p in params.items():
+            if state[name].shape != p.shape:
+                raise ValueError(f"{name}: expected shape {tuple(p.shape)}, got {tuple(state[name].shape)}")
+        with torch.no_grad():
+            for name, p in params.items():
+                p.copy_(state[name])
+
     def decoder_layers(self) -> Sequence[nn.Module]:
         layers = self._base.get_decoder().layers
         if not isinstance(layers, nn.ModuleList):

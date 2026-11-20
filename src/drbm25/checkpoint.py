@@ -24,6 +24,20 @@ renamed into place with ``os.replace`` and the parent directory is fsynced; only
 Sharded checkpoints use the same temp-dir / ``meta.json``-last / move-aside / ``latest`` protocol;
 every rank writes its DCP shard into the shared temp dir and rank 0 alone publishes it.
 
+The policy selected on the validation set is kept apart from the resume checkpoints, so pruning
+(``keep``) never touches it::
+
+      best/
+        model.safetensors         actor weights only: LoRA actor adapter (lora layout) or the full
+                                  actor with HF names in the compute dtype (full layout)
+        meta.json                 kind "best", step, both val nDCG@10s, selection metric, reward mode,
+                                  layout, config sha256, seeds, format_version (written last)
+
+``save_best`` builds ``.tmp-best-<pid>/``, moves the old ``best/`` aside to ``.tmp-old-best-<pid>/``
+and renames the new one into place. A crash between those two renames leaves no ``best/``; the
+previous one is then still complete under ``.tmp-old-best-*`` and ``recover_best`` (run at
+training startup, before stale temps are swept) puts it back.
+
 ``save_checkpoint`` is rank-agnostic: in a multi-process run the caller must call it on rank 0
 only. ``numpy.random.Generator`` objects are not captured (they are not global state); keep the
 data order reproducible through ``TrainState.data_cursor`` and a seed instead.
@@ -62,6 +76,10 @@ _LAYOUT_SHARDED = "sharded"
 _ACTOR_MODEL_PREFIX = "actor.model."  # FullPolicyModels.sharded_state()["actor"]["model"], flattened by DCP
 _STEP_PREFIX = "step_"
 _TMP_PREFIX = ".tmp-"
+BEST_DIR = "best"
+_BEST_KIND = "best"
+_OLD_BEST_PREFIX = f"{_TMP_PREFIX}old-{BEST_DIR}-"
+BestLayout = Literal["lora", "full"]
 
 
 @dataclass(frozen=True)
@@ -450,3 +468,128 @@ def load_sharded_actor(path: Path, model: nn.Module) -> TrainState:
         warnings.filterwarnings("ignore", message="torch.distributed is disabled", category=UserWarning)
         dcp_load({"actor": {"model": own}}, checkpoint_id=path / _DCP_DIR, no_dist=True)
     return train_state
+
+
+
+# ---------------------------------------------------------------------------- best/
+@dataclass(frozen=True)
+class BestMeta:
+    """What ``best/meta.json`` records about the selected policy."""
+
+    step: int
+    val_ndcg_normal: float
+    val_ndcg_count_once: float
+    reward_mode: ScoringMode
+    layout: BestLayout
+    config_sha256: str
+    seeds: dict[str, Any]
+
+    @property
+    def selection_metric(self) -> str:
+        """The run's own reward as a validation metric: ``val/ndcg_<reward_mode>``."""
+        return f"val/ndcg_{self.reward_mode}"
+
+    @property
+    def score(self) -> float:
+        return self.val_ndcg_normal if self.reward_mode == "normal" else self.val_ndcg_count_once
+
+
+def _best_meta_json(meta: BestMeta) -> dict[str, object]:
+    return {
+        "kind": _BEST_KIND,
+        "format_version": FORMAT_VERSION,
+        "step": meta.step,
+        "val_ndcg_normal": meta.val_ndcg_normal,
+        "val_ndcg_count_once": meta.val_ndcg_count_once,
+        "selection_metric": meta.selection_metric,
+        "reward_mode": meta.reward_mode,
+        "layout": meta.layout,
+        "config_sha256": meta.config_sha256,
+        "seeds": meta.seeds,
+    }
+
+
+def is_best_dir(path: Path) -> bool:
+    """True for a complete ``best/`` dir (its ``meta.json`` says ``kind: best``)."""
+    meta_path = path / _META_FILE
+    if not meta_path.is_file():
+        return False
+    return json.loads(meta_path.read_text()).get("kind") == _BEST_KIND
+
+
+def _read_best_meta(path: Path) -> BestMeta:
+    if not is_best_dir(path):
+        raise ValueError(f"{path} is not a best/ dir (no meta.json with kind 'best')")
+    raw = json.loads((path / _META_FILE).read_text())
+    if raw.get("format_version") != FORMAT_VERSION:
+        raise ValueError(f"{path}: unsupported best format_version {raw.get('format_version')!r}")
+    if raw["reward_mode"] not in get_args(ScoringMode) or raw["layout"] not in get_args(BestLayout):
+        raise ValueError(f"{path}: bad reward_mode {raw['reward_mode']!r} or layout {raw['layout']!r}")
+    return BestMeta(
+        step=raw["step"],
+        val_ndcg_normal=raw["val_ndcg_normal"],
+        val_ndcg_count_once=raw["val_ndcg_count_once"],
+        reward_mode=raw["reward_mode"],
+        layout=raw["layout"],
+        config_sha256=raw["config_sha256"],
+        seeds=raw["seeds"],
+    )
+
+
+def best_meta(run_dir: Path) -> BestMeta | None:
+    """``run_dir/best``'s metadata, or None when the run has no best policy yet."""
+    path = run_dir / BEST_DIR
+    return _read_best_meta(path) if is_best_dir(path) else None
+
+
+def load_best(path: Path) -> tuple[BestMeta, dict[str, Tensor]]:
+    """The metadata and actor weights (on CPU) of a ``best/`` dir."""
+    meta = _read_best_meta(path)
+    return meta, load_file(str(path / _MODEL_FILE), device="cpu")
+
+
+def save_best(run_dir: Path, *, weights: Mapping[str, Tensor], meta: BestMeta) -> Path:
+    """Atomically replace ``run_dir/best`` with ``weights`` and ``meta``. Rank-agnostic: call on rank 0 only."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    tmp = run_dir / f"{_TMP_PREFIX}{BEST_DIR}-{os.getpid()}"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir()
+    try:
+        save_file({k: _portable(v) for k, v in weights.items()}, str(tmp / _MODEL_FILE))
+        (tmp / _META_FILE).write_text(json.dumps(_best_meta_json(meta)))
+        for name in (_MODEL_FILE, _META_FILE):
+            _fsync_path(tmp / name)
+        _fsync_dir(tmp)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    final = run_dir / BEST_DIR
+    old = run_dir / f"{_OLD_BEST_PREFIX}{os.getpid()}"
+    if old.exists():
+        shutil.rmtree(old)
+    if final.exists():
+        os.replace(final, old)
+    os.replace(tmp, final)
+    _fsync_dir(run_dir)
+    if old.exists():
+        shutil.rmtree(old)
+    return final
+
+
+def recover_best(run_dir: Path) -> bool:
+    """Put back a best/ that a crash left moved aside; True if one was restored.
+
+    Call before stale ``.tmp-*`` dirs are swept. With a complete ``best/`` in place this does nothing.
+    """
+    if is_best_dir(run_dir / BEST_DIR) or not run_dir.is_dir():
+        return False
+    aside = sorted(p for p in run_dir.glob(f"{_OLD_BEST_PREFIX}*") if is_best_dir(p))
+    if not aside:
+        return False
+    final = run_dir / BEST_DIR
+    if final.exists():  # an incomplete leftover: never a usable best
+        shutil.rmtree(final)
+    os.replace(aside[-1], final)
+    _fsync_dir(run_dir)
+    return True

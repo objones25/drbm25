@@ -13,17 +13,19 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
 import yaml
 
 import drbm25.train as train_module
 import wandb
 from drbm25.bm25.index import read_index_info
+from drbm25.checkpoint import load_best, load_sharded_actor
 from drbm25.config import load_config
 from drbm25.data import DEV_FILE, TRAIN_FILE, Example, load_examples, split_train
 from drbm25.obs.runs import STEP_METRIC
 from drbm25.obs.setup import shutdown
 from drbm25.ppo.trainer import NonFiniteError, PPOTrainer
-from drbm25.tiny import build_tiny_tokenizer
+from drbm25.tiny import build_tiny_qwen2, build_tiny_tokenizer
 from drbm25.train import (
     EXIT_BUDGET,
     EXIT_ERROR,
@@ -508,6 +510,15 @@ def test_cli_full_layout_two_ranks_writes_sharded_checkpoints_and_resumes(workdi
     rows = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()]
     assert [row["step"] for row in rows] == [0, 1, 2]
     assert all(math.isfinite(row["ppo/policy_loss"]) for row in rows)
+    # best/: the full actor (HF names) gathered from both ranks at the validated step, written once.
+    best_meta, best_weights = load_best(run_dir / "best")
+    assert (best_meta.step, best_meta.layout, best_meta.reward_mode) == (2, "full", "normal")
+    actor_at_2 = build_tiny_qwen2(seed=0)
+    load_sharded_actor(run_dir / "step_000002", actor_at_2)
+    expected = actor_at_2.state_dict()
+    assert sorted(best_weights) == sorted(expected)
+    for key, tensor in expected.items():
+        assert torch.equal(best_weights[key], tensor), key
 
 
 @pytest.mark.java
@@ -534,6 +545,158 @@ def test_cli_validates_on_held_out_train_queries_and_never_trains_on_them(
     assert all(q.startswith("train-") for q in validated)  # never dev (the test set)
     assert set(trained).isdisjoint(validated)
     assert len(set(trained)) == N_TRAIN - 4  # 4 steps x 4 = 16 rows: one full epoch of the rest
+
+
+# --------------------------------------------------------------------------- best/ selection
+def _scripted_validation(
+    monkeypatch: pytest.MonkeyPatch, normal: dict[int, float], count_once: dict[int, float]
+) -> list[int]:
+    """Replace validation with fixed scores keyed by completed steps; returns the steps validated."""
+    seen: list[int] = []
+
+    def fake_validate(run: object, trainer: object, val: object, step: int) -> dict[str, float]:
+        done = step + 1
+        seen.append(done)
+        return {"val/ndcg_normal": normal[done], "val/ndcg_count_once": count_once[done]}
+
+    monkeypatch.setattr(train_module, "_validate", fake_validate)
+    return seen
+
+
+def _best(run_dir: Path) -> dict[str, Any]:
+    return json.loads((run_dir / "best" / "meta.json").read_text())
+
+
+@pytest.mark.java
+def test_cli_keeps_the_step_with_the_highest_validation_score(
+    workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A normal-reward run selects on val/ndcg_normal and ignores the count_once score.
+    _scripted_validation(monkeypatch, {1: 0.2, 2: 0.5, 3: 0.4}, {1: 0.9, 2: 0.1, 3: 0.95})
+    argv = _argv(workdir, toy_index, "best", "--until-step", "3", "--set", "run.val_every=1")
+    assert _main(argv) == EXIT_OK
+    meta = _best(workdir / "out" / "best")
+    assert meta["step"] == 2
+    assert meta["val_ndcg_normal"] == pytest.approx(0.5)
+    assert meta["val_ndcg_count_once"] == pytest.approx(0.1)
+    assert meta["selection_metric"] == "val/ndcg_normal"
+    assert meta["reward_mode"] == "normal"
+    assert meta["layout"] == "lora"
+    manifest = json.loads((workdir / "out" / "best" / "run_manifest.json").read_text())
+    assert meta["config_sha256"] == manifest["config_sha256"]
+    assert meta["seeds"] == manifest["seeds"]
+
+
+@pytest.mark.java
+def test_cli_best_tie_keeps_the_earlier_step(workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _scripted_validation(monkeypatch, {1: 0.2, 2: 0.5, 3: 0.5}, {1: 0.0, 2: 0.0, 3: 0.0})
+    assert _main(_argv(workdir, toy_index, "tie", "--until-step", "3", "--set", "run.val_every=1")) == EXIT_OK
+    assert _best(workdir / "out" / "tie")["step"] == 2
+
+
+@pytest.mark.java
+def test_cli_count_once_run_selects_on_its_own_metric(
+    workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _scripted_validation(monkeypatch, {1: 0.9, 2: 0.1, 3: 0.2}, {1: 0.1, 2: 0.3, 3: 0.2})
+    argv = _argv(workdir, toy_index, "co", "--until-step", "3", "--set", "run.val_every=1")
+    argv[argv.index("--reward-mode") + 1] = "count_once"
+    assert _main(argv) == EXIT_OK
+    meta = _best(workdir / "out" / "co")
+    assert (meta["step"], meta["selection_metric"]) == (2, "val/ndcg_count_once")
+
+
+@pytest.mark.java
+def test_cli_validates_at_the_final_step_even_off_the_val_every_grid(
+    workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _scripted_validation(monkeypatch, {2: 0.1, 3: 0.3}, {2: 0.0, 3: 0.0})
+    argv = _argv(workdir, toy_index, "final", "--set", "run.total_steps=3")
+    assert _main(argv) == EXIT_OK
+    assert seen == [2, 3]  # val_every = 2, total_steps = 3
+    assert _best(workdir / "out" / "final")["step"] == 3
+
+
+@pytest.mark.java
+def test_cli_resume_restores_best_so_far_and_a_lower_score_does_not_replace_it(
+    workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _scripted_validation(monkeypatch, {1: 0.2, 2: 0.5}, {1: 0.0, 2: 0.0})
+    assert _main(_argv(workdir, toy_index, "rb", "--until-step", "2", "--set", "run.val_every=1")) == EXIT_OK
+    weights_before = (workdir / "out" / "rb" / "best" / "model.safetensors").read_bytes()
+    seen = _scripted_validation(monkeypatch, {3: 0.4, 4: 0.45}, {3: 0.0, 4: 0.0})
+    assert _main(_argv(workdir, toy_index, "rb", "--until-step", "4", "--set", "run.val_every=1")) == EXIT_OK
+    assert seen == [3, 4]  # resumed at step 2: no re-evaluation of the stored best
+    meta = _best(workdir / "out" / "rb")
+    assert (meta["step"], meta["val_ndcg_normal"]) == (2, pytest.approx(0.5))
+    assert (workdir / "out" / "rb" / "best" / "model.safetensors").read_bytes() == weights_before
+    assert any(str(r["message"]).startswith("best so far") for r in _log_records(workdir / "out" / "rb"))
+
+
+@pytest.mark.java
+def test_cli_best_weights_are_the_actor_adapter_at_the_best_step(
+    workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from safetensors.torch import load_file
+
+    _scripted_validation(monkeypatch, {1: 0.2, 2: 0.5, 3: 0.4}, {1: 0.0, 2: 0.0, 3: 0.0})
+    argv = _argv(
+        workdir, toy_index, "w", "--until-step", "3", "--set", "run.val_every=1", "--set", "run.ckpt_every=1",
+        "--set", "run.keep_ckpts=5",
+    )
+    assert _main(argv) == EXIT_OK
+    run_dir = workdir / "out" / "w"
+    best = load_file(str(run_dir / "best" / "model.safetensors"))
+    at_step = load_file(str(run_dir / "step_000002" / "model.safetensors"))
+    assert len(best) == 28  # tiny model: 2 layers x 7 targets x (A, B)
+    assert all(".actor." in k for k in best)
+    assert sorted(best) == sorted(k for k in at_step if ".lora_" in k and ".actor." in k)
+    for key, tensor in best.items():
+        assert torch.equal(tensor, at_step[key]), key
+    later = load_file(str(run_dir / "step_000003" / "model.safetensors"))
+    assert any(not torch.equal(best[k], later[k]) for k in best)  # step 3 trained further
+
+
+# --------------------------------------------------------------------------- reproducibility manifest
+@pytest.mark.java
+def test_cli_writes_the_manifest_and_sends_it_to_wandb_meta(
+    workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+
+    @contextmanager
+    def fake_open_run(*_: object, **kwargs: Any) -> Iterator[_FakeRun]:
+        captured.update(kwargs["extra_config"])
+        yield _FakeRun()
+
+    monkeypatch.setattr(train_module, "open_run", fake_open_run)
+    assert _main(_argv(workdir, toy_index, "man", "--until-step", "1")) == EXIT_OK
+    manifest = json.loads((workdir / "out" / "man" / "run_manifest.json").read_text())
+    assert manifest["seeds"]["run_seed"] == 1234
+    assert manifest["seeds"]["split_seed"] == 1234
+    assert manifest["seeds"]["sampling_seeds"] == [1234]
+    assert manifest["config"]["data"]["val_size"] == 4
+    assert manifest["index"]["checksum"] == read_index_info(toy_index).checksum
+    assert manifest["effective_micro_batch_size"] == 1
+    assert manifest["versions"]["torch"].startswith("2.10.0")
+    assert manifest["resumed_at"] == []
+    assert captured == manifest
+
+
+@pytest.mark.java
+def test_cli_resume_appends_to_the_manifest_and_refuses_a_changed_seed(workdir: Path, toy_index: Path) -> None:
+    assert _main(_argv(workdir, toy_index, "seeds", "--until-step", "1")) == EXIT_OK
+    run_dir = workdir / "out" / "seeds"
+    first = json.loads((run_dir / "run_manifest.json").read_text())
+    assert _main(_argv(workdir, toy_index, "seeds", "--until-step", "2")) == EXIT_OK
+    second = json.loads((run_dir / "run_manifest.json").read_text())
+    assert second["seeds"] == first["seeds"]
+    assert second["start_time_utc"] == first["start_time_utc"]
+    assert [r["step"] for r in second["resumed_at"]] == [1]
+    assert _main(_argv(workdir, toy_index, "seeds", "--until-step", "3", "--set", "run.seed=99")) == EXIT_ERROR
+    assert (run_dir / "exit_code").read_text().strip() == "2"
+    assert "seed" in _first_error(run_dir)
+    assert json.loads((run_dir / "run_manifest.json").read_text()) == second
 
 
 # --------------------------------------------------------------------------- startup checks

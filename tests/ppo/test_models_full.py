@@ -171,6 +171,12 @@ def test_merged_actor_state_dict_casts_to_compute_dtype(mesh: DeviceMesh) -> Non
     assert {p.dtype for p in models.actor_parameters()} == {torch.float32}
 
 
+def test_merged_actor_state_dict_can_gather_onto_another_device(mesh: DeviceMesh) -> None:
+    # train.py gathers the best policy straight to host memory, one tensor at a time.
+    merged = cases.build_models(mesh).merged_actor_state_dict(device=torch.device("meta"))
+    assert {t.device.type for t in merged.values()} == {"meta"}
+
+
 def test_trainable_state_dict_roundtrip(mesh: DeviceMesh) -> None:
     trained = cases.build_models(mesh, seed=0)
     fresh = cases.build_models(mesh, seed=1)

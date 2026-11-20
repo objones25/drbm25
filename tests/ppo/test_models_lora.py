@@ -256,6 +256,35 @@ def test_load_trainable_state_dict_rejects_shape_mismatch(tiny_qwen2: PreTrained
         policy.load_trainable_state_dict({**state, "value_head.weight": torch.zeros(2, 32)})
 
 
+def test_actor_state_dict_holds_only_actor_lora_weights_and_round_trips(tiny_qwen2: PreTrainedModel) -> None:
+    policy = _policy(tiny_qwen2)
+    ids, mask = _batch()
+    _step(policy.actor_parameters(), lambda: _actor_loss(policy, ids, mask))
+    _step(policy.critic_parameters(), lambda: _critic_loss(policy, ids, mask), steps=2)
+    state = policy.actor_state_dict()
+    assert len(state) == 28  # 2 layers x 7 targets x (A, B)
+    assert all(".actor." in name and ".lora_" in name for name in state)
+
+    fresh = _policy(build_tiny_qwen2(seed=0))
+    fresh.load_actor_state_dict(state)
+    with torch.no_grad():
+        torch.testing.assert_close(fresh.actor_logits(ids, mask), policy.actor_logits(ids, mask), rtol=0, atol=0)
+        # The critic is not part of the export: the fresh one is still at its zero initialisation.
+        torch.testing.assert_close(fresh.critic_values(ids, mask), torch.zeros(B, L))
+
+
+def test_load_actor_state_dict_rejects_missing_unexpected_and_misshapen(tiny_qwen2: PreTrainedModel) -> None:
+    policy = _policy(tiny_qwen2)
+    state = policy.actor_state_dict()
+    first = next(iter(state))
+    with pytest.raises(KeyError, match="missing"):
+        policy.load_actor_state_dict({k: v for k, v in state.items() if k != first})
+    with pytest.raises(KeyError, match=r"unexpected.*value_head"):
+        policy.load_actor_state_dict({**state, "value_head.bias": torch.zeros(1)})
+    with pytest.raises(ValueError, match="shape"):
+        policy.load_actor_state_dict({**state, first: torch.zeros(1)})
+
+
 # --------------------------------------------------------------------------- merged export
 def test_merged_actor_state_dict_reproduces_actor_logits(tiny_qwen2: PreTrainedModel) -> None:
     policy = _policy(tiny_qwen2)

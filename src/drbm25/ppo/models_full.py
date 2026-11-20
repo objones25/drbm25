@@ -186,13 +186,15 @@ class FullPolicyModels:
         """No-op: no adapters are switched, so no backward can read the wrong weights."""
 
     # ------------------------------------------------------------------ state
-    def merged_actor_state_dict(self) -> dict[str, Tensor]:
-        """The full actor, in ``compute_dtype`` on the actor's device, named as the plain HF model.
+    def merged_actor_state_dict(self, *, device: torch.device | None = None) -> dict[str, Tensor]:
+        """The full actor, in ``compute_dtype``, named as the plain HF model.
 
-        A collective (one all-gather per tensor): call on every rank. Peak extra memory is one
-        full actor copy in ``compute_dtype`` (6.2 GB at 3B bf16).
+        A collective (one all-gather per tensor): call on every rank. The tensors land on
+        ``device`` (default: the actor's device). On the actor's device the peak extra memory is
+        one full actor copy in ``compute_dtype`` (6.2 GB at 3B bf16); with ``device=cpu`` the GPU
+        holds one gathered tensor at a time and the copy is in host memory.
         """
-        return _gather(self._actor, self._compute_dtype, None)
+        return _gather(self._actor, self._compute_dtype, device)
 
     def trainable_state_dict(self) -> dict[str, Tensor]:
         """Full fp32 copies of actor and critic on CPU, keyed ``actor.<name>`` / ``critic.<name>``.
