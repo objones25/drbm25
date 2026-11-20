@@ -205,56 +205,104 @@ uv run pytest -m gpu tests/rollout/test_vllm_engine.py   # vLLM greedy == HF, we
 
 Do not set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: vLLM's sleep mode refuses it.
 
-## RunPod one-shot launcher (A100 fallback)
+## RunPod launcher (A100 fallback)
 
-`scripts/runpod/run_all.sh` runs the whole experiment on a fresh 2x A100 80GB pod, alone: it prompts for the
-keys, installs everything, trains the `normal` and `count_once` runs in alternating chunks within a dollar
-budget, evaluates, writes the report and terminates the pod (also after a fatal error, a closed terminal or Ctrl-C).
+One command on your own machine starts the whole experiment on a new 2x A100 80GB pod and returns; the pod
+clones this (public) repository and runs `scripts/runpod/run_all.sh` unattended. It trains the `normal` and
+`count_once` runs in alternating chunks within a dollar budget, evaluates, writes the report and terminates
+itself (also after a fatal error). The network volume `drbm25` keeps everything between pods.
+
+### Prerequisites
+
+- bash 3.2+ (macOS `/bin/bash` is fine), curl 7.55+, `jq` (macOS 15 and later ship `/usr/bin/jq`; otherwise
+  `brew install jq`), git, and a checkout of this repository whose HEAD is pushed (or pass `--ref`).
+- A RunPod API key allowed to read the catalog, list and create network volumes, pods and secrets, and
+  terminate pods (`pods:write`). The pod uses the same key, stored as a RunPod secret, to terminate itself.
+- A Hugging Face token and a Weights & Biases API key.
+
+### Launch
+
+```bash
+bash scripts/runpod/launch.sh
+```
+
+It asks (hidden for keys; anything already set in the environment is not asked) for `RUNPOD_API_KEY`,
+`HF_TOKEN`, `WANDB_API_KEY`, `WANDB_PROJECT` (default `drbm25`), `WANDB_ENTITY` (optional) and `BUDGET_USD`,
+the dollars still left to spend. Then it:
+
+1. refuses if a pod named `drbm25` already exists (two pods must never share the volume);
+2. reads live stock and list prices for 2x A100 80GB, SXM and PCIe, on the secure cloud with CUDA 12.8 or
+   newer, and picks the cheapest offer in stock (`--gpu sxm|pcie|any`, default `any`). Community cloud is not
+   offered: RunPod network volumes only work on Secure Cloud pods;
+3. reuses the network volume named `drbm25` if there is one. A volume is tied to its data center, so the pod
+   must go there: if that data center has no stock, it says so and stops (it never creates a second volume).
+   With no volume it offers to create one (`--volume-gb`, default 400; standard tier) in the chosen data center;
+4. prints the plan: GPU, data center, the exact hourly price, what the budget buys, the volume (and its
+   monthly cost if new) and the git ref, and creates nothing billable until you type `yes` (`--yes` skips the
+   question for scripts; the plan is still printed);
+5. stores `HF_TOKEN`, `WANDB_API_KEY` and `RUNPOD_API_KEY` as RunPod secrets (`drbm25_hf_token`,
+   `drbm25_wandb_api_key`, `drbm25_runpod_api_key`; created or rotated). The pod's environment holds only
+   `{{ RUNPOD_SECRET_<name> }}` references, never the values; keys never appear in curl's arguments (the
+   header and bodies are mode-600 temporary files, deleted on exit);
+6. creates the pod: image `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (the official "Runpod Pytorch
+   2.8.0"), the volume at `/workspace`, 80 GB container disk, ports 22 and 8888. Its start command is
+   `scripts/runpod/pod_bootstrap.sh`: it starts the image's `/start.sh` (SSH, Jupyter) in the background, fetches
+   the ref into `/workspace/drbm25/repo` (reusing an earlier clone), then runs `run_all.sh` with stdin from
+   `/dev/null`. The budget, the quoted price, `TERMINATE_ON_FINISH=yes`, the volume size and the W&B settings go
+   in as plain environment variables;
+7. prints the pod id, the console URL (`https://console.runpod.io/pods`) and how to follow progress, and exits.
+
+Each RunPod endpoint used is listed with its documentation page at the top of `scripts/runpod/launch.sh`.
+
+### Cost
 
 Prices (RunPod API, as of 2026-11-19): 2x A100 SXM 80GB community $2.78/h, secure $4.38/h; 2x A100 PCIe 80GB
-community $2.38/h, secure $4.18/h. Community stock was listed as low.
+community $2.38/h, secure $4.18/h. Only secure applies (network volume). `launch.sh` prints the live list
+price before you confirm and passes it to the run as `PRICE_PER_HOUR`; if the created pod reports a higher hourly
+cost, it prints a warning. Standard network volume storage was $0.07/GB/month for the first TB (RunPod
+docs, as of 2026-11-20): 400 GB is about $28/month, billed until you delete the volume.
 
-Suggested budget: **$160** (the project's cap). At those prices it buys 57.6 h (SXM community), 67.2 h (PCIe
-community), 38.3 h (PCIe secure) or 36.5 h (SXM secure), one hour of which is reserved for evaluation and
-the report (`RESERVE_S`). Whether 1,751 steps fit is not known in advance: the trainer times the first 10 PPO
-steps and logs `budget/projected_steps` (to `metrics.jsonl`, the log and W&B), computed as steps done +
-(deadline - reserve - now) / mean step time. Read it after the first 10 steps of the first chunk. Each run's projection
-counts only its own step time, but both runs share the clock in alternating chunks, so expect each run to
-reach roughly half of the projected steps beyond those already done (an inference from the alternation, not
-a measurement).
+Suggested budget: **$160** (the project's cap). At $4.18-4.38/h it buys 36.5-38.3 h, one hour of which is
+reserved for evaluation and the report (`RESERVE_S`). Whether 1,751 steps fit is not known in advance: the
+trainer times the first 10 PPO steps and logs `budget/projected_steps` (to `metrics.jsonl`, the log and W&B),
+computed as steps done + (deadline - reserve - now) / mean step time. Read it after the first 10 steps of the
+first chunk. Each run's projection counts only its own step time, but both runs share the clock in alternating
+chunks, so expect each run to reach roughly half of the projected steps beyond those already done (an inference
+from the alternation, not a measurement).
 
-Template and stock: the official "Runpod Pytorch 2.8.0" image `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (host CUDA
-   12.8-13.4 allowed). Check GPU stock first: as of 2026-11-20 the RunPod API showed 2x A100 SXM 80GB available only on
-   SECURE cloud in US-MD-1, with availability LOW; community cloud and PCIe showed none. A network volume is tied to its
-   data center, so confirm that the data center currently has 2x A100 80GB in stock BEFORE creating the volume.
-1. Create a network volume of at least **400 GB** in a data center that has A100 80GB in stock. Size estimate
-   (not measured on a pod yet): a full fine-tune checkpoint holds fp32 parameters plus two Adam moments for the
-   actor and the critic, about 74 GB, and `best/` holds the 3B actor in bf16, about 6.8 GB (6.2 GB of parameters
-   plus the tied LM head stored under its own name). Each run keeps one checkpoint and one `best/`: 74 + 6.8 GB.
-   A save writes the new checkpoint beside the old one, so the run being saved peaks at 2 x 74 + 6.8 = about
-   155 GB while the other holds about 81 GB (the runs train in turn): about 236 GB, plus the model cache,
-   dataset, index, venv cache and logs. The launcher refuses to start a chunk unless 1.2 x (last checkpoint +
-   `best/`) is free (7 GiB stands in for a `best/` not written yet; 90 GiB before the first checkpoint).
-   Network volume storage is billed per GB-month: check the current rate in the RunPod console before
-   choosing the size. After the first checkpoint, confirm the real sizes on the pod with
-   `du -sh /workspace/drbm25/runs/*/step_* /workspace/drbm25/runs/*/best` and `df -h /workspace`.
-2. Deploy a pod with 2x A100 80GB and that volume mounted at `/workspace`. Create a RunPod API key with
-   `pods:write` (it is used only to terminate the pod).
-3. In the pod, run inside `tmux` so a closed SSH or web terminal cannot interrupt the run:
-   ```bash
-   cd /workspace && git clone <repo-url> repo && cd repo   # the default branch, once this work is merged
-   tmux new -s drbm25      # reattach later with: tmux attach -t drbm25
-   bash scripts/runpod/run_all.sh
-   ```
-   (`nohup bash scripts/runpod/run_all.sh` also works after the prompts have been answered via environment
-   variables.) It asks, with hidden input for secrets, for `HF_TOKEN`, `WANDB_API_KEY`, `WANDB_PROJECT` (default
-   `drbm25`), `WANDB_ENTITY` (optional), `RUNPOD_API_KEY` and `TERMINATE_ON_FINISH` (default `yes`); anything already
-   set in the environment is not asked again, and these answers go to `/workspace/drbm25/.env` (mode 600, never logged
-   or committed; on a re-run only missing values are asked). On every launch it also asks for `BUDGET_USD`, the
-   dollars still left to spend, shown next to what earlier launches already spent, and `PRICE_PER_HOUR` (this pod's
-   price from the list above). Those two are never saved. After the prompts all output goes to
-   `/workspace/drbm25/logs/run_all-<time>.log`; follow it with `tail -f`.
-4. Stages, in order: Java 21 (pinned Temurin tarball, SHA-256 checked), uv 0.13.7 (pinned GitHub release tarball for x86_64 Linux,
+### Watch, stop, resume
+
+```bash
+bash scripts/runpod/launch.sh --status
+bash scripts/runpod/launch.sh --logs
+bash scripts/runpod/launch.sh --watch --interval-min 10
+bash scripts/runpod/launch.sh --stop
+```
+
+`--status` prints the pod's id, status, hourly cost and data center. `--logs` runs a fixed read-only command
+in the pod through RunPod's exec API and prints the FAILED marker (if any), `spend.json` and the last 40 lines of
+the newest `logs/bootstrap-*.log` and `logs/run_all-*.log`. `--watch` repeats status and the last 10 log lines
+until the pod is gone. `--stop` terminates the pod after you type `yes`; the volume and its data are kept, but
+the run is cut off at once, so `spend.json` misses the time since the last finished chunk. In the RunPod web
+terminal or over SSH: `tail -f /workspace/drbm25/logs/bootstrap-*.log` (then `run_all-*.log`).
+
+Resume: run `bash scripts/runpod/launch.sh` again. It reuses the volume, the pod fetches the ref into the existing
+clone, finished stages are skipped and training resumes from the latest checkpoint. Give it the budget that is
+left: `--logs` (while a pod exists) or the last run's log shows the total in `spend.json`.
+
+Failures: any failure writes `/workspace/drbm25/FAILED` and terminates the pod. Read the cause with `--logs`
+before the pod is gone, or in the logs on the volume. A later launch that finds the marker terminates its pod at
+once instead of running (it would only repeat the failure). Fix the cause, then relaunch with
+`bash scripts/runpod/launch.sh --clear-failed`: the pod moves the marker to `logs/FAILED-<time>` and runs. If
+the clone itself fails (bad `--ref`, network), `pod_bootstrap.sh` terminates the pod. An unattended run never
+asks anything: a missing setting, or a secret reference RunPod did not replace (a deleted secret), is a failure.
+
+### What the run does
+
+1. Settings: the environment from `launch.sh`, else `/workspace/drbm25/.env` (mode 600; secrets included,
+   never logged or committed). `BUDGET_USD` and `PRICE_PER_HOUR` are never saved. After the settings all output
+   goes to `/workspace/drbm25/logs/run_all-<time>.log`.
+2. Stages, in order: Java 21 (pinned Temurin tarball, SHA-256 checked), uv 0.13.7 (pinned GitHub release tarball for x86_64 Linux,
    SHA-256 checked, installed into `/workspace/drbm25/bin`; no pip, so Ubuntu 24.04's externally-managed Python does not
    matter), Python 3.12 from `uv python install` (onto the volume, `UV_PYTHON_PREFERENCE=only-managed`, so the image's
    system Python and preinstalled torch are never used), `uv sync --frozen --extra vllm`, dataset and index, model snapshot at the config's pinned revision, GPU smoke test (`pytest
@@ -271,10 +319,12 @@ Template and stock: the official "Runpod Pytorch 2.8.0" image `runpod/pytorch:1.
    a re-run; Java, uv, `uv sync` and training run every launch (training resumes from the latest checkpoint), and the
    smoke test runs once per pod. The W&B project and entity you entered are applied to training, evaluation and the
    report.
-5. Budget: the deadline is `start + BUDGET_USD / PRICE_PER_HOUR` hours (`drbm25.budget.deadline_from_budget`),
-   measured from when the script starts. Spend (elapsed time x price) is written to `/workspace/drbm25/spend.json`
+3. Budget: the deadline is `start + BUDGET_USD / PRICE_PER_HOUR` hours (`drbm25.budget.deadline_from_budget`).
+   For a pod made by `launch.sh`, `start` is when its container started (`DRBM25_POD_START_UNIX`, so clone time
+   counts); in the manual flow it is when `run_all.sh` starts. Image download and provisioning before that are
+   not counted. Spend (elapsed time x price) is written to `/workspace/drbm25/spend.json`
    after every chunk and on exit, so a relaunch shows the total already spent; give it the remaining budget, not the
-   original one. Time before the script starts (pod boot, your typing) is not counted. Training stops at the next
+   original one. Training stops at the next
    checkpoint boundary once one more chunk would end less than `RESERVE_S` (default 3600 s, an unmeasured
    estimate for four evaluation runs, the report and the terminate call) before the deadline; override with
    `RESERVE_S=...`. The chunk estimate is the larger of the trainer's own (mean step time x `run.ckpt_every`)
@@ -285,31 +335,47 @@ Template and stock: the official "Runpod Pytorch 2.8.0" image `runpod/pytorch:1.
    training steps column shows how far each run got (see "Reading the report").
    The report's W&B upload is best effort: if it fails after `report.md` is written, the launcher logs a
    `WARNING` and still ends successfully (the results are on the volume; sync them by hand).
-6. Hangs: each training chunk runs under GNU `timeout` (time to the deadline plus 30 min), evaluation commands under
+4. Hangs: each training chunk runs under GNU `timeout` (time to the deadline plus 30 min), evaluation commands under
    2 h and each smoke command under 1 h. A timeout is a failure: `FAILED` is written and the pod is terminated. A `SIGKILL` before the limit (exit 137, for example
    the out-of-memory killer) is reported as that, not as a timeout.
 
-Ctrl-C, a closed terminal (SIGHUP) or SIGTERM stops the running command (its process group gets TERM, then KILL after
-10 s), records spend, copies logs and terminates the pod; further signals during that cleanup are ignored.
+Volume size: at least **400 GB** (not measured on a pod yet). A full fine-tune checkpoint holds fp32 parameters
+plus two Adam moments for the actor and the critic, about 74 GB, and `best/` holds the 3B actor in bf16, about
+6.8 GB (6.2 GB of parameters plus the tied LM head stored under its own name). Each run keeps one checkpoint and
+one `best/`: 74 + 6.8 GB. A save writes the new checkpoint beside the old one, so the run being saved peaks at
+2 x 74 + 6.8 = about 155 GB while the other holds about 81 GB (the runs train in turn): about 236 GB, plus the
+model cache, dataset, index, venv cache and logs. The run refuses to start a chunk unless 1.2 x (last checkpoint
++ `best/`) is free (7 GiB stands in for a `best/` not written yet; 90 GiB before the first checkpoint). `df` on
+a RunPod network volume may report pooled rather than per-volume space, so `VOLUME_GB` (set by `launch.sh` from
+the volume's size) also bounds free space as `VOLUME_GB - used` (from `du -sk /workspace/drbm25`). After the first
+checkpoint, confirm the real sizes on the pod with `du -sh /workspace/drbm25/runs/*/step_* /workspace/drbm25/runs/*/best`.
 
-`df` on a RunPod network volume may report pooled rather than per-volume space. Set `VOLUME_GB` to the size you created
-(the launcher asks, optional, and saves it in `.env`) and the preflight also requires
-`VOLUME_GB - used` (from `du -sk /workspace/drbm25`) to cover the next checkpoint and `best/`. On the pod, compare
-`du -sh /workspace` with the volume size you created.
+Terminating the pod releases GPU billing; the network volume keeps all data. If the run's terminate call fails
+after 3 attempts (waits of 5 s and 15 s) it logs the pod id and `https://console.runpod.io/pods`: `--status`
+shows the pod is still there; stop it with `--stop`.
 
-Terminating the pod releases GPU billing; the network volume keeps all data. Use `--no-terminate` or
-`TERMINATE_ON_FINISH=no` to keep the pod. If the terminate call fails after 3 attempts (waits of 5 s and 15 s) the
-script prints the pod id and `https://console.runpod.io/pods`: terminate it there yourself.
+### Manual fallback (inside a pod)
 
-Resuming on a new pod: attach the same volume at `/workspace`, clone again and re-run `bash scripts/runpod/run_all.sh`
-inside tmux. A failure leaves `/workspace/drbm25/FAILED` (and terminates the pod). A later launch that finds the file
-stops immediately, before prompting, and does NOT terminate the pod (it is still billing): fix the cause, delete the
-file and run again, or terminate the pod yourself.
+Deploy a 2x A100 80GB secure-cloud pod with the volume at `/workspace` yourself, then in its terminal:
+
+```bash
+mkdir -p /workspace/drbm25 && cd /workspace/drbm25 && git clone https://github.com/objones25/drbm25 repo && cd repo
+tmux new -s drbm25
+bash scripts/runpod/run_all.sh
+```
+
+Interactively it prompts for the same settings (hidden for secrets) plus `RUNPOD_API_KEY`, `PRICE_PER_HOUR` and
+`TERMINATE_ON_FINISH` (default `yes`), and saves all but the budget and price to `/workspace/drbm25/.env`. Ctrl-C,
+a closed terminal (SIGHUP) or SIGTERM stops the running command (its process group gets TERM, then KILL after
+10 s), records spend, copies logs and terminates the pod; `--no-terminate` or `TERMINATE_ON_FINISH=no` keeps it.
+An interactive launch that finds a `FAILED` marker stops before prompting and does NOT terminate the pod: fix the
+cause, delete the file and run again, or terminate the pod yourself.
 
 Where things are (all under `/workspace/drbm25`): `runs/{normal,count_once}/` (the sharded resume checkpoint,
 `best/`, `run_manifest.json`, `metrics.jsonl`, `train_rank*.log`, `exit_code`), `runs/eval/` (per-query jsonl
-and `report.md`), `logs/` (the launcher log and copies of the run logs, made on exit), `micro_batch` (the
+and `report.md`), `repo/` (the clone the pod runs), `logs/` (`bootstrap-*.log`, `run_all-*.log`, copies of the
+run logs made on exit, archived `FAILED-*` markers), `micro_batch` (the
 micro batch size the smoke stage chose), `spend.json`, `hf/` (model cache), `indexes/`, `data/`, `.env`.
 
-Tests: `bats tests/shell/test_runpod_lib.bats` (curl, uv, timeout, df and sleep are PATH shims) and
-`shellcheck scripts/runpod/*.sh`.
+Tests: `bats tests/shell/test_runpod_lib.bats tests/shell/test_runpod_launch.bats` (curl, uv, timeout, df and
+sleep are PATH shims; nothing calls the real RunPod API) and `shellcheck scripts/runpod/*.sh`.

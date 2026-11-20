@@ -171,7 +171,8 @@ scripts/
   audit_tests.py, audit_observability.py, lint_pytorch.py, diff_guard.py, mutate_check.py
   expanse/          common.sh, run.sh, prepare_login.sh (login node), probe.sbatch
                     (gpu-debug), train.sbatch, submit_chain.sh, eval.sbatch
-  runpod/           run_all.sh (one-shot launcher), lib.sh
+  runpod/           launch.sh (laptop launcher), pod_bootstrap.sh (pod start command),
+                    run_all.sh (in-pod pipeline), lib.sh
 tests/
 ```
 
@@ -421,7 +422,12 @@ A100 / full layout (`configs/runpod_a100_full.yaml`):
   driver/CUDA, `torch.cuda.get_arch_list()`, Java availability, and whether vLLM
   0.19 can generate in fp16 on a V100. If the probe shows internet, online W&B is enabled.
 
-RunPod: one script the lead runs on a fresh pod (`scripts/runpod/run_all.sh`):
+RunPod (amended 2026-11-20): the lead runs `scripts/runpod/launch.sh` on their own machine. It checks
+live 2x A100 80GB stock and price, asks for `yes`, stores the keys as RunPod secrets, reuses or creates
+the `drbm25` network volume and creates a pod whose start command (`pod_bootstrap.sh`) clones the
+public repository and runs `scripts/runpod/run_all.sh` unattended (`DRBM25_NONINTERACTIVE=1`: no
+prompts; a missing setting is a failure that terminates the pod). The README has the runbook.
+`run_all.sh` can still be run by hand inside a pod:
 1. **Prompts** (interactively, hidden input for secrets; or reads them from env)
    for: `HF_TOKEN`, `WANDB_API_KEY`, `WANDB_PROJECT`, `WANDB_ENTITY` (optional),
    `RUNPOD_API_KEY` (needs `pods:write`, used only to terminate the pod),
