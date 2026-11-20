@@ -98,6 +98,22 @@ def test_split_train_rejects_val_size_outside_1_to_n_minus_1(val_size: int):
         split_train(_train_examples(20), val_size=val_size, seed=1)
 
 
+def test_split_train_accepts_val_size_at_both_bounds():
+    train = _train_examples(20)
+    assert len(split_train(train, val_size=1, seed=1)[1]) == 1
+    assert len(split_train(train, val_size=19, seed=1)[0]) == 1
+
+
+def test_split_train_error_names_the_valid_range_and_row_count():
+    with pytest.raises(ValueError, match=r"1\.\.19 \(train has 20 rows\), got 20"):
+        split_train(_train_examples(20), val_size=20, seed=1)
+
+
+def test_batch_indices_accepts_smallest_valid_arguments():
+    assert batch_indices(0, 1, 1, seed=1) == [0]
+    assert len(batch_indices(0, 1, 10, seed=1)) == 1
+
+
 def test_batch_indices_deterministic_and_identical_across_calls():
     first = batch_indices(cursor=3, batch_size=4, n_examples=10, seed=7)
     assert first == batch_indices(cursor=3, batch_size=4, n_examples=10, seed=7)

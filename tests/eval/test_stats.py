@@ -82,6 +82,29 @@ def test_bootstrap_rejects_bad_alpha(alpha: float) -> None:
         paired_bootstrap_ci(np.zeros(3), np.ones(3), n_resamples=10, alpha=alpha)
 
 
+def test_bootstrap_defaults_are_10000_resamples_and_seed_0() -> None:
+    rng = np.random.default_rng(3)
+    a, b = rng.random(40), rng.random(40)
+    assert paired_bootstrap_ci(a, b) == paired_bootstrap_ci(a, b, n_resamples=10_000, seed=0)
+
+
+def test_bootstrap_accepts_one_resample_and_rejects_zero() -> None:
+    assert paired_bootstrap_ci(np.zeros(3), np.ones(3), n_resamples=1) == PairedCI(1.0, 1.0, 1.0)
+    with pytest.raises(ValueError, match="n_resamples"):
+        paired_bootstrap_ci(np.zeros(3), np.ones(3), n_resamples=0)
+
+
+def test_bootstrap_can_draw_the_first_query() -> None:
+    ci = paired_bootstrap_ci(np.zeros(2), np.array([1.0, 0.0]), n_resamples=400)
+    assert (ci.low, ci.high) == (0.0, 1.0)
+
+
+def test_bootstrap_uses_alpha_over_two_in_each_tail() -> None:
+    # Resampled means are 0, 0.5, 1 with probability 1/4, 1/2, 1/4: the 0.3 and 0.7 quantiles are both 0.5.
+    ci = paired_bootstrap_ci(np.zeros(2), np.array([1.0, 0.0]), n_resamples=4000, alpha=0.6)
+    assert (ci.low, ci.high) == (0.5, 0.5)
+
+
 def test_query_stats_hand_values() -> None:
     stats = query_stats([_record(("a", "a", "b")), _record(("c",))])
     assert stats["mean_n_terms"] == pytest.approx(2.0)
