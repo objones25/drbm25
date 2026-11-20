@@ -275,6 +275,43 @@ def test_cli_stops_at_checkpoint_boundary_when_budget_runs_out(
 
 
 @pytest.mark.java
+@pytest.mark.slow
+def test_cli_budget_counts_the_previous_chunk_wall_clock_from_the_launcher(
+    workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The launcher's measured chunk (torchrun start, model loads, vLLM init, validation, save) is
+    # the estimate at startup, where nothing is timed yet, and stays the floor afterwards.
+    calls: list[dict[str, float]] = []
+
+    def record(**kwargs: float) -> bool:
+        calls.append(kwargs)
+        return False
+
+    monkeypatch.setattr(train_module, "should_stop", record)
+    argv = _argv(workdir, toy_index, "prev", "--deadline-unix", str(time.time() + 3600), "--prev-chunk-s", "500")
+    assert _main([*argv, "--until-step", "2"]) == EXIT_OK
+    assert [c["mean_chunk_s"] for c in calls] == [pytest.approx(500.0), pytest.approx(500.0)]
+
+
+def test_budget_uses_its_own_chunk_estimate_when_larger_than_the_previous_chunk() -> None:
+    budget = train_module._Budget(  # pyright: ignore[reportPrivateUsage]
+        deadline_unix=None, reserve_s=0.0, ckpt_every=50, step_seconds=[30.0, 50.0], prev_chunk_s=1200.0
+    )
+    assert budget.mean_chunk_s() == pytest.approx(2000.0)  # 40 s/step x 50 steps > 1200 s
+    budget.step_seconds = [10.0]
+    assert budget.mean_chunk_s() == pytest.approx(1200.0)
+
+
+def test_cli_rejects_negative_prev_chunk_s(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        train_module._parse_args(  # pyright: ignore[reportPrivateUsage]
+            ["--config", "c.yaml", "--reward-mode", "normal", "--run-name", "r", "--prev-chunk-s", "-1"]
+        )
+    assert exc.value.code == 2
+    assert "--prev-chunk-s must be >= 0" in capsys.readouterr().err
+
+
+@pytest.mark.java
 def test_cli_sweeps_stale_checkpoint_temps_at_startup(workdir: Path, toy_index: Path) -> None:
     run_dir = workdir / "out" / "stale"
     (run_dir / ".tmp-step_000002-999").mkdir(parents=True)

@@ -137,6 +137,7 @@ class _Args:
     until_step: int | None
     deadline_unix: float | None
     reserve_s: float
+    prev_chunk_s: float
     overrides: dict[str, str]
 
 
@@ -155,6 +156,12 @@ def _parse_args(argv: Sequence[str] | None) -> _Args:
     parser.add_argument("--until-step", type=int, default=None, help="stop after this many total steps")
     parser.add_argument("--deadline-unix", type=float, default=None, help="budget deadline (unix seconds)")
     parser.add_argument("--reserve-s", type=float, default=0.0, help="seconds kept free before the deadline")
+    parser.add_argument(
+        "--prev-chunk-s",
+        type=float,
+        default=0.0,
+        help="wall-clock seconds of the launcher's previous chunk (startup, loads, validation, save included)",
+    )
     parser.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE")
     ns = parser.parse_args(argv)
     overrides: dict[str, str] = {}
@@ -167,7 +174,11 @@ def _parse_args(argv: Sequence[str] | None) -> _Args:
         parser.error(f"--until-step must be >= 0, got {ns.until_step}")
     if ns.reserve_s < 0:
         parser.error(f"--reserve-s must be >= 0, got {ns.reserve_s}")
-    return _Args(ns.config, ns.reward_mode, ns.run_name, ns.until_step, ns.deadline_unix, ns.reserve_s, overrides)
+    if not ns.prev_chunk_s >= 0:  # also rejects nan
+        parser.error(f"--prev-chunk-s must be >= 0, got {ns.prev_chunk_s}")
+    return _Args(
+        ns.config, ns.reward_mode, ns.run_name, ns.until_step, ns.deadline_unix, ns.reserve_s, ns.prev_chunk_s, overrides
+    )
 
 
 # ---------------------------------------------------------------------------- startup checks
@@ -346,11 +357,14 @@ class _Budget:
     reserve_s: float
     ckpt_every: int
     step_seconds: list[float]
+    # The launcher's wall-clock for its previous chunk: per-chunk overhead (torchrun start, model
+    # loads, vLLM init, validation, checkpoint save) that timing PPO steps alone misses.
+    prev_chunk_s: float = 0.0
 
     def mean_chunk_s(self) -> float:
-        if not self.step_seconds:
-            return 0.0
-        return sum(self.step_seconds) / len(self.step_seconds) * self.ckpt_every
+        """Expected seconds for one more chunk: the larger of the launcher's measurement and our own."""
+        own = sum(self.step_seconds) / len(self.step_seconds) * self.ckpt_every if self.step_seconds else 0.0
+        return max(own, self.prev_chunk_s)
 
     def stop(self) -> bool:
         if self.deadline_unix is None:
@@ -495,7 +509,7 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
 
     until = cfg.run.total_steps if args.until_step is None else min(args.until_step, cfg.run.total_steps)
     local = cfg.ppo.batch_size // dist.world_size
-    budget = _Budget(args.deadline_unix, args.reserve_s, cfg.run.ckpt_every, [])
+    budget = _Budget(args.deadline_unix, args.reserve_s, cfg.run.ckpt_every, [], args.prev_chunk_s)
     env = collect_environment()
     selection = _Selection(
         run_dir=run_dir,

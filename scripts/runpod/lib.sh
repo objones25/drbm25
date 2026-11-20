@@ -119,7 +119,7 @@ _saved_micro_batch() {
       return 0
     fi
   done
-  _common_log "error: $DRBM25_MICRO_BATCH_FILE holds '$micro', expected one of ${MICRO_BATCH_CANDIDATES[*]}; delete it to re-run the memory check from 8"
+  _common_log "error: $DRBM25_MICRO_BATCH_FILE holds '$micro', expected one of ${MICRO_BATCH_CANDIDATES[*]}; before training has started, delete it to re-run the memory check from 8"
   return 1
 }
 
@@ -605,10 +605,25 @@ print(f"model cached: {cfg.model.name}@{cfg.model.revision} -> {path}")
 PY
 }
 
+# Prints "yes" when either run has a complete training checkpoint, else "no".
+_training_started() {
+  local mode have
+  for mode in normal count_once; do
+    # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+    have=$(latest_step "$DRBM25_RUNS_DIR/$mode") || return 1
+    if ((have > 0)); then
+      printf 'yes\n'
+      return 0
+    fi
+  done
+  printf 'no\n'
+}
+
 smoke_stage() {
-  local micro saved='' rc tried=''
+  local micro saved='' rc tried='' started
+  local candidates=("${MICRO_BATCH_CANDIDATES[@]}")
   runpod_set_args
-  _runpod_log "GPU smoke: vLLM and full-model tests, then the 2-GPU memory check"
+  _runpod_log "GPU smoke: the gpu-marked tests (vLLM engine), then the 2-GPU memory check"
   # --no-cov: the repo's coverage gate would fail a two-file run.
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   if ! _uv_timeout "$SMOKE_TIMEOUT_S" pytest -p no:randomly --no-cov -m gpu tests/rollout/test_vllm_engine.py tests/ppo/test_models_full.py; then
@@ -620,7 +635,18 @@ smoke_stage() {
     # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
     saved=$(_saved_micro_batch) || return 1
   fi
-  for micro in "${MICRO_BATCH_CANDIDATES[@]}"; do
+  # Once either run has a checkpoint the micro batch is fixed, so both runs cover every step at the
+  # same size; a new pod that cannot fit it stops instead of silently stepping down.
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  started=$(_training_started) || return 1
+  if [[ $started == yes ]]; then
+    if [[ -z $saved ]]; then
+      mark_failed "training checkpoints exist in $DRBM25_RUNS_DIR but $DRBM25_MICRO_BATCH_FILE is missing, so the micro batch the runs trained at is unknown; restore that file"
+      return 1
+    fi
+    candidates=("$saved")
+  fi
+  for micro in "${candidates[@]}"; do
     if [[ -n $saved ]] && ((micro > saved)); then continue; fi
     tried+="$micro "
     rm -rf -- "${DRBM25_ROOT:?}/memcheck"
@@ -641,6 +667,10 @@ smoke_stage() {
       return 1
     fi
     # Exit 1: an error (an OOM included) or under 2 GiB headroom per GPU; 137: killed (out of memory).
+    if [[ $started == yes ]]; then
+      mark_failed "memory check failed at micro batch $micro (status $rc) on this pod, and training checkpoints already exist at that size; not stepping down (the two runs would differ in micro batch). Use a pod with more GPU memory"
+      return 1
+    fi
     _runpod_log "memory check failed at micro batch $micro (status $rc); trying a smaller one"
   done
   mark_failed "memory check failed at every micro batch tried (${tried% }); see the log above"
@@ -676,9 +706,14 @@ _is_positive_int() {
   [[ $1 =~ ^[0-9]+$ && ! $1 =~ ^0+$ ]]
 }
 
+# Wall-clock seconds of the last chunk that ran (0 before the first). The trainer adds it to its
+# budget check, because its own step timing misses torchrun start, model loads, vLLM init,
+# validation and the checkpoint save.
+LAST_CHUNK_S=0
+
 # One torchrun for MODE up to STEP. Status 0 ok, 3 budget stop, 1 failure (FAILED written).
 _train_chunk() {
-  local mode=$1 step=$2 torchrun_rc=0 code='' have after limit run_dir
+  local mode=$1 step=$2 torchrun_rc=0 code='' have after limit run_dir started
   run_dir=$DRBM25_RUNS_DIR/$mode
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   have=$(latest_step "$run_dir") || return 1
@@ -694,11 +729,14 @@ _train_chunk() {
   # A leftover exit_code (0 or 3 from the previous chunk) must never be read for this one: rank 0
   # only overwrites it after load_config, and torchrun can fail before that.
   rm -f -- "$run_dir/exit_code"
-  _runpod_log "training $mode: step $have -> $step (timeout ${limit}s)"
+  _runpod_log "training $mode: step $have -> $step (timeout ${limit}s, previous chunk ${LAST_CHUNK_S}s)"
+  started=$(_now_unix)
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   _uv_timeout "$limit" torchrun --nproc_per_node 2 --standalone -m drbm25.train \
     --config "$RUNPOD_CONFIG" --reward-mode "$mode" --run-name "$mode" --until-step "$step" \
-    --deadline-unix "$DEADLINE_UNIX" --reserve-s "$RESERVE_S" "${RUNPOD_SET_ARGS[@]}" || torchrun_rc=$?
+    --deadline-unix "$DEADLINE_UNIX" --reserve-s "$RESERVE_S" --prev-chunk-s "$LAST_CHUNK_S" \
+    "${RUNPOD_SET_ARGS[@]}" || torchrun_rc=$?
+  LAST_CHUNK_S=$(($(_now_unix) - started))
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   spend_record || true
   if ((TIMEOUT_FIRED)); then
@@ -793,7 +831,7 @@ _run_eval() {
 # the test set is all of dev.
 eval_stage() {
   local normal_dir=$DRBM25_RUNS_DIR/normal count_once_dir=$DRBM25_RUNS_DIR/count_once
-  local out_dir=$DRBM25_RUNS_DIR/eval run_dir
+  local out_dir=$DRBM25_RUNS_DIR/eval run_dir report_rc
   runpod_set_args
   for run_dir in "$normal_dir" "$count_once_dir"; do
     if [[ ! -f $run_dir/best/meta.json ]]; then
@@ -811,11 +849,22 @@ eval_stage() {
   _run_eval checkpoint "$out_dir/trained-normal.jsonl" "$normal_dir/best" || return 1
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   _run_eval checkpoint "$out_dir/trained-count_once.jsonl" "$count_once_dir/best" || return 1
+  # report.md is written before the W&B upload; a stale one must not pass for this launch's.
+  rm -f -- "$out_dir/report.md"
+  report_rc=0
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   _uv_timeout "$EVAL_TIMEOUT_S" python -m drbm25.eval.report \
     --inputs "$out_dir/original.jsonl" "$out_dir/untrained.jsonl" \
     "$out_dir/trained-normal.jsonl" "$out_dir/trained-count_once.jsonl" \
-    --out "$out_dir/report.md" --wandb --config "$RUNPOD_CONFIG" "${RUNPOD_SET_ARGS[@]}" || return 1
+    --out "$out_dir/report.md" --wandb --config "$RUNPOD_CONFIG" "${RUNPOD_SET_ARGS[@]}" || report_rc=$?
+  if ((report_rc != 0)); then
+    if [[ ! -f $out_dir/report.md ]]; then
+      _runpod_log "error: the report failed (status $report_rc) before writing $out_dir/report.md"
+      return 1
+    fi
+    # The results are on the volume; a W&B outage must not mark the whole experiment FAILED.
+    _runpod_log "WARNING: the report was written but its W&B upload failed (status $report_rc); results are in $out_dir (sync them to W&B by hand)"
+  fi
   _runpod_log "report: $out_dir/report.md"
 }
 

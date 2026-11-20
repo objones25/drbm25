@@ -82,6 +82,10 @@ case $cmd in
       shift
     done
     mkdir -p "$out/$run"
+    # STUB_TRAIN_ADVANCE_S: the chunk "takes" that long on the clock the date shim reads.
+    if [[ -n ${STUB_TRAIN_ADVANCE_S-} ]]; then
+      echo $(($(cat "$STUB_DIR/now") + STUB_TRAIN_ADVANCE_S)) >"$STUB_DIR/now"
+    fi
     code=0
     [[ -f $STUB_DIR/exit_${run}_$step ]] && code=$(cat "$STUB_DIR/exit_${run}_$step")
     if [[ $code != missing ]]; then echo "$code" >"$out/$run/exit_code"; fi
@@ -98,6 +102,14 @@ case $cmd in
   python)
     if [[ $* == *deadline_from_budget* ]]; then echo 1234567890; fi
     if [[ $* == *spike_monitor.py* ]]; then exit "${STUB_SPIKE_RC:-0}"; fi
+    if [[ $* == *drbm25.eval.report* ]]; then
+      # Writes --out (unless STUB_REPORT_NO_OUT), then exits STUB_REPORT_RC (a failed W&B upload).
+      while (($#)); do
+        if [[ $1 == --out && -z ${STUB_REPORT_NO_OUT-} ]]; then echo report >"$2"; fi
+        shift
+      done
+      exit "${STUB_REPORT_RC:-0}"
+    fi
     exit 0
     ;;
 esac
@@ -388,6 +400,36 @@ chunk_env() { printf '%s\n' "DEADLINE_UNIX=2000000000" "RESERVE_S=3600"; }
   grep -q -- "run.output_dir=$DRBM25_ROOT/runs" "$STUB_LOG"
 }
 
+# A clock for chunk timing: `date +%s` prints $STUB_DIR/now, which the torchrun stub advances.
+clock_shim() {
+  echo 1000 >"$STUB_DIR/now"
+  cat >"$BATS_TEST_TMPDIR/bin/date" <<'SHIM'
+#!/usr/bin/env bash
+if [[ $* == +%s ]]; then cat "$STUB_DIR/now"; else exec /bin/date "$@"; fi
+SHIM
+  chmod +x "$BATS_TEST_TMPDIR/bin/date"
+}
+
+prev_chunk_args() { grep '^uv .*drbm25.train' "$STUB_LOG" | grep -o -- '--prev-chunk-s [0-9]*' | sed 's/--prev-chunk-s //' | tr '\n' ' '; }
+
+@test "each training chunk gets the previous chunk's wall-clock seconds for the budget check" {
+  clock_shim
+  SNIPPET='runpod_paths; run_alternating_chunks 100 50'
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_TRAIN_ADVANCE_S=700
+  [[ $(train_calls | tr '\n' ' ') == 'normal@50 count_once@50 normal@100 count_once@100 ' ]]
+  [[ $(prev_chunk_args) == '0 700 700 700 ' ]]
+}
+
+@test "a chunk skipped because the run is already there does not reset the previous chunk time" {
+  clock_shim
+  mkdir -p "$DRBM25_ROOT/runs/count_once"
+  echo step_000050 >"$DRBM25_ROOT/runs/count_once/latest"
+  SNIPPET='runpod_paths; run_alternating_chunks 100 50'
+  run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_TRAIN_ADVANCE_S=700
+  [[ $(train_calls | tr '\n' ' ') == 'normal@50 normal@100 count_once@100 ' ]]
+  [[ $(prev_chunk_args) == '0 700 700 ' ]]
+}
+
 @test "run_alternating_chunks ends on UNTIL when it is not a multiple of CHUNK" {
   SNIPPET='runpod_paths; run_alternating_chunks 120 50'
   run -0 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600
@@ -526,6 +568,38 @@ memchecks() { grep '^memcheck micro=' "$STUB_LOG" | sed 's/memcheck micro=//' | 
   [[ $(<"$DRBM25_ROOT/micro_batch") == 2 ]]
 }
 
+@test "once training checkpoints exist the micro batch is fixed: a failed memory check is FAILED, not a step-down" {
+  echo 4 >"$DRBM25_ROOT/micro_batch"
+  mkdir -p "$DRBM25_ROOT/runs/normal"
+  echo step_000050 >"$DRBM25_ROOT/runs/normal/latest"
+  SNIPPET='runpod_paths; smoke_stage'
+  run -1 --separate-stderr in_lib STUB_MEM_RC_4=1
+  [[ $(memchecks) == '4 ' ]]
+  [[ $(<"$DRBM25_ROOT/micro_batch") == 4 ]]
+  grep -q 'micro batch 4' "$DRBM25_ROOT/FAILED"
+  grep -q 'checkpoint' "$DRBM25_ROOT/FAILED"
+}
+
+@test "once training checkpoints exist the persisted micro batch is checked alone and kept when it passes" {
+  echo 4 >"$DRBM25_ROOT/micro_batch"
+  mkdir -p "$DRBM25_ROOT/runs/count_once"
+  echo step_000050 >"$DRBM25_ROOT/runs/count_once/latest"
+  SNIPPET='runpod_paths; smoke_stage'
+  run -0 in_lib
+  [[ $(memchecks) == '4 ' ]]
+  [[ $(<"$DRBM25_ROOT/micro_batch") == 4 ]]
+}
+
+@test "training checkpoints without a persisted micro batch are FAILED, not a fresh search" {
+  mkdir -p "$DRBM25_ROOT/runs/normal"
+  echo step_000050 >"$DRBM25_ROOT/runs/normal/latest"
+  SNIPPET='runpod_paths; smoke_stage'
+  run -1 --separate-stderr in_lib
+  [[ -z $(memchecks) ]]
+  [[ ! -e $DRBM25_ROOT/micro_batch ]]
+  grep -q 'micro_batch' "$DRBM25_ROOT/FAILED"
+}
+
 @test "a malformed micro_batch file is an error, not silently ignored" {
   echo 3 >"$DRBM25_ROOT/micro_batch"
   SNIPPET='runpod_set_args'
@@ -576,6 +650,29 @@ memchecks() { grep '^memcheck micro=' "$STUB_LOG" | sed 's/memcheck micro=//' | 
   run -1 --separate-stderr in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_NO_BEST=1
   [[ $stderr == *"no best/"* ]]
   ! grep -q 'run_eval' "$STUB_LOG"
+  grep -q 'evaluation' "$DRBM25_ROOT/FAILED"
+}
+
+@test "a W&B upload failure after report.md was written is a loud warning, not FAILED" {
+  SNIPPET='runpod_paths; train_and_report 50 50'
+  run -0 --separate-stderr in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_REPORT_RC=1
+  [[ -f $DRBM25_ROOT/runs/eval/report.md ]]
+  [[ ! -e $DRBM25_ROOT/FAILED ]]
+  [[ $stderr == *WARNING*W\&B* ]]
+}
+
+@test "a report that fails without writing report.md is FAILED" {
+  SNIPPET='runpod_paths; train_and_report 50 50'
+  run -1 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_REPORT_RC=1 STUB_REPORT_NO_OUT=1
+  grep -q 'evaluation' "$DRBM25_ROOT/FAILED"
+}
+
+@test "a stale report.md from an earlier launch does not hide a report failure" {
+  mkdir -p "$DRBM25_ROOT/runs/eval"
+  echo old >"$DRBM25_ROOT/runs/eval/report.md"
+  SNIPPET='runpod_paths; train_and_report 50 50'
+  run -1 in_lib DEADLINE_UNIX=2000000000 RESERVE_S=3600 STUB_REPORT_RC=1 STUB_REPORT_NO_OUT=1
+  [[ ! -e $DRBM25_ROOT/runs/eval/report.md ]]
   grep -q 'evaluation' "$DRBM25_ROOT/FAILED"
 }
 

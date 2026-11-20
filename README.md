@@ -218,7 +218,7 @@ Template and stock: the official "Runpod Pytorch 2.8.0" image `runpod/pytorch:1.
    `pods:write` (it is used only to terminate the pod).
 3. In the pod, run inside `tmux` so a closed SSH or web terminal cannot interrupt the run:
    ```bash
-   cd /workspace && git clone <repo-url> repo && cd repo && git checkout feat/ppo-bm25
+   cd /workspace && git clone <repo-url> repo && cd repo   # the default branch, once this work is merged
    tmux new -s drbm25      # reattach later with: tmux attach -t drbm25
    bash scripts/runpod/run_all.sh
    ```
@@ -234,12 +234,16 @@ Template and stock: the official "Runpod Pytorch 2.8.0" image `runpod/pytorch:1.
    SHA-256 checked, installed into `/workspace/drbm25/bin`; no pip, so Ubuntu 24.04's externally-managed Python does not
    matter), Python 3.12 from `uv python install` (onto the volume, `UV_PYTHON_PREFERENCE=only-managed`, so the image's
    system Python and preinstalled torch are never used), `uv sync --frozen --extra vllm`, dataset and index, model snapshot at the config's pinned revision, GPU smoke test (`pytest
-   -m gpu` on the vLLM and full-model tests, then `scripts/memory_check.py` at micro batch 8; if it fails, by
+   -m gpu` over `tests/rollout/test_vllm_engine.py` and `tests/ppo/test_models_full.py`; the gpu-marked tests are
+   the vLLM engine tests, `test_models_full.py` has none and runs on CPU/gloo in the normal suite; then
+   `scripts/memory_check.py` at micro batch 8; if it fails, by
    exiting 1 for an error, an out-of-memory error or under 2 GiB headroom, or by being killed, it is retried at 4,
    then 2; the first size that passes is saved to `/workspace/drbm25/micro_batch` and passed as
    `--set ppo.micro_batch_size=N` to every training chunk, so it is recorded in each run's `run_manifest.json`;
    if 2 fails too, `FAILED` is written and the pod is terminated; a later pod never retries a size larger than
-   the saved one), training, evaluation of each run's `best/` policy, report. Data and model stages leave markers in `/workspace/drbm25/.done/` and are skipped on
+   the saved one, and once either run has a checkpoint the saved size is the only one checked: if it fails on
+   a new pod, `FAILED` is written instead of stepping down, so both runs train every step at the same micro
+   batch), training, evaluation of each run's `best/` policy, report. Data and model stages leave markers in `/workspace/drbm25/.done/` and are skipped on
    a re-run; Java, uv, `uv sync` and training run every launch (training resumes from the latest checkpoint), and the
    smoke test runs once per pod. The W&B project and entity you entered are applied to training, evaluation and the
    report.
@@ -247,10 +251,15 @@ Template and stock: the official "Runpod Pytorch 2.8.0" image `runpod/pytorch:1.
    measured from when the script starts. Spend (elapsed time x price) is written to `/workspace/drbm25/spend.json`
    after every chunk and on exit, so a relaunch shows the total already spent; give it the remaining budget, not the
    original one. Time before the script starts (pod boot, your typing) is not counted. Training stops at the next
-   checkpoint boundary once less than `RESERVE_S` (default 3600 s, an unmeasured estimate for four evaluation runs,
-   the report and the terminate call) is left; override with `RESERVE_S=...`. Both runs advance in chunks of
-   `run.chunk_steps` (50), so they stop within one chunk of each other; the evaluation scores each run's `best/`
-   policy so far.
+   checkpoint boundary once one more chunk would end less than `RESERVE_S` (default 3600 s, an unmeasured
+   estimate for four evaluation runs, the report and the terminate call) before the deadline; override with
+   `RESERVE_S=...`. The chunk estimate is the larger of the trainer's own (mean step time x `run.ckpt_every`)
+   and the previous chunk's wall-clock, which the launcher measures and passes as `--prev-chunk-s` (it includes
+   torchrun start, model loads, vLLM init, validation and the checkpoint save). Both runs advance in chunks of
+   `run.chunk_steps` (50), so they stop within one chunk of each other: after a budget stop `count_once` can be
+   one chunk behind `normal`. The evaluation scores each run's `best/` policy so far.
+   The report's W&B upload is best effort: if it fails after `report.md` is written, the launcher logs a
+   `WARNING` and still ends successfully (the results are on the volume; sync them by hand).
 6. Hangs: each training chunk runs under GNU `timeout` (time to the deadline plus 30 min), evaluation commands under
    2 h and each smoke command under 1 h. A timeout is a failure: `FAILED` is written and the pod is terminated. A `SIGKILL` before the limit (exit 137, for example
    the out-of-memory killer) is reported as that, not as a timeout.

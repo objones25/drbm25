@@ -246,8 +246,15 @@ A100 / full layout (`configs/runpod_a100_full.yaml`):
   two concurrent jobs instead, and alternation isn't needed.
 - **Budget guard (RunPod).** The launcher takes the dollar budget and the pod's
   hourly price, and turns them into a wall-clock deadline. The trainer stops at the
-  next checkpoint boundary once the time left drops below the reserve needed for
-  final evaluation and upload, measured from observed chunk times. Live prices
+  next checkpoint boundary once one more chunk would end inside the reserve needed
+  for final evaluation and upload. The chunk estimate is the larger of the trainer's
+  own (mean PPO step time × steps per chunk) and the previous chunk's wall-clock,
+  which the launcher measures and passes as `--prev-chunk-s`, so per-chunk overhead
+  (torchrun start, model loads, vLLM init, validation, the ~74 GB sharded save) is
+  counted. Once either run has a checkpoint, the launcher keeps the micro-batch
+  size fixed: a new pod that cannot fit it fails loudly instead of stepping down, so
+  both runs train every step at the same size. The report's W&B upload is best
+  effort: a failure after `report.md` is written is a warning, not a failed run. Live prices
   (RunPod API, 2026-11-19): 2× A100 SXM 80GB community $2.78/h, secure $4.38/h;
   2× A100 PCIe 80GB community $2.38/h, secure $4.18/h. $100 ≈ 36–42 h on community
   cloud, ≈ 23–24 h on secure. Community availability was listed as LOW.
