@@ -116,7 +116,7 @@ class ValSample:
 
 
 @dataclass(frozen=True)
-class _Scored:
+class ScoredBatch:
     """Per-row scoring of one batch of responses under both BM25 modes."""
 
     parsed: list[ParsedRewrite | FormatError]
@@ -124,6 +124,54 @@ class _Scored:
     ndcg: dict[ScoringMode, list[float]]  # 0.0 for format errors and overflowing queries
     rewards: dict[ScoringMode, list[float]]
     search_s: float
+
+
+def search_all(searcher: Searcher, queries: Sequence[str], *, mode: ScoringMode, k: int) -> list[SearchResult | None]:
+    """Search every query; ``None`` marks a query over Lucene's clause limit (reward 0, counted)."""
+    if not queries:
+        return []
+    try:
+        return list(searcher.batch_search(queries, mode=mode, k=k))
+    except TooManyClausesError:
+        # batch_search surfaces only the first failure; redo one by one to find every overflow.
+        logger.warning("a %s query exceeded the clause limit; re-searching one by one", mode, exc_info=True)
+    out: list[SearchResult | None] = []
+    for query in queries:
+        try:
+            out.append(searcher.search(query, mode=mode, k=k))
+        except TooManyClausesError:
+            logger.warning("query over the clause limit scored 0 (%s mode)", mode, exc_info=True)
+            out.append(None)
+    return out
+
+
+def score_responses(
+    searcher: Searcher, texts: Sequence[str], examples: Sequence[Example], *, k: int
+) -> ScoredBatch:
+    """Parse each response, search the rewrites under both modes, and score nDCG@k and reward."""
+    parsed = [parse_response(t) for t in texts]
+    queries = [(i, p.query) for i, p in enumerate(parsed) if isinstance(p, ParsedRewrite)]
+    results: dict[ScoringMode, list[SearchResult | None]] = {}
+    start = time.perf_counter()
+    for mode in _MODES:
+        found = search_all(searcher, [q for _, q in queries], mode=mode, k=k)
+        per_row: list[SearchResult | None] = [None] * len(parsed)
+        for (i, _), result in zip(queries, found, strict=True):
+            per_row[i] = result
+        results[mode] = per_row
+    search_s = time.perf_counter() - start
+    ndcg: dict[ScoringMode, list[float]] = {}
+    rewards: dict[ScoringMode, list[float]] = {}
+    for mode in _MODES:
+        ndcg[mode] = [
+            0.0 if r is None else ndcg_at_k(r.doc_ids, e.relevant_ids, k)
+            for r, e in zip(results[mode], examples, strict=True)
+        ]
+        rewards[mode] = [
+            compute_reward(p, None if isinstance(p, FormatError) else n)
+            for p, n in zip(parsed, ndcg[mode], strict=True)
+        ]
+    return ScoredBatch(parsed=parsed, results=results, ndcg=ndcg, rewards=rewards, search_s=search_s)
 
 
 def tempered_response_logits(logits: Tensor, *, prompt_len: int, temperature: float) -> Tensor:
@@ -328,49 +376,9 @@ class PPOTrainer:
         self._critic_opt.load_state_dict(states["critic"])
 
     # ------------------------------------------------------------------ scoring
-    def _score(self, texts: Sequence[str], examples: Sequence[Example], *, k: int | None = None) -> _Scored:
+    def _score(self, texts: Sequence[str], examples: Sequence[Example], *, k: int | None = None) -> ScoredBatch:
         k = self._cfg.retrieval.train_k if k is None else k
-        parsed = [parse_response(t) for t in texts]
-        queries = [(i, p.query) for i, p in enumerate(parsed) if isinstance(p, ParsedRewrite)]
-        results: dict[ScoringMode, list[SearchResult | None]] = {}
-        start = time.perf_counter()
-        for mode in _MODES:
-            found = self._search_all([q for _, q in queries], mode=mode, k=k)
-            per_row: list[SearchResult | None] = [None] * len(parsed)
-            for (i, _), result in zip(queries, found, strict=True):
-                per_row[i] = result
-            results[mode] = per_row
-        search_s = time.perf_counter() - start
-        ndcg: dict[ScoringMode, list[float]] = {}
-        rewards: dict[ScoringMode, list[float]] = {}
-        for mode in _MODES:
-            ndcg[mode] = [
-                0.0 if r is None else ndcg_at_k(r.doc_ids, e.relevant_ids, k)
-                for r, e in zip(results[mode], examples, strict=True)
-            ]
-            rewards[mode] = [
-                compute_reward(p, None if isinstance(p, FormatError) else n)
-                for p, n in zip(parsed, ndcg[mode], strict=True)
-            ]
-        return _Scored(parsed=parsed, results=results, ndcg=ndcg, rewards=rewards, search_s=search_s)
-
-    def _search_all(self, queries: Sequence[str], *, mode: ScoringMode, k: int) -> list[SearchResult | None]:
-        """Search every query; ``None`` marks a query over Lucene's clause limit (reward 0, counted)."""
-        if not queries:
-            return []
-        try:
-            return list(self._searcher.batch_search(queries, mode=mode, k=k))
-        except TooManyClausesError:
-            # batch_search surfaces only the first failure; redo one by one to find every overflow.
-            logger.warning("a %s query exceeded the clause limit; re-searching one by one", mode, exc_info=True)
-        out: list[SearchResult | None] = []
-        for query in queries:
-            try:
-                out.append(self._searcher.search(query, mode=mode, k=k))
-            except TooManyClausesError:
-                logger.warning("query over the clause limit scored 0 (%s mode)", mode, exc_info=True)
-                out.append(None)
-        return out
+        return score_responses(self._searcher, texts, examples, k=k)
 
     def _checked_rewards(self, rewards: Sequence[float], step: int) -> Tensor:
         tensor = torch.tensor(rewards, dtype=torch.float32, device=self._dist.device)
@@ -554,7 +562,7 @@ class PPOTrainer:
         return stats, layer_norms
 
     # ------------------------------------------------------------------ metrics
-    def _reward_metrics(self, scored: _Scored, rewards: Tensor) -> dict[str, float]:
+    def _reward_metrics(self, scored: ScoredBatch, rewards: Tensor) -> dict[str, float]:
         n = len(scored.parsed)
         mode = self._reward_mode
         reasons = [p.reason for p in scored.parsed if isinstance(p, FormatError)]

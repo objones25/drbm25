@@ -248,6 +248,13 @@ def _prune(run_dir: Path, *, keep: int, protect: str) -> None:
         _remove_dir(old)
 
 
+def complete_steps(run_dir: Path) -> list[int]:
+    """Steps that have a complete checkpoint in ``run_dir``, ascending."""
+    if not run_dir.is_dir():
+        return []
+    return [int(p.name[len(_STEP_PREFIX) :]) for p in _complete_step_dirs(run_dir)]
+
+
 def latest_checkpoint(run_dir: Path) -> Path | None:
     """The dir named by ``latest`` if complete, else the newest complete ``step_*`` dir."""
     pointer = run_dir / _LATEST_FILE

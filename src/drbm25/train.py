@@ -173,7 +173,7 @@ def check_tokenizer(tokenizer: PreTrainedTokenizerBase) -> None:
 
 
 # ---------------------------------------------------------------------------- building blocks
-def _build_base(cfg: Config, device: torch.device) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+def build_base(cfg: Config, device: torch.device) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
     if cfg.model.name == TINY_MODEL:
         tiny = build_tiny_qwen2(seed=cfg.run.seed)
         nn.Module.to(tiny, device)  # transformers' decorated .to() confuses pyright
@@ -189,7 +189,7 @@ def _build_base(cfg: Config, device: torch.device) -> tuple[PreTrainedModel, Pre
     return base, tokenizer
 
 
-def _check_layout(cfg: Config, device: torch.device) -> LoraCfg:
+def check_layout(cfg: Config, device: torch.device) -> LoraCfg:
     if cfg.model.train_mode != "lora" or cfg.lora is None:
         raise ConfigError("this CLI builds the LoRA layout only; train_mode 'full' needs the FSDP2 layout (A100 task)")
     if cfg.rollout.backend != "hf":
@@ -289,7 +289,7 @@ class _Budget:
 
 
 def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
-    lora = _check_layout(cfg, dist.device)
+    lora = check_layout(cfg, dist.device)
     validate_for_runtime(cfg, device_capability=_device_capability(dist.device), world_size=dist.world_size)
     check_cuda_arch(dist.device)
     check_java()
@@ -304,7 +304,7 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
     val, _ = split_dev(load_examples(data_dir / DEV_FILE), val_size=cfg.data.val_size)
     _seed(cfg.run.seed + dist.rank)
 
-    base, tokenizer = _build_base(cfg, dist.device)
+    base, tokenizer = build_base(cfg, dist.device)
     check_tokenizer(tokenizer)
     models = LoraPolicyModels(base, lora, gradient_checkpointing=cfg.model.gradient_checkpointing)
     engine = HFGenerateEngine(models, tokenizer, cfg.rollout, dist.device)
