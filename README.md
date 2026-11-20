@@ -254,22 +254,31 @@ the dollars still left to spend. Then it:
    2.8.0"), the volume at `/workspace`, 80 GB container disk, ports 22 and 8888. Its start command is
    `scripts/runpod/pod_bootstrap.sh`: it starts the image's `/start.sh` (SSH, Jupyter) in the background, fetches
    the ref into `/workspace/drbm25/repo` (reusing an earlier clone), then runs `run_all.sh` with stdin from
-   `/dev/null`. The budget, the quoted price, `TERMINATE_ON_FINISH=yes`, the volume size, the W&B settings and
-   `DRBM25_HARD_DEADLINE_UNIX` go in as plain environment variables;
+   `/dev/null`. The budget, the quoted price, `TERMINATE_ON_FINISH=yes`, the volume size, the W&B settings, a
+   launch id and two absolute deadlines go in as plain environment variables. The deadlines are
+   `DRBM25_BUDGET_DEADLINE_UNIX` = launch time + budget / price, and `DRBM25_HARD_DEADLINE_UNIX`, 1 h later;
 7. prints the pod id, the console URL (`https://console.runpod.io/pods`) and how to follow progress, and exits.
 
 Each RunPod endpoint used is listed with its documentation page at the top of `scripts/runpod/launch.sh`.
 
-Self-termination has several layers, so a broken launch does not keep billing:
-- `run_all.sh` terminates the pod when it ends, fails or is signalled.
-- `pod_bootstrap.sh` installs its exit trap before any step that can fail. It terminates the pod after
-  `run_all.sh` returns, or when the clone fails, or when the volume is not writable (it then logs to `/tmp`).
-- A watchdog process, started first, terminates the pod at `DRBM25_HARD_DEADLINE_UNIX`: launch time + budget /
-  price + 1 h, whatever the run is doing.
-- Every terminate call tries your key (the `drbm25_runpod_api_key` secret) first, then the pod-scoped
-  `RUNPOD_API_KEY` that RunPod injects into every pod. This covers a secret that was deleted or never replaced.
-- If terminating still fails, the watchdog retries with backoff for about 35 minutes. The bootstrap then exits so
-  the container stops; it does not wait on the image's services forever. Check `--status` if a launch went wrong.
+The pod is terminated through the RunPod API (the documented way to stop GPU billing) by three parties:
+- `run_all.sh`, when it ends, fails or is signalled.
+- `pod_bootstrap.sh`, on exit: after `run_all.sh` returns, after a skipped run, or after any failure. Failures
+  include a failed clone and a volume that is not writable (it then logs to `/tmp`). Its exit trap is in place
+  before any step that can fail.
+- A watchdog process, started first, at `DRBM25_HARD_DEADLINE_UNIX`, whatever the run is doing.
+
+Every terminate call tries your key (the `drbm25_runpod_api_key` secret) first, then the pod-scoped
+`RUNPOD_API_KEY` that RunPod injects into every pod. This covers a secret that was deleted or never replaced.
+If the calls keep failing, the watchdog retries every 10 minutes for about 48 hours and logs each attempt, while
+the bootstrap waits for it. The scripts do not assume that the container exiting ends billing. If a launch went
+wrong, check `--status` and the console.
+
+Restarts: if RunPod restarts the container, the bootstrap runs again with the same environment. It does not
+run `run_all.sh` again when this launch already finished (`/workspace/drbm25/.launch-<id>-done`, written when
+`run_all.sh` returns). It also does not run it when less than `RESERVE_S` remains before the budget deadline.
+In both cases it terminates the pod instead. Otherwise `run_all.sh` resumes from the latest checkpoint against
+the same absolute budget deadline.
 
 ### Cost
 
@@ -339,10 +348,12 @@ asks anything: a missing setting, or a secret reference RunPod did not replace (
    a re-run; Java, uv, `uv sync` and training run every launch (training resumes from the latest checkpoint), and the
    smoke test runs once per pod. The W&B project and entity you entered are applied to training, evaluation and the
    report.
-3. Budget: the deadline is `start + BUDGET_USD / PRICE_PER_HOUR` hours (`drbm25.budget.deadline_from_budget`).
-   For a pod made by `launch.sh`, `start` is when its container started (`DRBM25_POD_START_UNIX`, so clone time
-   counts); in the manual flow it is when `run_all.sh` starts. Image download and provisioning before that are
-   not counted. Spend (elapsed time x price) is written to `/workspace/drbm25/spend.json`
+3. Budget: for a pod made by `launch.sh` the deadline is the absolute `DRBM25_BUDGET_DEADLINE_UNIX` (launch
+   time + `BUDGET_USD / PRICE_PER_HOUR` hours), so a restarted container gets no fresh budget. In the manual flow
+   it is `start + BUDGET_USD / PRICE_PER_HOUR` hours from when `run_all.sh` starts
+   (`drbm25.budget.deadline_from_budget`). Spend is counted from the container's start (`DRBM25_POD_START_UNIX`)
+   on top of what `spend.json` already holds, so a restart adds only its own time; the gap between the last
+   record and a restart is not counted. Spend (elapsed time x price) is written to `/workspace/drbm25/spend.json`
    after every chunk and on exit, so a relaunch shows the total already spent; give it the remaining budget, not the
    original one. Training stops at the next
    checkpoint boundary once one more chunk would end less than `RESERVE_S` (default 3600 s, an unmeasured

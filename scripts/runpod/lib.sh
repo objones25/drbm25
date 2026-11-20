@@ -23,6 +23,7 @@
 #   smoke_stage                GPU tests, then the memory check at micro batch 8, 4, 2 (first that
 #                              passes is saved to $DRBM25_ROOT/micro_batch and used by every chunk)
 #   compute_deadline_unix START_UNIX BUDGET_USD PRICE_PER_HOUR   print the deadline (unix seconds)
+#   launch_deadline_unix START_UNIX BUDGET_USD PRICE_PER_HOUR    DRBM25_BUDGET_DEADLINE_UNIX, else the above
 #   run_alternating_chunks UNTIL CHUNK   status 0 done, 3 budget stop, 1 failure
 #   eval_stage, train_and_report UNTIL CHUNK
 #   spend_begin / spend_record / spend_total   dollars spent, kept in spend.json on the volume
@@ -772,6 +773,17 @@ smoke_stage() {
 }
 
 # ---------------------------------------------------------------- budget
+
+# The budget deadline of this launch. A pod made by launch.sh carries it as an absolute time
+# (DRBM25_BUDGET_DEADLINE_UNIX = launch time + budget / price), so a restarted container cannot start a fresh
+# budget from its own start time; otherwise it is START + BUDGET / PRICE (compute_deadline_unix).
+launch_deadline_unix() {
+  if [[ ${DRBM25_BUDGET_DEADLINE_UNIX-} =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$DRBM25_BUDGET_DEADLINE_UNIX"
+    return 0
+  fi
+  compute_deadline_unix "$@"
+}
 
 compute_deadline_unix() {
   local start=$1 budget=$2 price=$3

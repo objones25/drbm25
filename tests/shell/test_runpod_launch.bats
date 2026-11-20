@@ -692,7 +692,8 @@ EOF
   # The image's services would run forever; the bootstrap must not wait on them.
   printf '#!/usr/bin/env bash\necho $$ >"$STUB_DIR/start.pid"\nexec sleep 120\n' >"$BATS_TEST_TMPDIR/start.sh"
   chmod +x "$BATS_TEST_TMPDIR/start.sh"
-  run bootstrap_bounded DRBM25_HARD_DEADLINE_UNIX=$(($(date +%s) + 3600))
+  # DRBM25_WATCHDOG_ROUNDS shortens the watchdog's 48 h of retries to 12 rounds (sleep is a stub here).
+  run bootstrap_bounded DRBM25_HARD_DEADLINE_UNIX=$(($(date +%s) + 3600)) DRBM25_WATCHDOG_ROUNDS=12
   kill "$(cat "$STUB_DIR/start.pid")" 2>/dev/null || true
   ((status != 0 && status != 142)) # 142: killed by the 60 s alarm, i.e. a hang
   (($(grep -c '^DELETE' "$STUB_DIR/calls.log") > 2))
@@ -704,4 +705,85 @@ EOF
   : >"$BATS_TEST_TMPDIR/not-a-dir"
   BOOT_ROOT=$BATS_TEST_TMPDIR/not-a-dir/drbm25 TMPDIR=$BATS_TEST_TMPDIR/not-a-dir/tmp run -1 bootstrap_bounded
   grep -q '^DELETE https://api.runpod.io/v2/pods/pod123$' "$STUB_DIR/calls.log"
+}
+
+# ---------------------------------------------------------------- fix round 2
+
+@test "the pod env carries absolute deadlines and a launch id" {
+  local before after budget hard id
+  before=$(date +%s)
+  run -0 launch --yes
+  after=$(date +%s)
+  run -0 body_of POST_v2_pods
+  budget=$(jq -r '.["env"]["DRBM25_BUDGET_DEADLINE_UNIX"]' <<<"$output")
+  hard=$(jq -r '.["env"]["DRBM25_HARD_DEADLINE_UNIX"]' <<<"$output")
+  id=$(jq -r '.["env"]["DRBM25_LAUNCH_ID"]' <<<"$output")
+  # 150 / 4.38 h = 123287.67 s
+  ((budget >= before + 123287 - 1 && budget <= after + 123288 + 1))
+  ((hard == budget + 3600))
+  [[ $id =~ ^[A-Za-z0-9_-]{8,}$ ]]
+}
+
+@test "two launches get different launch ids" {
+  run -0 launch --yes
+  local first
+  first=$(body_of POST_v2_pods | jq -r '.["env"]["DRBM25_LAUNCH_ID"]')
+  run -0 launch --yes
+  [[ $(body_of POST_v2_pods | jq -r '.["env"]["DRBM25_LAUNCH_ID"]') != "$first" ]]
+}
+
+@test "bootstrap writes the launch's done marker when run_all.sh returns" {
+  make_fixture_repo
+  run -0 bootstrap_bounded DRBM25_LAUNCH_ID=L2
+  [[ -f $BATS_TEST_TMPDIR/ws/drbm25/.launch-L2-done ]]
+}
+
+@test "a restarted bootstrap after its launch finished does not run run_all.sh again, and terminates" {
+  make_fixture_repo
+  mkdir -p "$BATS_TEST_TMPDIR/ws/drbm25"
+  date >"$BATS_TEST_TMPDIR/ws/drbm25/.launch-L1-done"
+  run bootstrap_bounded DRBM25_LAUNCH_ID=L1
+  [[ ! -f $STUB_DIR/run_all.out ]]
+  grep -q '^DELETE https://api.runpod.io/v2/pods/pod123$' "$STUB_DIR/calls.log"
+}
+
+@test "another launch's done marker does not stop this launch" {
+  make_fixture_repo
+  mkdir -p "$BATS_TEST_TMPDIR/ws/drbm25"
+  date >"$BATS_TEST_TMPDIR/ws/drbm25/.launch-OLD-done"
+  run -0 bootstrap_bounded DRBM25_LAUNCH_ID=NEW
+  grep -qx version=v1 "$STUB_DIR/run_all.out"
+}
+
+@test "a restarted bootstrap past the budget deadline minus the reserve does not run run_all.sh, and terminates" {
+  make_fixture_repo
+  run bootstrap_bounded DRBM25_LAUNCH_ID=L3 DRBM25_BUDGET_DEADLINE_UNIX=$(($(date +%s) + 600))
+  [[ ! -f $STUB_DIR/run_all.out ]]
+  grep -q '^DELETE https://api.runpod.io/v2/pods/pod123$' "$STUB_DIR/calls.log"
+}
+
+@test "bootstrap runs run_all.sh when the budget deadline is more than the reserve away" {
+  make_fixture_repo
+  run -0 bootstrap_bounded DRBM25_LAUNCH_ID=L4 DRBM25_BUDGET_DEADLINE_UNIX=$(($(date +%s) + 7200))
+  grep -qx version=v1 "$STUB_DIR/run_all.out"
+}
+
+@test "the watchdog keeps retrying past 8 rounds until terminate succeeds" {
+  make_fixture_repo
+  # The bootstrap's own attempt (user key, pod key) and 10 watchdog rounds fail; the 11th round's first call works.
+  local i
+  for i in $(seq 1 22); do echo 500; done >"$STUB_DIR/resp/DELETE_v2_pods_pod123.status"
+  echo 204 >>"$STUB_DIR/resp/DELETE_v2_pods_pod123.status"
+  run bootstrap_bounded DRBM25_REPO_URL="file://$BATS_TEST_TMPDIR/nope" DRBM25_HARD_DEADLINE_UNIX=$(($(date +%s) + 3600))
+  [[ $(grep -c '^DELETE' "$STUB_DIR/calls.log") == 23 ]]
+  grep -q 'terminated pod pod123' "$BATS_TEST_TMPDIR"/ws/drbm25/logs/bootstrap-*.log
+}
+
+@test "the watchdog waits 10 minutes between late retries" {
+  make_fixture_repo
+  resp_status DELETE_v2_pods_pod123 500
+  run bootstrap_bounded DRBM25_REPO_URL="file://$BATS_TEST_TMPDIR/nope" DRBM25_HARD_DEADLINE_UNIX=$(($(date +%s) + 3600)) \
+    DRBM25_WATCHDOG_ROUNDS=10
+  grep -q '^sleep 600$' "$STUB_DIR/calls.log"
+  ! grep -q '^sleep \(6[0-9][1-9]\|[7-9][0-9][0-9]\|[0-9]\{4,\}\)$' "$STUB_DIR/calls.log"
 }

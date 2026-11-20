@@ -7,14 +7,18 @@
 # Order, chosen so every failure still reaches the terminate call:
 #   1. save RunPod's pod-scoped RUNPOD_API_KEY, install the EXIT/signal traps;
 #   2. open the log ($DRBM25_ROOT/logs/bootstrap-<time>.log, or $TMPDIR when the volume is not writable);
-#   3. start the watchdog: an independent process that terminates the pod at DRBM25_HARD_DEADLINE_UNIX
-#      (launch time + budget / price + 1 h, from launch.sh) whatever the run is doing;
-#   4. start the image's services (SSH, Jupyter), fetch DRBM25_REF of DRBM25_REPO_URL into $DRBM25_ROOT/repo
-#      (reusing an earlier clone), and run run_all.sh unattended (DRBM25_NONINTERACTIVE=1, stdin /dev/null).
-# On exit (success, failure or signal), unless TERMINATE_ON_FINISH=no, it terminates the pod (run_all.sh has
-# normally done so already). If that fails it hands over to the watchdog, which retries with backoff for about
-# 35 minutes and then stops this process; the bootstrap then exits, ending the container, rather than waiting
-# on the image's services forever.
+#   3. start the watchdog: an independent process that terminates the pod through the API at
+#      DRBM25_HARD_DEADLINE_UNIX (launch time + budget / price + 1 h, from launch.sh) whatever the run is doing;
+#   4. start the image's services (SSH, Jupyter);
+#   5. skip the run when this is a restarted container whose launch already finished (marker
+#      $DRBM25_ROOT/.launch-<DRBM25_LAUNCH_ID>-done) or whose budget is used up (now >= DRBM25_BUDGET_DEADLINE_UNIX
+#      - RESERVE_S); otherwise fetch DRBM25_REF of DRBM25_REPO_URL into $DRBM25_ROOT/repo (reusing an earlier
+#      clone) and run run_all.sh unattended (DRBM25_NONINTERACTIVE=1, stdin /dev/null), then write the marker.
+# The pod is terminated through the RunPod API: by run_all.sh when it ends, by the watchdog at the hard
+# deadline, and by this script on exit (after the run, a skipped run or any failure) unless
+# TERMINATE_ON_FINISH=no. If that call fails, the watchdog keeps retrying every 10 minutes for about 48 hours
+# and this script waits for it (a bounded wait). Nothing here assumes that the container exiting ends
+# billing: RunPod documents only the API stop and terminate calls for that.
 #
 # Terminate keys, in order: DRBM25_RUNPOD_API_KEY (the user's pods:write key, a RunPod secret) unless it is
 # missing or an unreplaced {{ RUNPOD_SECRET_* }} reference, then the pod-scoped RUNPOD_API_KEY that RunPod
@@ -22,8 +26,9 @@
 #
 # Environment (set by launch.sh in the pod body): DRBM25_REPO_URL, DRBM25_REF, DRBM25_RUNPOD_API_KEY,
 # DRBM25_HARD_DEADLINE_UNIX, TERMINATE_ON_FINISH; RUNPOD_POD_ID and RUNPOD_API_KEY are set by RunPod.
+# Also read: DRBM25_BUDGET_DEADLINE_UNIX, DRBM25_LAUNCH_ID (launch.sh), RESERVE_S (default 3600, as run_all.sh).
 # Test hooks: DRBM25_ROOT (default /workspace/drbm25), DRBM25_START_SH (default /start.sh), DRBM25_SLEEP
-# (command used for terminate backoff).
+# (command used for terminate backoff), DRBM25_WATCHDOG_ROUNDS (default 300).
 # Requires: bash, git (installed with apt-get if missing), curl; setsid when present. Runs on the pod (Ubuntu 24.04).
 # audit-bash disable-file=B403 # run as `bash -c "<text>"` by the pod, never sourced
 # bash-target: 3.2
@@ -38,7 +43,10 @@ readonly ROOT=${DRBM25_ROOT:-/workspace/drbm25}
 readonly START_SH=${DRBM25_START_SH:-/start.sh}
 readonly FETCH_TIMEOUT_S=900
 readonly BOOTSTRAP_TERMINATE_ROUNDS=3 # without a watchdog to hand over to
-readonly WATCHDOG_TERMINATE_ROUNDS=8  # backoff 30, 60, ..., 600 s: about 35 minutes
+# Waits of 30, 60, 120, 240, 480 s, then 600 s: 300 rounds is about 49 hours of retries, a bound, not forever.
+readonly WATCHDOG_TERMINATE_ROUNDS=${DRBM25_WATCHDOG_ROUNDS:-300}
+# Same default as run_all.sh's DEFAULT_RESERVE_S: with less than this left there is no time to train and evaluate.
+readonly RESERVE_S_DEFAULT=3600
 
 LOGFILE=''
 WATCHDOG_PID=''
@@ -105,11 +113,11 @@ terminate_retry() {
 
 # ---------------------------------------------------------------- watchdog (runs as its own process)
 
-# watchdog_main DEADLINE_UNIX BOOTSTRAP_PID ROUNDS: sleeps until the deadline, or until SIGUSR1 (the bootstrap
-# could not terminate), then terminates the pod in ROUNDS rounds. If that fails too, it sends SIGTERM to the
-# bootstrap (PID 1) so the container exits. SIGTERM ends it quietly (the run finished normally).
+# watchdog_main DEADLINE_UNIX ROUNDS: sleeps until the deadline, or until SIGUSR1 (the bootstrap could not
+# terminate), then tries to terminate the pod in up to ROUNDS rounds (every 10 minutes once the backoff
+# reaches it), logging each failed round. SIGTERM ends it quietly (the run finished normally).
 watchdog_main() {
-  local deadline=$1 parent=$2 rounds=$3 now polls
+  local deadline=$1 rounds=$2 now polls
   WD_GO=0
   WD_SLEEP_PID=''
   trap 'WD_GO=1; if [[ -n $WD_SLEEP_PID ]]; then kill "$WD_SLEEP_PID" 2>/dev/null; fi' USR1
@@ -125,14 +133,13 @@ watchdog_main() {
     WD_SLEEP_PID=''
   done
   if ((WD_GO)); then
-    log "watchdog: the bootstrap could not terminate the pod; retrying for about 35 minutes"
+    log "watchdog: the bootstrap could not terminate the pod; retrying (up to $rounds rounds, every 10 minutes at most)"
   else
     log "watchdog: hard deadline $deadline reached; terminating the pod whatever the run is doing"
   fi
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   if terminate_retry "$rounds"; then exit 0; fi
-  log "watchdog: ERROR: could not terminate pod ${RUNPOD_POD_ID-}; stopping the bootstrap (pid $parent) so the container exits. Check https://console.runpod.io/pods"
-  kill -TERM "$parent" 2>/dev/null || true
+  log "watchdog: ERROR: could not terminate pod ${RUNPOD_POD_ID-} in $rounds rounds; it may still be billing. Terminate it at https://console.runpod.io/pods"
   exit 1
 }
 
@@ -140,6 +147,10 @@ watchdog_main() {
 # available, so nothing run_all.sh does to its own process groups reaches it.
 start_watchdog() {
   local deadline=${DRBM25_HARD_DEADLINE_UNIX-} file
+  if [[ ! $WATCHDOG_TERMINATE_ROUNDS =~ ^[1-9][0-9]*$ ]]; then
+    log "WARNING: DRBM25_WATCHDOG_ROUNDS must be a positive whole number: no watchdog"
+    return 0
+  fi
   if [[ ! $deadline =~ ^[0-9]+$ ]]; then
     log "WARNING: DRBM25_HARD_DEADLINE_UNIX is not set: no watchdog; only run_all.sh's own budget stop applies"
     return 0
@@ -154,9 +165,9 @@ start_watchdog() {
     printf 'watchdog_main "$@"\n'
   } >"$file"
   if command -v setsid >/dev/null 2>&1; then
-    setsid bash "$file" "$deadline" "$$" "$WATCHDOG_TERMINATE_ROUNDS" </dev/null &
+    setsid bash "$file" "$deadline" "$WATCHDOG_TERMINATE_ROUNDS" </dev/null &
   else
-    bash "$file" "$deadline" "$$" "$WATCHDOG_TERMINATE_ROUNDS" </dev/null &
+    bash "$file" "$deadline" "$WATCHDOG_TERMINATE_ROUNDS" </dev/null &
   fi
   WATCHDOG_PID=$!
   log "watchdog started (pid $WATCHDOG_PID): terminates the pod at unix time $deadline"
@@ -203,6 +214,32 @@ fetch_repo() {
   log "checked out $DRBM25_REF ($sha)"
 }
 
+# Restart guards. A container that RunPod restarts runs this script again with the same environment; it must
+# not train again after its launch finished, nor start once the launch's budget is used up. Prints the reason
+# and returns 0 when the run must be skipped.
+skip_reason() {
+  local id=${DRBM25_LAUNCH_ID-} budget=${DRBM25_BUDGET_DEADLINE_UNIX-} reserve=${RESERVE_S:-$RESERVE_S_DEFAULT} now
+  if [[ $id =~ ^[A-Za-z0-9_-]+$ && -f $ROOT/.launch-$id-done ]]; then
+    printf 'launch %s already finished (marker %s); this is a restarted container\n' "$id" "$ROOT/.launch-$id-done"
+    return 0
+  fi
+  now=$(date +%s)
+  if [[ $budget =~ ^[0-9]+$ && $reserve =~ ^[0-9]+$ ]] && ((now >= budget - reserve)); then
+    printf 'the budget deadline %s minus the reserve %ss has passed (now %s)\n' "$budget" "$reserve" "$now"
+    return 0
+  fi
+  return 1
+}
+
+mark_launch_done() {
+  local id=${DRBM25_LAUNCH_ID-}
+  if [[ ! $id =~ ^[A-Za-z0-9_-]+$ ]]; then
+    log "WARNING: no valid DRBM25_LAUNCH_ID: a restarted container would run run_all.sh again"
+    return 0
+  fi
+  date '+%Y-%m-%dT%H:%M:%S' >"$ROOT/.launch-$id-done" || log "WARNING: could not write $ROOT/.launch-$id-done"
+}
+
 # EXIT trap. Never waits without a bound: on the image's services only when the user asked to keep the pod.
 on_exit() {
   local status=$1
@@ -228,12 +265,12 @@ on_exit() {
   log "ERROR: could not terminate pod ${RUNPOD_POD_ID-} (log: $LOGFILE)"
   if [[ -n $WATCHDOG_PID ]] && kill -0 "$WATCHDOG_PID" 2>/dev/null; then
     kill -USR1 "$WATCHDOG_PID" 2>/dev/null
-    # Bounded: the watchdog gives up after WATCHDOG_TERMINATE_ROUNDS rounds.
+    # Bounded: the watchdog gives up after WATCHDOG_TERMINATE_ROUNDS rounds (about 49 h by default).
     wait "$WATCHDOG_PID" 2>/dev/null
   else
     terminate_retry "$BOOTSTRAP_TERMINATE_ROUNDS"
   fi
-  log "exiting so the container stops; if the pod still shows in https://console.runpod.io/pods, terminate it there"
+  log "ERROR: the pod may still exist and bill; check https://console.runpod.io/pods or launch.sh --status"
   exit 1
 }
 
@@ -255,6 +292,12 @@ main() {
     log "WARNING: $START_SH not found: SSH and Jupyter are not started; follow the run with launch.sh --logs"
   fi
 
+  local reason
+  # shellcheck disable=SC2310 # a predicate: its status is the answer
+  if reason=$(skip_reason); then
+    log "not running run_all.sh: $reason"
+    return 0
+  fi
   if [[ -z ${DRBM25_REPO_URL-} || -z ${DRBM25_REF-} ]]; then
     log "error: DRBM25_REPO_URL and DRBM25_REF must be set (launch.sh sets them)"
     return 1
@@ -279,6 +322,7 @@ main() {
   wait "$RUN_ALL_PID" || rc=$?
   RUN_ALL_PID=''
   log "run_all.sh exited with status $rc"
+  mark_launch_done
   return "$rc"
 }
 

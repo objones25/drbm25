@@ -41,7 +41,9 @@ which training stops so evaluation and the report still fit.
 Unattended (DRBM25_NONINTERACTIVE=1, or stdin is not a terminal; set by pod_bootstrap.sh when launch.sh created
 the pod): nothing is ever asked; a missing setting is a failure (FAILED marker, pod terminated), and a FAILED
 marker from an earlier launch terminates the pod too. DRBM25_CLEAR_FAILED=1 moves that marker into logs/ and
-runs. DRBM25_POD_START_UNIX (the container's start) is used as the start of this launch's spend.
+runs. DRBM25_POD_START_UNIX (the container's start) is used as the start of this launch's spend, and
+DRBM25_BUDGET_DEADLINE_UNIX (absolute, from launch.sh) as the budget deadline, so a restarted container
+neither double-counts spend nor gets a fresh budget.
 
 Exit status: 0 success, 1 failure (a FAILED marker is left in /workspace/drbm25; an interactive launch that finds one stops without terminating the pod), 2 usage error.
 EOF2
@@ -127,7 +129,7 @@ main() {
   total_steps=$(config_run_int "$RUNPOD_CONFIG" total_steps)
   chunk_steps=$(config_run_int "$RUNPOD_CONFIG" chunk_steps)
   RESERVE_S=${RESERVE_S:-$DEFAULT_RESERVE_S}
-  deadline=$(compute_deadline_unix "$start_unix" "$BUDGET_USD" "$PRICE_PER_HOUR")
+  deadline=$(launch_deadline_unix "$start_unix" "$BUDGET_USD" "$PRICE_PER_HOUR")
   DEADLINE_UNIX=$deadline
   export DEADLINE_UNIX RESERVE_S
   now=$(date +%s)

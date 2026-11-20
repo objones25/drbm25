@@ -389,7 +389,8 @@ pod_body() {
     --arg runpod "{{ RUNPOD_SECRET_$SECRET_RUNPOD }}" \
     --arg project "$WANDB_PROJECT" --arg entity "$WANDB_ENTITY" --arg budget "$BUDGET_USD" \
     --arg price "$OFFER_PRICE" --arg volume_gb "$VOLUME_SIZE" --arg repo "$OPT_REPO_URL" --arg ref "$OPT_REF" \
-    --arg clear "$OPT_CLEAR_FAILED" --arg hard_deadline "$HARD_DEADLINE_UNIX" '{
+    --arg clear "$OPT_CLEAR_FAILED" --arg hard_deadline "$HARD_DEADLINE_UNIX" \
+    --arg budget_deadline "$BUDGET_DEADLINE_UNIX" --arg launch_id "$LAUNCH_ID" '{
       name: $name, image: $image, cloud: "SECURE", dataCenterIds: [$dc],
       gpu: {id: $gpu, count: $count, minCudaVersion: $min_cuda},
       disk: $disk, ports: ["8888/http", "22/tcp"], startSsh: true, startJupyter: true,
@@ -399,17 +400,24 @@ pod_body() {
         HF_TOKEN: $hf, WANDB_API_KEY: $wandb, DRBM25_RUNPOD_API_KEY: $runpod,
         WANDB_PROJECT: $project, WANDB_ENTITY: $entity, BUDGET_USD: $budget, PRICE_PER_HOUR: $price,
         TERMINATE_ON_FINISH: "yes", VOLUME_GB: $volume_gb, DRBM25_REPO_URL: $repo, DRBM25_REF: $ref,
-        DRBM25_NONINTERACTIVE: "1", DRBM25_CLEAR_FAILED: $clear, DRBM25_HARD_DEADLINE_UNIX: $hard_deadline
+        DRBM25_NONINTERACTIVE: "1", DRBM25_CLEAR_FAILED: $clear, DRBM25_HARD_DEADLINE_UNIX: $hard_deadline,
+        DRBM25_BUDGET_DEADLINE_UNIX: $budget_deadline, DRBM25_LAUNCH_ID: $launch_id
       }
     }'
 }
 
 create_pod() {
-  local out=$TMP_DIR/pod-resp.json body=$TMP_DIR/pod.json cost now
+  local out=$TMP_DIR/pod-resp.json body=$TMP_DIR/pod.json cost now suffix
   now=$(date +%s)
-  # Launch time + the hours the confirmed budget buys at the quoted price + a margin (the pod's watchdog).
-  HARD_DEADLINE_UNIX=$(awk -v t="$now" -v b="$BUDGET_USD" -v p="$OFFER_PRICE" -v m="$HARD_DEADLINE_MARGIN_S" \
-    'BEGIN { printf "%d", t + b / p * 3600 + m }')
+  # Absolute deadlines, so a container that RunPod restarts gets no fresh budget: the budget deadline is
+  # launch time + the hours the confirmed budget buys at the quoted price (run_all.sh's deadline), and the
+  # watchdog's hard deadline is a margin after it.
+  BUDGET_DEADLINE_UNIX=$(awk -v t="$now" -v b="$BUDGET_USD" -v p="$OFFER_PRICE" 'BEGIN { printf "%d", t + b / p * 3600 }')
+  HARD_DEADLINE_UNIX=$((BUDGET_DEADLINE_UNIX + HARD_DEADLINE_MARGIN_S))
+  # Names this launch's done marker on the volume (pod_bootstrap.sh): time plus 8 random hex digits.
+  suffix=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n') || die "cannot read /dev/urandom"
+  LAUNCH_ID=$(date -u '+%Y%m%dT%H%M%SZ')-$suffix
+  [[ $LAUNCH_ID =~ ^[0-9TZ]+-[0-9a-f]{8}$ ]] || die "could not make a launch id (got '$LAUNCH_ID')"
   pod_body >"$body"
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   if ! api "$out" POST /v2/pods "$body"; then

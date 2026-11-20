@@ -1183,3 +1183,28 @@ make_uv_tarball() {
   run -0 in_lib RUNPOD_POD_ID=pod123 DRBM25_POD_RUNPOD_API_KEY=pod_key
   [[ $(cat "$STUB_DIR/curl_stdin") == 'Authorization: Bearer pod_key' ]]
 }
+
+@test "launch_deadline_unix uses DRBM25_BUDGET_DEADLINE_UNIX from launch.sh instead of a fresh start + budget" {
+  SNIPPET='launch_deadline_unix 1700000000 90 2.78'
+  run -0 in_lib DRBM25_BUDGET_DEADLINE_UNIX=1700050000
+  [[ $output == 1700050000 ]]
+  ! grep -q deadline_from_budget "$STUB_LOG"
+}
+
+@test "launch_deadline_unix computes start + budget / price without a valid DRBM25_BUDGET_DEADLINE_UNIX" {
+  SNIPPET='launch_deadline_unix 1700000000 90 2.78'
+  run -0 in_lib DRBM25_BUDGET_DEADLINE_UNIX=junk
+  [[ $output == 1234567890 ]]
+  grep -q deadline_from_budget "$STUB_LOG"
+}
+
+@test "run_all.sh takes its deadline from launch_deadline_unix" {
+  grep -q 'deadline=$(launch_deadline_unix "$start_unix" "$BUDGET_USD" "$PRICE_PER_HOUR")' "$RUN_ALL"
+}
+
+@test "a restarted container adds only its own time to spend.json (no double counting)" {
+  printf '{"spent_usd": 10.0000, "updated_unix": 1699996000}\n' >"$DRBM25_ROOT/spend.json"
+  SNIPPET='spend_begin "$(launch_start_unix)" 2; spend_record; cat "$DRBM25_SPEND_FILE"'
+  run -0 in_lib DRBM25_NOW_UNIX=1700003600 DRBM25_POD_START_UNIX=1700000000
+  [[ $output == *'"spent_usd": 12.0000'* ]]
+}
