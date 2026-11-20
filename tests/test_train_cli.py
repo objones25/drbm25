@@ -6,16 +6,20 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
+import wandb
 import yaml
 
 import drbm25.train as train_module
 from drbm25.bm25.index import read_index_info
 from drbm25.config import load_config
 from drbm25.data import DEV_FILE, TRAIN_FILE
+from drbm25.obs.runs import STEP_METRIC
 from drbm25.obs.setup import shutdown
 from drbm25.ppo.trainer import NonFiniteError, PPOTrainer
 from drbm25.tiny import build_tiny_tokenizer
@@ -135,6 +139,12 @@ def test_cli_resume_continues_from_checkpoint_with_same_next_batch(workdir: Path
     assert [r["step"] for r in records if str(r["message"]).startswith("validation")] == [1, 3]
     rows = [json.loads(line) for line in (workdir / "out" / "chunked" / "metrics.jsonl").read_text().splitlines()]
     assert [row["step"] for row in rows] == [0, 1, 2, 3]
+    # Model, optimizer and RNG restore: after resuming, steps 2-3 match the uninterrupted run.
+    straight_rows = [
+        json.loads(line) for line in (workdir / "out" / "straight" / "metrics.jsonl").read_text().splitlines()
+    ]
+    for got, want in zip(rows[2:], straight_rows[2:], strict=True):
+        assert _deterministic(got) == pytest.approx(_deterministic(want), nan_ok=True)
     ids = {
         json.loads((workdir / "out" / "chunked" / f"step_00000{s}" / "meta.json").read_text())["train_state"][
             "wandb_run_id"
@@ -143,6 +153,17 @@ def test_cli_resume_continues_from_checkpoint_with_same_next_batch(workdir: Path
     }
     assert len(ids) == 1  # the resumed run reattached to the same W&B run id
     assert (workdir / "out" / "chunked" / "final_adapters.safetensors").is_file()  # total_steps reached
+
+
+_NONDETERMINISTIC_PREFIXES = ("time/", "sys/", "budget/")
+_NONDETERMINISTIC_KEYS = {"rollout/tokens_per_s", "search/seconds"}
+
+
+def _deterministic(row: dict[str, float]) -> dict[str, float]:
+    """The metrics that depend only on data, weights, optimizer state and RNG (not wall clock)."""
+    return {
+        k: v for k, v in row.items() if not k.startswith(_NONDETERMINISTIC_PREFIXES) and k not in _NONDETERMINISTIC_KEYS
+    }
 
 
 def _free_port() -> int:
@@ -309,6 +330,60 @@ def test_cli_alerts_and_exits_1_on_nonfinite_error(
     assert alerts == [("ERROR", "nan: training aborted")]
     assert (workdir / "out" / "nan" / "exit_code").read_text().strip() == "1"
     assert list((workdir / "out" / "nan").glob("step_*")) == []  # no checkpoint of a broken state
+
+
+@pytest.mark.java
+def test_exit_code_reads_1_while_the_run_is_in_progress(
+    workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A previous chunk's 0 must not survive a run that is killed before main's finally.
+    run_dir = workdir / "out" / "killed"
+    run_dir.mkdir(parents=True)
+    (run_dir / "exit_code").write_text("0\n")
+    during: list[str] = []
+
+    def fake_train(*_: object) -> int:
+        during.append((run_dir / "exit_code").read_text().strip())
+        return EXIT_OK
+
+    monkeypatch.setattr(train_module, "_train", fake_train)
+    assert _main(_argv(workdir, toy_index, "killed")) == EXIT_OK
+    assert during == ["1"]
+    assert (run_dir / "exit_code").read_text().strip() == "0"
+
+
+class _FakeRun:
+    id = "fake-run"
+
+    def __init__(self) -> None:
+        self.logged: list[dict[str, Any]] = []
+
+    def log(self, data: dict[str, Any]) -> None:
+        self.logged.append(data)
+
+    def alert(self, **_: object) -> None:
+        pass
+
+
+@pytest.mark.java
+def test_cli_logs_histograms_to_wandb_on_deep_log_steps_only(
+    workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeRun()
+
+    @contextmanager
+    def fake_open_run(*_: object, **__: object) -> Iterator[_FakeRun]:
+        yield fake
+
+    monkeypatch.setattr(train_module, "open_run", fake_open_run)
+    assert _main(_argv(workdir, toy_index, "hist", "--until-step", "2")) == EXIT_OK
+    steps = [entry for entry in fake.logged if "ppo/policy_loss" in entry]
+    assert [entry[STEP_METRIC] for entry in steps] == [0, 1]
+    hist_keys = ("hist/kl_ref", "hist/advantages", "hist/response_len")
+    assert all(isinstance(steps[0][k], wandb.Histogram) for k in hist_keys)  # step 0: deep_log_every = 10
+    assert [k for k in steps[1] if k.startswith("hist/")] == []
+    rows = (workdir / "out" / "hist" / "metrics.jsonl").read_text()
+    assert "hist/" not in rows  # histograms go to W&B only
 
 
 @pytest.mark.java

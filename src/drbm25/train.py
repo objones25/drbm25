@@ -370,7 +370,9 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
                 indices = batch_indices(state.data_cursor, cfg.ppo.batch_size, len(train), cfg.run.seed)
                 logger.info("batch", extra={"batch_indices": indices})
                 started = time.perf_counter()
-                metrics = trainer.step([train[i] for i in indices[dist.rank * local : (dist.rank + 1) * local]], step=step)
+                metrics = trainer.step(
+                    [train[i] for i in indices[dist.rank * local : (dist.rank + 1) * local]], step=step
+                )
                 state = TrainState(step + 1, state.data_cursor + cfg.ppo.batch_size, state.wandb_run_id)
                 if len(budget.step_seconds) < CALIBRATION_STEPS:
                     # Running estimate on each of the first CALIBRATION_STEPS steps; logged once at the end.
@@ -380,7 +382,7 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
                         if len(budget.step_seconds) == CALIBRATION_STEPS:
                             logger.info("projected steps within budget: %.0f", metrics["budget/projected_steps"])
                 if dist.rank == 0:
-                    _log_step(run, run_dir, step, metrics)
+                    _log_step(run, run_dir, step, metrics, trainer.histograms())
                     if state.step % cfg.run.val_every == 0:
                         _validate(run, trainer, val, step)
                 if state.step % cfg.run.ckpt_every == 0:
@@ -399,24 +401,37 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
             logger.info("reached step %d", state.step)
             if run is not None and state.step >= cfg.run.total_steps:
                 adapters = run_dir / "final_adapters.safetensors"
-                save_file({k: v.detach().cpu().contiguous() for k, v in models.trainable_state_dict().items()}, adapters)
+                save_file(
+                    {k: v.detach().cpu().contiguous() for k, v in models.trainable_state_dict().items()}, adapters
+                )
                 log_checkpoint(run, adapters, name=f"{args.run_name}-adapters", artifact_type="model")
             _alert(run, f"{args.run_name}: finished", f"reached step {state.step}", "INFO")
     return exit_code
 
 
-def _log_step(run: wandb.Run | None, run_dir: Path, step: int, metrics: dict[str, float]) -> None:
-    # loss / grad_norm are the column names scripts/spike_monitor.py analyses.
+def _log_step(
+    run: wandb.Run | None,
+    run_dir: Path,
+    step: int,
+    metrics: dict[str, float],
+    histograms: dict[str, list[float]],
+) -> None:
+    """Append the scalar row to metrics.jsonl; send scalars and (deep-log steps) histograms to W&B."""
+    # loss / grad_norm are the column names scripts/spike_monitor.py analyses; histograms stay out
+    # of metrics.jsonl, which must hold numbers only.
     row = {"step": step, "loss": metrics["ppo/policy_loss"], "grad_norm": metrics["optim/actor_grad_norm"], **metrics}
     with (run_dir / "metrics.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(row) + "\n")
     if run is not None:
-        run.log({**metrics, STEP_METRIC: step})
+        hists = {key: wandb.Histogram(values) for key, values in histograms.items()}
+        run.log({**metrics, **hists, STEP_METRIC: step})
 
 
 def _validate(run: wandb.Run | None, trainer: PPOTrainer, val: Sequence[Example], step: int) -> None:
     metrics, samples = trainer.validate_with_samples(val)
-    logger.info("validation ndcg normal=%.4f count_once=%.4f", metrics["val/ndcg_normal"], metrics["val/ndcg_count_once"])
+    logger.info(
+        "validation ndcg normal=%.4f count_once=%.4f", metrics["val/ndcg_normal"], metrics["val/ndcg_count_once"]
+    )
     if run is None:
         return
     table = wandb.Table(columns=["query", "rewrite", "analyzed_terms", "reward_normal", "reward_count_once"])
@@ -434,6 +449,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         cfg = load_config(args.config, args.overrides)
         run_dir = cfg.run.output_dir / args.run_name
         run_dir.mkdir(parents=True, exist_ok=True)
+        if dist.rank == 0:
+            # Until the real code is written at the end, a killed process (OOM, Slurm limit,
+            # torchrun teardown) must not leave the previous chunk's 0 or 3 behind.
+            (run_dir / "exit_code").write_text(f"{EXIT_ERROR}\n")
         configure(level="INFO", fmt="json", log_file=str(run_dir / f"train_rank{dist.rank}.log"))
         bind_log_context(run_name=args.run_name, reward_mode=args.reward_mode, rank=dist.rank)
         code = _train(args, cfg, dist, run_dir)

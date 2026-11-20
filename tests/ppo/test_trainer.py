@@ -220,7 +220,18 @@ def test_response_logprobs_take_the_positions_that_predict_response_tokens() -> 
     expected = torch.stack([torch.log_softmax(logits[0, 2], -1)[4], torch.log_softmax(logits[0, 3], -1)[5]]).unsqueeze(
         0
     )
-    torch.testing.assert_close(response_logprobs(logits, ids, prompt_len=3), expected)
+    torch.testing.assert_close(response_logprobs(logits, ids, prompt_len=3, temperature=1.0), expected)
+
+
+def test_response_logprobs_use_the_sampling_temperature() -> None:
+    # Rollouts sample from softmax(logits / T); old, ref and new log-probs must score that policy.
+    gen = torch.Generator().manual_seed(1)
+    logits = torch.randn(1, 5, 7, generator=gen)
+    ids = torch.tensor([[1, 2, 3, 4, 5]])
+    expected = torch.stack(
+        [torch.log_softmax(logits[0, 2] / 0.5, -1)[4], torch.log_softmax(logits[0, 3] / 0.5, -1)[5]]
+    ).unsqueeze(0)
+    torch.testing.assert_close(response_logprobs(logits, ids, prompt_len=3, temperature=0.5), expected)
 
 
 def test_response_values_are_the_states_before_each_response_token() -> None:
@@ -257,6 +268,31 @@ def test_deep_log_keys_only_on_deep_log_steps(toy_index: Path) -> None:
     trainer, _ = make_trainer(cfg, searcher=ModeSearcher())
     metrics = trainer.step(examples(cfg.ppo.batch_size), step=1)  # deep_log_every = 10
     assert [k for k in metrics if k.startswith(("stab/", "layers/", "act/"))] == []
+
+
+def test_histograms_on_deep_log_steps_only(toy_index: Path) -> None:
+    cfg = smoke_cfg(toy_index)  # deep_log_every = 10
+    trainer, _ = make_trainer(cfg, searcher=ModeSearcher())
+    metrics = trainer.step(examples(cfg.ppo.batch_size), step=0)
+    hists = trainer.histograms()
+    assert sorted(hists) == ["hist/advantages", "hist/kl_ref", "hist/response_len"]
+    assert len(hists["hist/response_len"]) == cfg.ppo.batch_size
+    n_valid = int(sum(hists["hist/response_len"]))
+    assert len(hists["hist/kl_ref"]) == n_valid
+    assert len(hists["hist/advantages"]) == n_valid
+    assert sum(hists["hist/response_len"]) / cfg.ppo.batch_size == pytest.approx(metrics["rollout/response_len_mean"])
+    trainer.step(examples(cfg.ppo.batch_size), step=1)
+    assert trainer.histograms() == {}
+
+
+def test_per_layer_grad_norms_are_taken_before_clipping(toy_index: Path) -> None:
+    # One mini-batch and a tiny clip threshold: post-clip layer norms would add up to ~1e-9.
+    cfg = smoke_cfg(toy_index, **{"ppo.mini_batch_size": "4", "ppo.grad_clip": "1e-9"})
+    trainer, _ = make_trainer(cfg, searcher=ModeSearcher())
+    metrics = trainer.step(examples(cfg.ppo.batch_size, relevant="docN"), step=0)
+    layer_sq = sum(v**2 for k, v in metrics.items() if k.startswith("layers/actor/") and k.endswith("/grad_norm"))
+    assert metrics["optim/actor_grad_norm"] > 1e-6  # >> the clip threshold, so clipping changed the grads
+    assert math.sqrt(layer_sq) == pytest.approx(metrics["optim/actor_grad_norm"], rel=1e-4)
 
 
 def _split_params(models: LoraPolicyModels, base: torch.nn.Module) -> dict[str, dict[str, Tensor]]:
@@ -321,6 +357,86 @@ def test_too_many_clauses_scores_zero_and_is_counted(toy_index: Path) -> None:
     assert metrics["search/too_many_clauses_rate"] == pytest.approx(0.5)
     assert metrics["reward/min"] == pytest.approx(0.0)
     assert metrics["reward/mean"] == pytest.approx(0.55)  # half score 0, half 1.1
+
+
+class RecordingEngine(AnswerFormatEngine):
+    """Keeps the last rollout so a test can recompute log-probs from the same ids."""
+
+    last: RolloutBatch | None = None
+
+    def generate(self, prompts: Sequence[str], *, greedy: bool) -> RolloutBatch:
+        self.last = super().generate(prompts, greedy=greedy)
+        return self.last
+
+
+def _tempered_logprobs(logits: Tensor, ids: Tensor, prompt_len: int, temperature: float) -> Tensor:
+    logp = torch.log_softmax(logits[:, prompt_len - 1 : -1].float() / temperature, dim=-1)
+    return logp.gather(-1, ids[:, prompt_len:].unsqueeze(-1)).squeeze(-1)
+
+
+def test_old_and_ref_logprobs_score_the_tempered_sampling_policy(
+    toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = smoke_cfg(toy_index, **{"rollout.temperature": "0.5"})
+    assert cfg.lora is not None
+    models = LoraPolicyModels(build_tiny_qwen2(seed=0), cfg.lora, gradient_checkpointing=False)
+    engine = RecordingEngine(HFGenerateEngine(models, build_tiny_tokenizer(), cfg.rollout, CPU))
+    trainer = PPOTrainer(
+        cfg, models=models, engine=engine, searcher=ModeSearcher(), reward_mode="normal", dist=DIST, scaler=None
+    )
+    seen: dict[str, Tensor] = {}
+    real = trainer_module.kl_penalized_rewards
+
+    def spy(task_reward: Tensor, logprobs_old: Tensor, logprobs_ref: Tensor, mask: Tensor, **kw: float) -> Tensor:
+        batch = engine.last
+        assert batch is not None
+        p = batch.prompt_ids.shape[1]
+        ids = torch.cat([batch.prompt_ids, batch.response_ids], dim=1)
+        attn = torch.cat([batch.prompt_mask, batch.response_mask], dim=1)
+        with torch.no_grad():  # before any update: actor and ref forwards as the trainer ran them
+            seen["old"] = _tempered_logprobs(models.actor_logits(ids, attn), ids, p, 0.5)
+            seen["ref"] = _tempered_logprobs(models.ref_logits(ids, attn), ids, p, 0.5)
+        seen["got_old"], seen["got_ref"] = logprobs_old, logprobs_ref
+        return real(task_reward, logprobs_old, logprobs_ref, mask, **kw)
+
+    monkeypatch.setattr(trainer_module, "kl_penalized_rewards", spy)
+    trainer.step(examples(cfg.ppo.batch_size), step=0)
+    torch.testing.assert_close(seen["got_old"], seen["old"])
+    torch.testing.assert_close(seen["got_ref"], seen["ref"])
+
+
+def test_update_logprobs_and_entropy_use_the_same_tempered_logits(
+    toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = smoke_cfg(toy_index, **{"rollout.temperature": "0.5"})
+    assert cfg.lora is not None
+    models = LoraPolicyModels(build_tiny_qwen2(seed=0), cfg.lora, gradient_checkpointing=False)
+    engine = RecordingEngine(HFGenerateEngine(models, build_tiny_tokenizer(), cfg.rollout, CPU))
+    trainer = PPOTrainer(
+        cfg, models=models, engine=engine, searcher=ModeSearcher(), reward_mode="normal", dist=DIST, scaler=None
+    )
+    calls: list[tuple[Tensor, Tensor]] = []
+    entropy_logits: list[Tensor] = []
+    real_pg, real_ent = trainer_module.policy_loss, trainer_module.entropy_from_logits
+
+    def pg_spy(new: Tensor, old: Tensor, *args: Tensor, **kw: float) -> tuple[Tensor, dict[str, Tensor]]:
+        calls.append((new.detach(), old))
+        return real_pg(new, old, *args, **kw)
+
+    def ent_spy(logits: Tensor, mask: Tensor) -> Tensor:
+        entropy_logits.append(logits.detach())
+        return real_ent(logits, mask)
+
+    monkeypatch.setattr(trainer_module, "policy_loss", pg_spy)
+    monkeypatch.setattr(trainer_module, "entropy_from_logits", ent_spy)
+    trainer.step(examples(cfg.ppo.batch_size), step=0)
+    new, old = calls[0]
+    torch.testing.assert_close(new, old)  # first micro-batch, before any optimizer step: ratio 1
+    # The entropy sees exactly the tempered logits the new log-probs were gathered from.
+    assert engine.last is not None
+    response = engine.last.response_ids[: new.shape[0]]
+    gathered = torch.log_softmax(entropy_logits[0], dim=-1).gather(-1, response.unsqueeze(-1)).squeeze(-1)
+    torch.testing.assert_close(gathered, new)
 
 
 def test_step_rejects_wrong_local_batch_size(toy_index: Path) -> None:

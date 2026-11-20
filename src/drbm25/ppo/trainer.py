@@ -18,6 +18,8 @@ Alignment (prompt width ``P``, response width ``R``, sequence ``L = P + R``): lo
 the logits at ``P - 1 + j`` -> ``logits[:, P-1 : L-1]``. ``values[:, t]`` is the value of the
 state after token ``t``; token ``j`` is chosen in the state after token ``P - 1 + j`` -> the
 response values are ``values[:, P-1 : L-1]``. Both line up with the (unshifted) response mask.
+All log-probs (old, reference, new) and the entropy are computed from ``logits / T`` with
+``T = rollout.temperature``, the policy the rollouts were sampled from (as verl does).
 
 Whitening is per rank: with 2 ranks each whitens its own 32 rollouts. That differs from verl's
 whole-batch whitening by the spread of the two halves' statistics; it is accepted here because
@@ -58,7 +60,7 @@ from drbm25.obs.metrics import (
 )
 from drbm25.ppo.gae import gae, kl_penalized_rewards
 from drbm25.ppo.losses import entropy_from_logits, masked_mean, masked_whiten, policy_loss, value_loss
-from drbm25.ppo.models import PolicyModels, token_logprobs
+from drbm25.ppo.models import PolicyModels
 from drbm25.prompt import build_prompt
 from drbm25.reward import (
     FORMAT_BONUS,
@@ -124,10 +126,31 @@ class _Scored:
     search_s: float
 
 
-def response_logprobs(logits: Tensor, input_ids: Tensor, *, prompt_len: int) -> Tensor:
-    """``[B, R]`` fp32 log-prob of each response token (see the module docstring for the alignment)."""
-    _require_response(input_ids.shape[1], prompt_len)
-    return token_logprobs(logits[:, prompt_len - 1 :], input_ids[:, prompt_len - 1 :])
+def tempered_response_logits(logits: Tensor, *, prompt_len: int, temperature: float) -> Tensor:
+    """``[B, R, V]`` fp32 ``logits / temperature`` at the positions that predict response tokens.
+
+    Rollouts sample from ``softmax(logits / T)``, so old, reference and new log-probs and the
+    entropy must all score that tempered policy (verl divides by ``rollout.temperature`` in
+    ``dp_actor.py``). Every log-prob and entropy in the trainer goes through this one helper.
+    """
+    if not temperature > 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
+    _require_response(logits.shape[1], prompt_len)
+    return logits[:, prompt_len - 1 : -1].float() / temperature
+
+
+def response_logprobs(logits: Tensor, input_ids: Tensor, *, prompt_len: int, temperature: float) -> Tensor:
+    """``[B, R]`` fp32 log-prob of each response token under ``softmax(logits / temperature)``."""
+    return _gather_logprobs(
+        tempered_response_logits(logits, prompt_len=prompt_len, temperature=temperature), input_ids, prompt_len
+    )
+
+
+def _gather_logprobs(tempered: Tensor, input_ids: Tensor, prompt_len: int) -> Tensor:
+    response = input_ids[:, prompt_len:]
+    if tempered.shape[:2] != response.shape:
+        raise ValueError(f"tempered logits {tuple(tempered.shape)} do not match response ids {tuple(response.shape)}")
+    return torch.log_softmax(tempered, dim=-1).gather(-1, response.unsqueeze(-1)).squeeze(-1)
 
 
 def response_values(values: Tensor, *, prompt_len: int) -> Tensor:
@@ -196,8 +219,10 @@ class PPOTrainer:
                 f"per-rank batch {self._local_batch}, mini-batch {self._local_mini} and micro-batch "
                 f"{self._micro} must divide each other; run validate_for_runtime first"
             )
+        self._temperature = cfg.rollout.temperature  # training scores the sampling policy pi_T
         self._low_scale_streak = 0
         self._high_kl_streak = 0
+        self._histograms: dict[str, list[float]] = {}
 
     # ------------------------------------------------------------------ public API
     def step(self, examples: Sequence[Example], *, step: int) -> dict[str, float]:
@@ -247,11 +272,25 @@ class PPOTrainer:
         metrics.update(self._rollout_metrics(rollout, timings["generate"]))
         metrics.update({f"time/{name}": seconds for name, seconds in timings.items()})
         metrics.update(self._sys_metrics())
+        self._histograms = {}
         if deep:
             metrics.update(self._deep_metrics(ids[: self._micro], attn[: self._micro]))
+            valid = mask.bool()
+            self._histograms = {
+                "hist/kl_ref": (old - ref)[valid].tolist(),
+                "hist/advantages": adv_raw[valid].tolist(),
+                "hist/response_len": mask.sum(dim=1).tolist(),
+            }
         metrics = self._reduce(metrics)
         self._check_health(metrics, step)
         return metrics
+
+    def histograms(self) -> dict[str, list[float]]:
+        """This rank's per-token KL to ref, raw advantages (valid tokens) and response lengths.
+
+        Filled on deep-log steps only (empty otherwise); rank-local, not reduced. For W&B histograms.
+        """
+        return {key: list(values) for key, values in self._histograms.items()}
 
     def validate_with_samples(self, examples: Sequence[Example]) -> tuple[dict[str, float], list[ValSample]]:
         """Greedy rollouts scored with nDCG@10 under both modes, plus the first ``N_VAL_SAMPLES`` rows."""
@@ -353,12 +392,14 @@ class PPOTrainer:
         return [slice(i, i + self._micro) for i in range(0, n, self._micro)]
 
     @torch.no_grad()
-    def _no_grad_logprobs(self, forward: Callable[[Tensor, Tensor], Tensor], ids: Tensor, attn: Tensor, prompt_len: int) -> Tensor:
+    def _no_grad_logprobs(
+        self, forward: Callable[[Tensor, Tensor], Tensor], ids: Tensor, attn: Tensor, prompt_len: int
+    ) -> Tensor:
         parts = []
         for chunk in self._chunks(ids.shape[0]):
             with self._autocast():
                 logits = forward(ids[chunk], attn[chunk])
-            parts.append(response_logprobs(logits, ids[chunk], prompt_len=prompt_len))
+            parts.append(response_logprobs(logits, ids[chunk], prompt_len=prompt_len, temperature=self._temperature))
         return torch.cat(parts)
 
     @torch.no_grad()
@@ -406,14 +447,10 @@ class PPOTrainer:
                         ids[rows], attn[rows], mask[rows], old[rows], values[rows], advantages[rows],
                         returns[rows], prompt_len, n_micro=n_micro, step=step, stats=stats,
                     )  # fmt: skip
-                for key, value in self._optimizer_step(step).items():
+                optim_stats, norms = self._optimizer_step(step, deep=deep)
+                for key, value in optim_stats.items():
                     stats.setdefault(key, []).append(value)
-                if deep:  # grads of the last mini-batch are still present (unscaled, all-reduced)
-                    layers = self._models.decoder_layers()
-                    layer_norms = {
-                        **per_layer_grad_and_weight_norms(layers, "layers/actor", only=self._actor_params),
-                        **per_layer_grad_and_weight_norms(layers, "layers/critic", only=self._critic_params),
-                    }
+                layer_norms = norms or layer_norms  # deep steps: the last mini-batch's norms
         out = {key: _mean(vals) for key, vals in stats.items()}
         out["optim/actor_update_ratio"] = update_ratio(actor_before, self._actor_params)
         out["optim/critic_update_ratio"] = update_ratio(critic_before, self._critic_params)
@@ -441,14 +478,16 @@ class PPOTrainer:
         # Actor forward and backward first; the critic forward may only start after it (see module doc).
         with self._autocast():
             logits = self._models.actor_logits(ids, attn)
-        new = response_logprobs(logits, ids, prompt_len=prompt_len)
+        tempered = tempered_response_logits(logits, prompt_len=prompt_len, temperature=self._temperature)
+        del logits
+        new = _gather_logprobs(tempered, ids, prompt_len)
         _require_finite("logprobs_new", new, step)
-        entropy = entropy_from_logits(logits[:, prompt_len - 1 : -1], mask)
+        entropy = entropy_from_logits(tempered, mask)
         pg_loss, pg_stats = policy_loss(new, old, advantages, mask, clip_ratio=ppo.clip_ratio)
         actor_loss = pg_loss - ppo.entropy_coef * entropy
         _require_finite("policy_loss", actor_loss, step)
         self._backward(actor_loss / n_micro)
-        del logits
+        del tempered
 
         with self._autocast():
             values_all = self._models.critic_values(ids, attn)
@@ -468,13 +507,25 @@ class PPOTrainer:
         ):
             stats.setdefault(key, []).append(float(value.detach()))
 
-    def _optimizer_step(self, step: int) -> dict[str, float]:
+    def _optimizer_step(self, step: int, *, deep: bool) -> tuple[dict[str, float], dict[str, float]]:
+        """All-reduce, unscale, clip, step. On deep-log steps also return per-layer norms.
+
+        The per-layer grad norms are taken after unscale and BEFORE clipping, so they add up
+        to the logged (pre-clip) ``optim/*_grad_norm``.
+        """
         allreduce_mean_grads(self._actor_params, self._dist)
         allreduce_mean_grads(self._critic_params, self._dist)
         clip = self._cfg.ppo.grad_clip
         if self._scaler is not None:
             self._scaler.unscale_(self._actor_opt)
             self._scaler.unscale_(self._critic_opt)
+        layer_norms: dict[str, float] = {}
+        if deep:
+            layers = self._models.decoder_layers()
+            layer_norms = {
+                **per_layer_grad_and_weight_norms(layers, "layers/actor", only=self._actor_params),
+                **per_layer_grad_and_weight_norms(layers, "layers/critic", only=self._critic_params),
+            }
         actor_norm = float(nn.utils.clip_grad_norm_(self._actor_params, clip))
         critic_norm = float(nn.utils.clip_grad_norm_(self._critic_params, clip))
         skipped = 0.0
@@ -492,7 +543,7 @@ class PPOTrainer:
             self._scaler.update()
             scale = self._scaler.get_scale()
             skipped = float(scale < before)  # update() backs the scale off only after an inf/NaN grad
-        return {
+        stats = {
             "optim/actor_grad_norm": actor_norm,
             "optim/critic_grad_norm": critic_norm,
             "optim/actor_clipped": float(actor_norm > clip),
@@ -500,6 +551,7 @@ class PPOTrainer:
             "optim/scaler_scale": scale,
             "optim/scaler_skipped": skipped,
         }
+        return stats, layer_norms
 
     # ------------------------------------------------------------------ metrics
     def _reward_metrics(self, scored: _Scored, rewards: Tensor) -> dict[str, float]:
