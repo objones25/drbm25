@@ -107,3 +107,4 @@ venv = ".venv"
 include = ["src", "tests"]
 exclude = ["scripts", "upstream", ".venv", "runs", "data", "indexes"]
 typeCheckingMode = "standard"
+stubPath = "typings"

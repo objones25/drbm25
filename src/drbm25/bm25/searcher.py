@@ -45,9 +45,8 @@ _import_pyserini_search()
 
 # jnius must be imported after pyserini, which puts the Anserini jars on the classpath
 # before the JVM starts.
-# pyjnius 1.9.0 ships no stubs and re-exports these from its compiled jnius.so via a
-# star import, so pyright cannot see them.
-from jnius import JavaException, detach  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]
+# Types for these come from typings/jnius (pyjnius ships no stubs).
+from jnius import JavaException, detach  # noqa: E402
 from pyserini.analysis import Analyzer  # noqa: E402
 from pyserini.search.lucene import LuceneSearcher, querybuilder  # noqa: E402
 
