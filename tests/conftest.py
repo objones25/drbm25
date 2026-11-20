@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import ipaddress
+import logging
 import os
 import random
 import socket
@@ -52,6 +53,30 @@ def _deterministic_rngs() -> None:
         import numpy as np
 
         np.random.seed(SEED)
+
+
+@pytest.fixture(autouse=True)
+def _restore_logging() -> Iterator[None]:
+    """Undo any `drbm25.obs.configure()` a test triggered (e.g. via a CLI `main`).
+
+    configure() installs a queue handler and listener thread, binds the console
+    handler to the current (captured) stdout, and sets process-wide flags; none of
+    that may leak into the next test.
+    """
+    from drbm25.obs.setup import DEFAULT_LIBRARY_LEVELS, shutdown
+
+    root = logging.getLogger()  # obs: allow LOG003 -- snapshot/restore of root on purpose
+    handlers, level = list(root.handlers), root.level
+    lib_levels = {n: logging.getLogger(n).level for n in DEFAULT_LIBRARY_LEVELS}
+    yield
+    shutdown()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    for h in handlers:
+        root.addHandler(h)
+    root.setLevel(level)
+    for n, lvl in lib_levels.items():
+        logging.getLogger(n).setLevel(lvl)
 
 
 @pytest.fixture

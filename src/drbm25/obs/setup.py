@@ -261,6 +261,21 @@ def configure(
     return config
 
 
+def shutdown() -> None:
+    """Undo `configure()`: stop the queue listener, restore warnings, allow configuring again.
+
+    Does not touch root handlers; callers that need the previous handlers back
+    (test fixtures) restore them themselves.
+    """
+    global _configured
+    handler = logging.getHandlerByName("queue")
+    listener = getattr(handler, "listener", None)
+    if listener is not None:
+        _stop_once(listener)
+    logging.captureWarnings(False)
+    _configured = False
+
+
 def _start_queue_listener() -> None:
     """Start the listener thread for a dictConfig-created QueueHandler (3.12+).
 
