@@ -1,5 +1,7 @@
 import json
+import os
 import random
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -161,9 +163,17 @@ def test_prune_never_deletes_latest_target(tmp_path: Path) -> None:
     _save(tmp_path, 100)
     _save(tmp_path, 150)
     # a resumed run saves an older step number; latest then points at it
-    _save(tmp_path, 50, keep=1)
-    assert (tmp_path / "step_000050").is_dir()
+    _save(tmp_path, 50, keep=2)
+    names = sorted(p.name for p in tmp_path.glob("step_*"))
+    assert names == ["step_000050", "step_000150"]  # protected dir + (keep - 1) newest others
     assert latest_checkpoint(tmp_path) == tmp_path / "step_000050"
+
+
+def test_prune_total_never_exceeds_keep(tmp_path: Path) -> None:
+    _save(tmp_path, 100)
+    _save(tmp_path, 150)
+    _save(tmp_path, 50, keep=1)
+    assert sorted(p.name for p in tmp_path.glob("step_*")) == ["step_000050"]
 
 
 def test_prune_ignores_incomplete_dirs_when_counting(tmp_path: Path) -> None:
@@ -232,3 +242,71 @@ def test_load_rejects_unknown_format_version(tmp_path: Path) -> None:
     (path / "meta.json").write_text(json.dumps(meta))
     with pytest.raises(ValueError, match="format_version"):
         load_checkpoint(path)
+
+
+_real_replace = os.replace
+_real_rmtree = shutil.rmtree
+
+
+def _replace_crashing_into(target: Path):
+    def replace(src: str | Path, dst: str | Path) -> None:
+        if Path(dst) == target:
+            raise OSError("simulated crash")
+        _real_replace(src, dst)
+
+    return replace
+
+
+def _partial_rmtree(path: str | Path) -> None:
+    # worst-case partial delete: the model goes first, then the process dies
+    model_file = Path(path) / "model.safetensors"
+    if model_file.exists():
+        model_file.unlink()
+        raise OSError("simulated crash")
+    _real_rmtree(path)
+
+
+def test_crash_between_move_aside_and_swap_leaves_loadable_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _save(tmp_path, 25)
+    _save(tmp_path, 50)
+    monkeypatch.setattr(os, "replace", _replace_crashing_into(tmp_path / "step_000050"))
+    with pytest.raises(OSError, match="simulated crash"):
+        _save(tmp_path, 50)
+    monkeypatch.undo()
+
+    found = latest_checkpoint(tmp_path)
+    assert found == tmp_path / "step_000025"
+    assert found is not None
+    assert load_checkpoint(found).train_state.step == 25
+
+
+def test_crash_while_deleting_old_copy_keeps_new_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _save(tmp_path, 50)
+    monkeypatch.setattr(shutil, "rmtree", _partial_rmtree)
+    with pytest.raises(OSError, match="simulated crash"):
+        _save(tmp_path, 50)
+    monkeypatch.undo()
+
+    found = latest_checkpoint(tmp_path)
+    assert found == tmp_path / "step_000050"
+    assert found is not None
+    assert load_checkpoint(found).train_state.step == 50
+
+
+def test_crash_while_pruning_never_leaves_half_deleted_complete_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _save(tmp_path, 50)
+    _save(tmp_path, 100)
+    monkeypatch.setattr(shutil, "rmtree", _partial_rmtree)
+    with pytest.raises(OSError, match="simulated crash"):
+        _save(tmp_path, 150, keep=2)
+    monkeypatch.undo()
+
+    assert not (tmp_path / "step_000050").exists()  # moved aside, not left half-deleted
+    assert latest_checkpoint(tmp_path) == tmp_path / "step_000150"
+    assert load_checkpoint(tmp_path / "step_000100").train_state.step == 100

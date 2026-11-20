@@ -175,6 +175,19 @@ def _write_checkpoint_files(
     _fsync_dir(tmp)
 
 
+def _remove_dir(path: Path) -> None:
+    """Delete a checkpoint dir so a crash mid-delete never leaves a dir that looks complete.
+
+    ``rmtree`` may remove ``meta.json`` last, so the dir is first renamed (atomic) to a
+    ``.tmp-del-*`` name that every reader ignores, then deleted.
+    """
+    aside = path.parent / f"{_TMP_PREFIX}del-{path.name}-{os.getpid()}"
+    if aside.exists():
+        shutil.rmtree(aside)
+    os.replace(path, aside)
+    shutil.rmtree(aside)
+
+
 def _write_latest(run_dir: Path, name: str) -> None:
     tmp = run_dir / f"{_TMP_PREFIX}{_LATEST_FILE}-{os.getpid()}"
     tmp.write_text(name + "\n")
@@ -212,20 +225,27 @@ def save_checkpoint(
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
+    # os.replace cannot overwrite a non-empty directory, so an existing step is moved aside
+    # (atomic) first; a crash before the swap leaves no half-deleted dir that looks complete.
+    old = run_dir / f"{_TMP_PREFIX}old-{name}-{os.getpid()}"
+    if old.exists():
+        shutil.rmtree(old)
     if final.exists():
-        shutil.rmtree(final)  # os.replace cannot overwrite a non-empty directory
+        os.replace(final, old)
     os.replace(tmp, final)
     _fsync_dir(run_dir)
     _write_latest(run_dir, name)
+    if old.exists():
+        shutil.rmtree(old)
     _prune(run_dir, keep=keep, protect=name)
     return final
 
 
 def _prune(run_dir: Path, *, keep: int, protect: str) -> None:
-    complete = _complete_step_dirs(run_dir)
-    for old in complete[: max(len(complete) - keep, 0)]:
-        if old.name != protect:
-            shutil.rmtree(old)
+    """Keep the ``protect`` dir plus the ``keep - 1`` newest other complete dirs (total <= keep)."""
+    others = [p for p in _complete_step_dirs(run_dir) if p.name != protect]
+    for old in others[: max(len(others) - (keep - 1), 0)]:
+        _remove_dir(old)
 
 
 def latest_checkpoint(run_dir: Path) -> Path | None:
