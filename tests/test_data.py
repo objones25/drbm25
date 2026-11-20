@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 from requests.exceptions import ConnectionError as ConnDown
 from requests.exceptions import Timeout as ConnSlow
 
@@ -163,6 +164,55 @@ def test_download_does_not_retry_other_errors(monkeypatch: pytest.MonkeyPatch, t
 
     monkeypatch.setattr(data, "hf_hub_download", bad)
     with pytest.raises(PermissionError):
+        data._download_with_retry(_cfg(tmp_path), "raw_data/x", sleep=lambda _s: None)
+    assert len(attempts) == 1
+
+
+def _local_entry_not_found(cause: BaseException | None) -> LocalEntryNotFoundError:
+    """Mimic huggingface_hub 0.36.2 `_raise_on_head_call_error`: `raise ... from head_call_error`."""
+    err = LocalEntryNotFoundError("cannot locate file")
+    err.__cause__ = cause
+    return err
+
+
+def test_download_retries_when_hf_wraps_connection_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    attempts: list[int] = []
+
+    def wrapped_down(**kwargs: Any) -> str:
+        raise _local_entry_not_found(ConnDown("down"))
+
+    def ok(**kwargs: Any) -> str:
+        return str(tmp_path / "f")
+
+    steps = iter([wrapped_down, wrapped_down, ok])
+
+    def flaky(**kwargs: Any) -> str:
+        attempts.append(1)
+        return next(steps)(**kwargs)
+
+    monkeypatch.setattr(data, "hf_hub_download", flaky)
+    data._download_with_retry(_cfg(tmp_path), "raw_data/x", sleep=lambda _s: None)
+    assert len(attempts) == 3
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _local_entry_not_found(None),
+        _local_entry_not_found(PermissionError("nope")),
+        EntryNotFoundError("missing file"),
+    ],
+    ids=["no-cause", "non-connection-cause", "entry-not-found"],
+)
+def test_download_does_not_retry_missing_entry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception):
+    attempts: list[int] = []
+
+    def missing(**kwargs: Any) -> str:
+        attempts.append(1)
+        raise error
+
+    monkeypatch.setattr(data, "hf_hub_download", missing)
+    with pytest.raises(type(error)):
         data._download_with_retry(_cfg(tmp_path), "raw_data/x", sleep=lambda _s: None)
     assert len(attempts) == 1
 

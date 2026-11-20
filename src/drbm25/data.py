@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import requests
 from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import LocalEntryNotFoundError
 
 from drbm25.config import DataCfg
 
@@ -22,7 +23,19 @@ COLLECTION_FILE = "raw_data/msmarco/collection_800k.tsv"
 
 _DOWNLOAD_ATTEMPTS = 3
 _BACKOFF_BASE_S = 1.0
-_RETRYABLE = (requests.ConnectionError, requests.Timeout)
+_CONNECTION_ERRORS = (requests.ConnectionError, requests.Timeout)
+
+
+def _is_connection_failure(error: Exception) -> bool:
+    """True for connection errors, including huggingface_hub's wrapping of them.
+
+    With nothing cached, hf_hub_download (0.36.2, `_raise_on_head_call_error`) re-raises a failed
+    HEAD request as `LocalEntryNotFoundError ... from head_call_error`. Only that case, with a
+    connection error as the cause, is retryable; a genuinely missing file is not.
+    """
+    if isinstance(error, _CONNECTION_ERRORS):
+        return True
+    return isinstance(error, LocalEntryNotFoundError) and isinstance(error.__cause__, _CONNECTION_ERRORS)
 
 
 @dataclass(frozen=True)
@@ -51,8 +64,8 @@ def _download_with_retry(cfg: DataCfg, filename: str, *, sleep: Callable[[float]
                 local_dir=cfg.data_dir,
                 token=os.environ.get("HF_TOKEN"),
             )
-        except _RETRYABLE:
-            if attempt == _DOWNLOAD_ATTEMPTS:
+        except (*_CONNECTION_ERRORS, LocalEntryNotFoundError) as error:
+            if not _is_connection_failure(error) or attempt == _DOWNLOAD_ATTEMPTS:
                 raise
             sleep(_BACKOFF_BASE_S * 2 ** (attempt - 1))
     raise AssertionError("unreachable: the loop returns or raises")
