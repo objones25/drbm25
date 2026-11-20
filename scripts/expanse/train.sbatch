@@ -27,7 +27,9 @@
 set -Eeuo pipefail
 
 readonly SCRIPT_NAME=train.sbatch
-REPO_ROOT=${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
+# submit_chain.sh sets DRBM25_REPO_ROOT. SLURM_SUBMIT_DIR is where sbatch was invoked (not --chdir),
+# so a direct `sbatch` must be run from the repository root.
+REPO_ROOT=${DRBM25_REPO_ROOT:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}
 readonly REPO_ROOT
 readonly CONFIG=configs/expanse_v100_lora.yaml
 
@@ -93,6 +95,15 @@ cd "$REPO_ROOT"
 total_steps=$(config_total_steps "$CONFIG")
 run_dir=$DRBM25_RUNS_DIR/$run_name
 
+# A real failure (exit_code 2, 3 or no file) leaves FAILED. Later jobs of an afterany chain stop
+# here at once instead of burning up to 47.5 h each on the same error.
+failed_marker=$run_dir/FAILED
+if [[ -f $failed_marker ]]; then
+  log "error: $run_name has a failure marker: $(<"$failed_marker")"
+  log "error: inspect $run_dir/train_rank0.log, fix the cause, then delete $failed_marker to retry"
+  exit 1
+fi
+
 # afterany chains start every job; later ones must do nothing once the run is finished.
 # A malformed marker file makes run_is_complete return false, so the job trains (and rewrites it).
 # shellcheck disable=SC2310 # intentional: any failure inside means "not complete"
@@ -114,13 +125,28 @@ torchrun_rc=0
   --config "$CONFIG" --reward-mode "$reward_mode" --run-name "$run_name" \
   "${DRBM25_SET_ARGS[@]}" ${train_args[@]+"${train_args[@]}"} || torchrun_rc=$?
 
-# shellcheck disable=SC2310 # the || die is the error handling; run_exit_code logs its own reason
-code=$(run_exit_code "$run_dir") || die "torchrun exited $torchrun_rc and left no usable exit_code file in $run_dir"
+mark_failed() {
+  local now
+  now=$(date '+%Y-%m-%dT%H:%M:%S')
+  printf 'job %s failed at %s: %s (torchrun exited %s)\n' "${SLURM_JOB_ID:-local}" "$now" "$1" "$torchrun_rc" >"$failed_marker"
+  die "$1; wrote $failed_marker, so later jobs in the chain stop immediately; see $run_dir/train_rank0.log"
+}
+
+# Codes in exit_code: 0 done; 3 budget stop; 2 ended by an exception; 1 started and never finished
+# (killed: OOM, node failure); missing = died before drbm25.train started.
+code=''
+if [[ -f $run_dir/exit_code ]]; then
+  # shellcheck disable=SC2310 # a malformed file falls through to the "no usable exit_code" branch
+  code=$(run_exit_code "$run_dir") || code=''
+fi
 case $code in
   0)
     log "training finished: exit_code 0"
     exit 0
     ;;
-  3) die "drbm25.train stopped on its budget deadline (exit_code 3), which this job never sets; treating as an error" ;;
-  *) die "drbm25.train failed: exit_code $code (torchrun exited $torchrun_rc); see $run_dir/train_rank0.log" ;;
+  1) die "run did not finish (exit_code 1, torchrun exited $torchrun_rc): killed or out of memory; the next job resumes from the latest checkpoint" ;;
+  2) mark_failed "drbm25.train raised an exception (exit_code 2)" ;;
+  3) mark_failed "drbm25.train stopped on its budget deadline (exit_code 3), which this job never sets" ;;
+  '') mark_failed "no usable exit_code file in $run_dir (exit_code missing)" ;;
+  *) mark_failed "unexpected exit_code $code" ;;
 esac

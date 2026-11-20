@@ -21,7 +21,7 @@ LoRA, fp16). The profile holds placeholder paths: the scripts pass `--set` overr
 Compute nodes are assumed to have no internet (unverified until the probe runs): jobs set
 `HF_HUB_OFFLINE=1` and `WANDB_MODE=offline` unless `DRBM25_ONLINE=1` is exported at submit time.
 
-Everything below is a sequence of commands to run in a login-node shell, from the repository root.
+Everything below is a sequence of commands to run in a login-node shell. Run `sbatch` and `scripts/expanse/...` commands from the repository root.
 
 1. Log in and set the two required variables. `EXPANSE_ACCOUNT` is your allocation id (it is never
    hard-coded). Export `HF_TOKEN` only if a download needs it, and `WANDB_API_KEY` for W&B.
@@ -45,13 +45,13 @@ Everything below is a sequence of commands to run in a login-node shell, from th
 3. Probe job (`gpu-debug`, 2 GPUs, 30 min). It records internet reachability, `nvidia-smi`, torch arch
    list and capability, Java, `module avail java cuda`, and a 3-prompt fp16 HF generation, and writes
    `$DRBM25_ROOT/probes/probe_<jobid>.json`. The vLLM check runs only if
-   `UV_PROJECT_ENVIRONMENT="$DRBM25_ROOT/venv-vllm" uv sync --frozen --extra vllm` has been done (the
-   probe tries it itself only when the compute node has internet). Module names are not known in advance:
+   `scripts/expanse/run.sh bash -c 'UV_PROJECT_ENVIRONMENT="$DRBM25_ROOT/venv-vllm" uv sync --frozen --extra vllm'`
+   has been done (the probe tries it itself only when the compute node has internet). Module names are not known in advance:
    use what `module avail` prints.
 
    ```bash
    sbatch --account="$EXPANSE_ACCOUNT" scripts/expanse/probe.sbatch
-   cat "$DRBM25_ROOT"/probes/probe_*.json
+   scripts/expanse/run.sh bash -c 'cat "$DRBM25_ROOT"/probes/probe_*.json'
    ```
 
    If `internet_ok` is true you may submit with `DRBM25_ONLINE=1` exported to get live W&B and no offline HF.
@@ -80,28 +80,36 @@ Everything below is a sequence of commands to run in a login-node shell, from th
    ```
 
    Each job's status is read from `$DRBM25_ROOT/runs/<run>/exit_code` (written by rank 0, because
-   `torchrun` collapses worker exit codes to 1). `train.sbatch` exits 0 only when it is 0. A budget stop
-   (3) is treated as an error: these jobs never set a deadline, so a stop means something is wrong.
-   Logs: `train_rank0.log` in the run directory and `drbm25-train.<jobid>.out` in the submit directory.
+   `torchrun` collapses worker exit codes to 1): 0 done, 3 budget stop, 2 failed with an exception,
+   1 started but never finished (killed, e.g. out of memory). `train.sbatch` exits 0 only for 0.
+   On 2, on 3 (these jobs never set a deadline, so a stop means something is wrong) or when no
+   `exit_code` exists, it writes `$DRBM25_ROOT/runs/<run>/FAILED` (job id and reason) and every later job
+   in the chain exits non-zero immediately instead of repeating the failure. Inspect `train_rank0.log`
+   in the run directory, fix the cause, delete `FAILED`, then submit again. After 1 (killed) the next
+   job resumes from the latest checkpoint; a job ended by the time limit does the same. A worker
+   other than rank 0 that raises can leave 1 rather than 2, so check `squeue` and the logs anyway.
+   Job output: `drbm25-train.<jobid>.out` in the repository directory.
 
-6. Sync offline W&B runs from the login node (needs internet and `WANDB_API_KEY`):
+6. Sync offline W&B runs from the login node (needs internet and `WANDB_API_KEY`). Do not `source`
+   `common.sh` in your login shell (it turns on `set -eu` and its helpers call `exit`); `run.sh` sets
+   the same environment for one command in its own process:
 
    ```bash
-   source scripts/expanse/common.sh && drbm25_paths
-   uv run --frozen wandb sync "$WANDB_DIR"/wandb/offline-run-*
+   scripts/expanse/run.sh bash -c 'uv run --frozen wandb sync "$WANDB_DIR"/wandb/offline-run-*'
    ```
 
 7. Evaluation, once both chains have finished. `eval.sbatch` scores the original queries, the untrained
    model and both trained runs at the largest step both runs have a complete checkpoint for
    (`drbm25.eval.report.common_step`) and writes `$DRBM25_ROOT/runs/eval/report.md` and the four
-   `.jsonl` files. To also log the tables to W&B, rerun the report from the login node with `--wandb`.
+   `.jsonl` files. To also log the tables to W&B, rerun the report from the login node with `--wandb`
+   (the report does not need Java).
 
    ```bash
    sbatch --account="$EXPANSE_ACCOUNT" scripts/expanse/eval.sbatch
-   source scripts/expanse/common.sh && drbm25_paths && jdk_env
-   uv run --frozen python -m drbm25.eval.report --wandb --config configs/expanse_v100_lora.yaml \
+   scripts/expanse/run.sh bash -c 'uv run --frozen python -m drbm25.eval.report --wandb \
+     --config configs/expanse_v100_lora.yaml \
      --inputs "$DRBM25_RUNS_DIR"/eval/{original,untrained,trained-normal,trained-count_once}.jsonl \
-     --out "$DRBM25_RUNS_DIR"/eval/report.md
+     --out "$DRBM25_RUNS_DIR"/eval/report.md'
    ```
 
 Shell tests: `bats tests/shell/` (needs bats >= 1.5 and bash >= 4 for `mapfile`) and

@@ -29,7 +29,7 @@ Run the two reward modes as two independent chains so they train concurrently:
   $SCRIPT_NAME normal 3
   $SCRIPT_NAME count_once 3
 
-Run it from the repository root. Needs EXPANSE_ACCOUNT in the environment.
+Runs from any directory (jobs find the repository through DRBM25_REPO_ROOT). Needs EXPANSE_ACCOUNT.
 A job that fails for a real reason (not the time limit) still lets the next job start and
 fail again; cancel the rest of the chain with scancel <ids>.
 Exit status: 0 success, 1 runtime error, 2 usage error.
@@ -68,7 +68,8 @@ main() {
   # shellcheck source=common.sh
   source "$SCRIPT_DIR/common.sh"
   require_env EXPANSE_ACCOUNT
-  # Slurm runs train.sbatch with this as its working directory (SLURM_SUBMIT_DIR).
+  # The job finds the repository through DRBM25_REPO_ROOT; --chdir only places job logs there.
+  # (SLURM_SUBMIT_DIR is where sbatch was invoked, not the --chdir directory.)
   local repo_root
   repo_root=$(cd "$SCRIPT_DIR/../.." && pwd)
 
@@ -81,7 +82,7 @@ main() {
     fi
     # --parsable prints "id" or "id;cluster"; keep the id. The account cannot be set with
     # #SBATCH inside train.sbatch because directives do not expand variables.
-    job_id=$(sbatch --parsable --account="$EXPANSE_ACCOUNT" --chdir="$repo_root" ${dependency[@]+"${dependency[@]}"} \
+    job_id=$(sbatch --parsable --account="$EXPANSE_ACCOUNT" --chdir="$repo_root" --export="ALL,DRBM25_REPO_ROOT=$repo_root" ${dependency[@]+"${dependency[@]}"} \
       "$SCRIPT_DIR/train.sbatch" "$mode" "$@")
     job_id=${job_id%%;*}
     [[ $job_id =~ ^[0-9]+$ ]] || _common_die "sbatch returned an unexpected job id: '$job_id'"

@@ -6,7 +6,8 @@
 Exit codes: 0 reached ``min(until_step, total_steps)``; 3 stopped by the budget deadline;
 1 any error. torchrun turns any non-zero worker exit into its own exit code 1, so rank 0 also
 writes the code to ``output_dir/run_name/exit_code``; launchers read that file to tell a
-budget stop (3) from a crash (1).
+budget stop (3) from a failure. The file holds 0 done, 3 budget stop, 2 ended by an exception,
+and 1 when the run started and never finished (killed by OOM, a Slurm time limit, teardown).
 
 Run directory ``output_dir/run_name/``: ``step_NNNNNN/`` checkpoints (rank 0), ``metrics.jsonl``
 (rank 0, one JSON object of floats per step, read by ``scripts/spike_monitor.py``),
@@ -67,6 +68,9 @@ logger = logging.getLogger(__name__)
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
 EXIT_BUDGET: Final = 3
+# Only ever written to the exit_code file, never returned: the process still exits 1 on an exception.
+# The file reads 1 for a run that started and never finished (killed), 2 for one that raised.
+EXIT_CODE_FILE_FAILED: Final = 2
 TINY_MODEL: Final = "tiny-local"
 REQUIRED_JAVA_MAJOR: Final = 21
 CALIBRATION_STEPS: Final = 10
@@ -448,6 +452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     dist = init_distributed()
     code = EXIT_ERROR
+    file_code = EXIT_ERROR  # what the exit_code file gets; stays 1 if the process dies before finally
     run_dir: Path | None = None
     try:
         cfg = load_config(args.config, args.overrides)
@@ -460,13 +465,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         configure(level="INFO", fmt="json", log_file=str(run_dir / f"train_rank{dist.rank}.log"))
         bind_log_context(run_name=args.run_name, reward_mode=args.reward_mode, rank=dist.rank)
         code = _train(args, cfg, dist, run_dir)
+        file_code = code
     except Exception:
         # Entry point: every failure becomes exit code 1, with its traceback in the log.
         logger.exception("training failed")
         code = EXIT_ERROR
+        file_code = EXIT_CODE_FILE_FAILED
     finally:
         if run_dir is not None and dist.rank == 0:
-            (run_dir / "exit_code").write_text(f"{code}\n")
+            (run_dir / "exit_code").write_text(f"{file_code}\n")
         if tdist.is_initialized():
             tdist.destroy_process_group()
     return code

@@ -255,3 +255,105 @@ STUB
   [[ $status -eq 2 ]]
   [[ ! -e $TORCHRUN_LOG ]]
 }
+
+# ---- run.sh (login-shell-safe wrapper) ----
+
+@test "run.sh fails with a message naming EXPANSE_ACCOUNT, and never runs the command" {
+  unset EXPANSE_ACCOUNT
+  run -1 --separate-stderr "$REPO/scripts/expanse/run.sh" touch ran.flag
+  [[ $stderr == *"EXPANSE_ACCOUNT"* ]]
+  [[ ! -e ran.flag ]]
+}
+
+@test "run.sh without a command is a usage error" {
+  run -2 --separate-stderr "$REPO/scripts/expanse/run.sh"
+  [[ $stderr == *"COMMAND"* ]]
+}
+
+@test "run.sh --help exits 0" {
+  run -0 "$REPO/scripts/expanse/run.sh" --help
+  [[ $output == *"Usage:"* ]]
+}
+
+@test "run.sh runs the command with the Lustre paths and an online (login-node) environment" {
+  HF_HUB_OFFLINE=1 WANDB_MODE=offline run -0 "$REPO/scripts/expanse/run.sh" \
+    bash -c 'printf "%s\n" "$WANDB_DIR" "$HF_HOME" "${HF_HUB_OFFLINE-unset}" "${WANDB_MODE-unset}"'
+  [[ ${lines[0]} == "$DRBM25_ROOT/wandb" ]]
+  [[ ${lines[1]} == "$DRBM25_ROOT/hf" ]]
+  [[ ${lines[2]} == unset ]]
+  [[ ${lines[3]} == unset ]]
+}
+
+@test "run.sh --offline sets the offline variables" {
+  run -0 "$REPO/scripts/expanse/run.sh" --offline bash -c 'printf "%s %s\n" "$HF_HUB_OFFLINE" "$WANDB_MODE"'
+  [[ $output == "1 offline" ]]
+}
+
+@test "run.sh passes the command's exit status and arguments through unchanged" {
+  run -7 "$REPO/scripts/expanse/run.sh" bash -c 'exit 7'
+  run -0 "$REPO/scripts/expanse/run.sh" bash -c 'printf "[%s]" "$1"' _ 'a b'
+  [[ $output == "[a b]" ]]
+}
+
+@test "run.sh puts a user-space JDK on PATH when one is installed" {
+  mkdir -p root/jdk/current/bin
+  run -0 "$REPO/scripts/expanse/run.sh" bash -c 'printf "%s\n" "$JAVA_HOME"'
+  [[ $output == "$DRBM25_ROOT/jdk/current" ]]
+}
+
+# ---- train.sbatch failure guard ----
+
+@test "train.sbatch writes FAILED with the job id and reason when exit_code says 2" {
+  STUB_CODE=2 STUB_RC=1 run_train normal
+  [[ $status -eq 1 ]]
+  [[ -f $DRBM25_ROOT/runs/normal/FAILED ]]
+  failed=$(<"$DRBM25_ROOT/runs/normal/FAILED")
+  [[ $failed == *"job 77"* ]]
+  [[ $failed == *"exit_code 2"* ]]
+}
+
+@test "train.sbatch writes FAILED on a budget stop (3), which Expanse never expects" {
+  STUB_CODE=3 STUB_RC=1 run_train normal
+  [[ $status -eq 1 ]]
+  [[ $(<"$DRBM25_ROOT/runs/normal/FAILED") == *"exit_code 3"* ]]
+}
+
+@test "train.sbatch writes FAILED when no exit_code file exists after torchrun" {
+  STUB_RC=1 run_train normal
+  [[ $status -eq 1 ]]
+  [[ -f $DRBM25_ROOT/runs/normal/FAILED ]]
+}
+
+@test "train.sbatch leaves no FAILED marker for exit_code 1 (killed), so the chain resumes" {
+  STUB_CODE=1 STUB_RC=1 run_train normal
+  [[ $status -eq 1 ]]
+  [[ ! -e $DRBM25_ROOT/runs/normal/FAILED ]]
+}
+
+@test "train.sbatch exits non-zero at once when FAILED exists, telling the user how to retry" {
+  mkdir -p root/runs/normal
+  printf 'job 5: exit_code 2\n' >root/runs/normal/FAILED
+  run_train normal
+  [[ $status -eq 1 ]]
+  [[ $stderr == *"FAILED"* ]]
+  [[ $stderr == *"delete"* ]]
+  [[ $stderr == *"job 5: exit_code 2"* ]]
+  [[ ! -e $TORCHRUN_LOG ]]
+}
+
+@test "train.sbatch FAILED guard is per run name, so a pilot is not blocked by the real run" {
+  mkdir -p root/runs/normal
+  printf 'x\n' >root/runs/normal/FAILED
+  STUB_RUN=pilot STUB_CODE=0 run_train normal --run-name pilot
+  [[ $status -eq 0 ]]
+}
+
+@test "submit_chain exports the repo root so jobs do not depend on where sbatch was run from" {
+  run -0 --separate-stderr "$REPO/scripts/expanse/submit_chain.sh" normal 1
+  [[ $(<"$SBATCH_LOG") == *"--export=ALL,DRBM25_REPO_ROOT="*"/deep-retrieval-CS279"* ]]
+}
+
+@test "train.sbatch prefers DRBM25_REPO_ROOT over SLURM_SUBMIT_DIR" {
+  STUB_CODE=0 SLURM_SUBMIT_DIR=/nonexistent DRBM25_REPO_ROOT="$(cd "$REPO" && pwd)" run_train normal
+  [[ $status -eq 0 ]]
+}

@@ -282,7 +282,7 @@ def test_cli_fails_fast_on_wrong_index_size(workdir: Path, toy_index: Path) -> N
     assert len(errors) == 1
     assert "expected 5 docs, found 1002" in json.dumps(errors[0])
     assert list(run_dir.glob("step_*")) == []
-    assert (run_dir / "exit_code").read_text().strip() == "1"
+    assert (run_dir / "exit_code").read_text().strip() == "2"  # failed with an exception, not killed
 
 
 @pytest.mark.java
@@ -338,7 +338,7 @@ def test_cli_alerts_and_exits_1_on_nonfinite_error(
     monkeypatch.setattr(PPOTrainer, "step", explode)
     assert _main(_argv(workdir, toy_index, "nan")) == EXIT_ERROR
     assert alerts == [("ERROR", "nan: training aborted")]
-    assert (workdir / "out" / "nan" / "exit_code").read_text().strip() == "1"
+    assert (workdir / "out" / "nan" / "exit_code").read_text().strip() == "2"
     assert list((workdir / "out" / "nan").glob("step_*")) == []  # no checkpoint of a broken state
 
 
@@ -360,6 +360,19 @@ def test_exit_code_reads_1_while_the_run_is_in_progress(
     assert _main(_argv(workdir, toy_index, "killed")) == EXIT_OK
     assert during == ["1"]
     assert (run_dir / "exit_code").read_text().strip() == "0"
+
+
+@pytest.mark.java
+def test_exit_code_file_reads_2_when_main_fails_with_an_exception(
+    workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 1 = started but never finished (killed); 2 = ended by an exception. Chain launchers rely on the split.
+    def boom(*_: object) -> int:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(train_module, "_train", boom)
+    assert _main(_argv(workdir, toy_index, "failed")) == EXIT_ERROR
+    assert (workdir / "out" / "failed" / "exit_code").read_text().strip() == "2"
 
 
 class _FakeRun:

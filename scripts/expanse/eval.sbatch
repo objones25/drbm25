@@ -26,7 +26,9 @@
 set -Eeuo pipefail
 
 readonly SCRIPT_NAME=eval.sbatch
-REPO_ROOT=${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
+# submit_chain.sh sets DRBM25_REPO_ROOT. SLURM_SUBMIT_DIR is where sbatch was invoked (not --chdir),
+# so a direct `sbatch` must be run from the repository root.
+REPO_ROOT=${DRBM25_REPO_ROOT:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}
 readonly REPO_ROOT
 readonly CONFIG=configs/expanse_v100_lora.yaml
 
