@@ -215,7 +215,10 @@ itself (also after a fatal error). The network volume `drbm25` keeps everything 
 ### Prerequisites
 
 - bash 3.2+ (macOS `/bin/bash` is fine), curl 7.55+, `jq` (macOS 15 and later ship `/usr/bin/jq`; otherwise
-  `brew install jq`), git, and a checkout of this repository whose HEAD is pushed (or pass `--ref`).
+  `brew install jq`), git, and a checkout of this repository.
+- The code the pod runs must be on the public repository. `--ref` defaults to this checkout's HEAD commit, which
+  must be the tip of a branch or tag on `https://github.com/objones25/drbm25` (push first); or pass
+  `--ref <pushed branch or tag>`. `launch.sh` checks this with `git ls-remote` before it creates anything.
 - A RunPod API key allowed to read the catalog, list and create network volumes, pods and secrets, and
   terminate pods (`pods:write`). The pod uses the same key, stored as a RunPod secret, to terminate itself.
 - A Hugging Face token and a Weights & Biases API key.
@@ -236,7 +239,10 @@ the dollars still left to spend. Then it:
    offered: RunPod network volumes only work on Secure Cloud pods;
 3. reuses the network volume named `drbm25` if there is one. A volume is tied to its data center, so the pod
    must go there: if that data center has no stock, it says so and stops (it never creates a second volume).
-   With no volume it offers to create one (`--volume-gb`, default 400; standard tier) in the chosen data center;
+   With no volume it offers to create one (`--volume-gb`, default 400; standard tier) in the chosen data center,
+   choosing only among data centers whose catalog entry lists STANDARD volumes (checked before you confirm; if
+   none with stock does, it stops and lists each data center's volume types, since the high-performance price
+   is not published in the docs);
 4. prints the plan: GPU, data center, the exact hourly price, what the budget buys, the volume (and its
    monthly cost if new) and the git ref, and creates nothing billable until you type `yes` (`--yes` skips the
    question for scripts; the plan is still printed);
@@ -248,16 +254,28 @@ the dollars still left to spend. Then it:
    2.8.0"), the volume at `/workspace`, 80 GB container disk, ports 22 and 8888. Its start command is
    `scripts/runpod/pod_bootstrap.sh`: it starts the image's `/start.sh` (SSH, Jupyter) in the background, fetches
    the ref into `/workspace/drbm25/repo` (reusing an earlier clone), then runs `run_all.sh` with stdin from
-   `/dev/null`. The budget, the quoted price, `TERMINATE_ON_FINISH=yes`, the volume size and the W&B settings go
-   in as plain environment variables;
+   `/dev/null`. The budget, the quoted price, `TERMINATE_ON_FINISH=yes`, the volume size, the W&B settings and
+   `DRBM25_HARD_DEADLINE_UNIX` go in as plain environment variables;
 7. prints the pod id, the console URL (`https://console.runpod.io/pods`) and how to follow progress, and exits.
 
 Each RunPod endpoint used is listed with its documentation page at the top of `scripts/runpod/launch.sh`.
 
+Self-termination has several layers, so a broken launch does not keep billing:
+- `run_all.sh` terminates the pod when it ends, fails or is signalled.
+- `pod_bootstrap.sh` installs its exit trap before any step that can fail. It terminates the pod after
+  `run_all.sh` returns, or when the clone fails, or when the volume is not writable (it then logs to `/tmp`).
+- A watchdog process, started first, terminates the pod at `DRBM25_HARD_DEADLINE_UNIX`: launch time + budget /
+  price + 1 h, whatever the run is doing.
+- Every terminate call tries your key (the `drbm25_runpod_api_key` secret) first, then the pod-scoped
+  `RUNPOD_API_KEY` that RunPod injects into every pod. This covers a secret that was deleted or never replaced.
+- If terminating still fails, the watchdog retries with backoff for about 35 minutes. The bootstrap then exits so
+  the container stops; it does not wait on the image's services forever. Check `--status` if a launch went wrong.
+
 ### Cost
 
 Prices (RunPod API, as of 2026-11-19): 2x A100 SXM 80GB community $2.78/h, secure $4.38/h; 2x A100 PCIe 80GB
-community $2.38/h, secure $4.18/h. Only secure applies (network volume). `launch.sh` prints the live list
+community $2.38/h, secure $4.18/h. Only the secure prices apply: network volumes require the Secure Cloud
+(https://docs.runpod.io/storage/network-volumes, as of 2026-11-20). `launch.sh` prints the live list
 price before you confirm and passes it to the run as `PRICE_PER_HOUR`; if the created pod reports a higher hourly
 cost, it prints a warning. Standard network volume storage was $0.07/GB/month for the first TB (RunPod
 docs, as of 2026-11-20): 400 GB is about $28/month, billed until you delete the volume.
@@ -277,12 +295,14 @@ bash scripts/runpod/launch.sh --status
 bash scripts/runpod/launch.sh --logs
 bash scripts/runpod/launch.sh --watch --interval-min 10
 bash scripts/runpod/launch.sh --stop
+bash scripts/runpod/launch.sh --stop --yes
 ```
 
 `--status` prints the pod's id, status, hourly cost and data center. `--logs` runs a fixed read-only command
 in the pod through RunPod's exec API and prints the FAILED marker (if any), `spend.json` and the last 40 lines of
 the newest `logs/bootstrap-*.log` and `logs/run_all-*.log`. `--watch` repeats status and the last 10 log lines
-until the pod is gone. `--stop` terminates the pod after you type `yes`; the volume and its data are kept, but
+until the pod is gone. `--stop` terminates the pod after you type `yes` (`--stop --yes` without asking); the
+volume and its data are kept, but
 the run is cut off at once, so `spend.json` misses the time since the last finished chunk. In the RunPod web
 terminal or over SSH: `tail -f /workspace/drbm25/logs/bootstrap-*.log` (then `run_all-*.log`).
 

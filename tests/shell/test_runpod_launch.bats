@@ -20,6 +20,7 @@ setup() {
   : >"$STUB_DIR/calls.log"
   : >"$STUB_DIR/argv.log"
   make_curl_stub
+  make_git_stub
   cat >"$BATS_TEST_TMPDIR/bin/sleep_stub" <<'EOF'
 #!/usr/bin/env bash
 echo "sleep $*" >>"$STUB_DIR/calls.log"
@@ -41,15 +42,20 @@ make_curl_stub() {
 # Records the call, then answers from $STUB_DIR/resp/<METHOD>_<path with / as _>.{json,status}. A .status file
 # holds one status per line, used in order (the last one repeats); defaults: 200, or 201 for POST, 204 DELETE.
 printf '%s\n' "$*" >>"$STUB_DIR/argv.log"
-method=GET out='' hdr='' body='' auth='' url=''
+method=GET out='' hdr='' body='' auth='' url='' fail=0
 while (($#)); do
   case $1 in
+    --fail) fail=1 ;;
     -X) method=$2; shift ;;
     -o) out=$2; shift ;;
     -D) hdr=$2; shift ;;
     -w) shift ;;
     --data-binary) body=${2#@}; shift ;;
-    -H) [[ $2 == @* ]] && auth=${2#@}; shift ;;
+    -H)
+      # -H @-: the header comes on stdin (pod_bootstrap.sh, lib.sh); -H @file: launch.sh's auth file.
+      if [[ $2 == @- ]]; then cat >>"$STUB_DIR/auth_stdin.log"; elif [[ $2 == @* ]]; then auth=${2#@}; fi
+      shift
+      ;;
     https://*) url=$1 ;;
   esac
   shift
@@ -80,6 +86,23 @@ if [[ -n $out ]]; then
   if [[ -f $STUB_DIR/resp/$key.json ]]; then cp "$STUB_DIR/resp/$key.json" "$out"; else : >"$out"; fi
 fi
 printf '%s' "$status"
+if ((fail && status >= 400)); then exit 22; fi
+EOF
+}
+
+# git ls-remote answers from $STUB_DIR/ls_remote (no network); every other git command is the real git.
+make_git_stub() {
+  local real_git
+  real_git=$(command -v git)
+  printf '%s\trefs/heads/feat/test\n' 0123456789abcdef0123456789abcdef01234567 >"$STUB_DIR/ls_remote"
+  cat >"$BATS_TEST_TMPDIR/bin/git" <<EOF
+#!/usr/bin/env bash
+if [[ \$1 == ls-remote ]]; then
+  echo "git \$*" >>"\$STUB_DIR/calls.log"
+  cat "\$STUB_DIR/ls_remote"
+  exit 0
+fi
+exec "$real_git" "\$@"
 EOF
 }
 
@@ -109,6 +132,10 @@ default_responses() {
   resp POST_v2_account_secrets '{"id":"sec9","name":"x"}'
   resp POST_v2_network-volumes '{"id":"volNEW","name":"drbm25","size":400,"dataCenter":"US-KS-2","type":"STANDARD"}'
   resp POST_v2_pods '{"id":"pod123","name":"drbm25","status":"PROVISIONING","cost":4.38,"dataCenterId":"US-MD-1"}'
+  resp GET_v2_catalog_datacenters '{"dataCenters":[
+    {"id":"US-MD-1","name":"US Maryland 1","networkVolumeTypes":["STANDARD","HIGH_PERFORMANCE"]},
+    {"id":"EU-RO-1","name":"EU Romania 1","networkVolumeTypes":["STANDARD"]},
+    {"id":"US-KS-2","name":"US Kansas 2","networkVolumeTypes":["STANDARD"]}]}'
 }
 
 launch() {
@@ -134,6 +161,7 @@ no_billable_calls() {
 @test "launch.sh --help exits 0 and documents --yes, --status, --logs, --watch and --stop" {
   run -0 bash "$LAUNCH" --help
   [[ $output == *--yes* && $output == *--status* && $output == *--logs* && $output == *--watch* && $output == *--stop* ]]
+  [[ $output == *"--stop --yes"* ]]
 }
 
 @test "launch.sh rejects an unknown option with status 2" {
@@ -520,5 +548,160 @@ bootstrap() {
 @test "pod_bootstrap.sh terminates the pod when DRBM25_REF is missing" {
   make_fixture_repo
   run -1 bootstrap DRBM25_REF=
+  grep -q '^DELETE https://api.runpod.io/v2/pods/pod123$' "$STUB_DIR/calls.log"
+}
+
+# ---------------------------------------------------------------- fix round 1
+
+@test "--stop --yes terminates without asking" {
+  resp GET_v2_pods '{"pods":[{"id":"pod7","name":"drbm25","status":"RUNNING","cost":4.38}],"pagination":{"hasNextPage":false}}'
+  run -0 env -u DRBM25_TTY bash "$LAUNCH" --stop --yes </dev/null
+  grep -q '^DELETE https://api.runpod.io/v2/pods/pod7$' "$STUB_DIR/calls.log"
+}
+
+@test "the pod env carries a hard deadline: now + budget / price hours + 1 h" {
+  local before after lo hi got
+  before=$(date +%s)
+  run -0 launch --yes
+  after=$(date +%s)
+  run -0 body_of POST_v2_pods
+  got=$(jq -r '.["env"]["DRBM25_HARD_DEADLINE_UNIX"]' <<<"$output")
+  # 150 / 4.38 h = 123287.67 s, plus 3600 s
+  lo=$((before + 123287 + 3600 - 2))
+  hi=$((after + 123288 + 3600 + 2))
+  ((got >= lo && got <= hi))
+}
+
+@test "a new volume only goes to a data center offering STANDARD volumes, checked before confirming" {
+  resp GET_v2_network-volumes '{"networkVolumes":[],"pagination":{"hasNextPage":false}}'
+  resp GET_v2_catalog_datacenters '{"dataCenters":[
+    {"id":"US-MD-1","networkVolumeTypes":["STANDARD"]},{"id":"EU-RO-1","networkVolumeTypes":["STANDARD"]},
+    {"id":"US-KS-2","networkVolumeTypes":["HIGH_PERFORMANCE"]}]}'
+  run -0 launch --yes
+  [[ $output != *US-KS-2* ]]
+  run -0 body_of POST_v2_network-volumes
+  [[ $(jq -r '.dataCenter' <<<"$output") == EU-RO-1 ]]
+}
+
+@test "with no stocked data center offering STANDARD volumes it stops before confirming or writing secrets" {
+  resp GET_v2_network-volumes '{"networkVolumes":[],"pagination":{"hasNextPage":false}}'
+  resp GET_v2_catalog_datacenters '{"dataCenters":[{"id":"US-MD-1","networkVolumeTypes":["HIGH_PERFORMANCE"]},
+    {"id":"EU-RO-1","networkVolumeTypes":[]},{"id":"US-KS-2","networkVolumeTypes":["HIGH_PERFORMANCE"]}]}'
+  printf 'yes\n' >"$DRBM25_TTY"
+  run -1 launch
+  [[ $output == *STANDARD* && $output == *HIGH_PERFORMANCE* ]]
+  [[ $output != *"Type yes"* ]]
+  ! grep -q '^\(POST\|PATCH\|DELETE\)' "$STUB_DIR/calls.log"
+}
+
+@test "a ref that is not on origin (git ls-remote) stops the launch before any API write" {
+  : >"$STUB_DIR/ls_remote"
+  run -1 launch --yes
+  [[ $output == *feat/test* && $output == *push* ]]
+  grep -q '^git ls-remote https://github.com/objones25/drbm25' "$STUB_DIR/calls.log"
+  ! grep -q '^\(POST\|PATCH\|DELETE\)' "$STUB_DIR/calls.log"
+}
+
+@test "the default ref is HEAD's sha when it is a branch tip on origin" {
+  local sha
+  sha=$(git -C "$BATS_TEST_DIRNAME/../.." rev-parse HEAD)
+  printf '%s\trefs/heads/some-branch\n' "$sha" >"$STUB_DIR/ls_remote"
+  run -0 bash "$LAUNCH" --yes
+  run -0 body_of POST_v2_pods
+  [[ $(jq -r '.["env"]["DRBM25_REF"]' <<<"$output") == "$sha" ]]
+}
+
+@test "the default ref is refused when HEAD is not a branch or tag tip on origin" {
+  run -1 bash "$LAUNCH" --yes
+  [[ $output == *push* ]]
+  no_billable_calls
+}
+
+bootstrap_bounded() { # like bootstrap, killed after 60 s so a hang fails the test instead of blocking it
+  perl -e 'alarm 60; exec @ARGV' env DRBM25_ROOT="${BOOT_ROOT:-$BATS_TEST_TMPDIR/ws/drbm25}" \
+    DRBM25_START_SH="$BATS_TEST_TMPDIR/start.sh" DRBM25_REPO_URL="file://$FIXTURE_REPO" DRBM25_REF=main \
+    DRBM25_RUNPOD_API_KEY=$RP RUNPOD_API_KEY=pod_scoped_key RUNPOD_POD_ID=pod123 "$@" bash -c "$(cat "$BOOTSTRAP")"
+}
+
+@test "bootstrap: an unreplaced user secret reference falls back to the pod-scoped key for DELETE" {
+  make_fixture_repo
+  run -1 bootstrap_bounded DRBM25_RUNPOD_API_KEY='{{ RUNPOD_SECRET_drbm25_runpod_api_key }}' \
+    DRBM25_REPO_URL="file://$BATS_TEST_TMPDIR/nope"
+  grep -q '^DELETE https://api.runpod.io/v2/pods/pod123$' "$STUB_DIR/calls.log"
+  grep -qx 'Authorization: Bearer pod_scoped_key' "$STUB_DIR/auth_stdin.log"
+  ! grep -q RUNPOD_SECRET "$STUB_DIR/auth_stdin.log"
+  ! grep -q pod_scoped_key "$STUB_DIR/argv.log"
+}
+
+@test "bootstrap: when the user key's DELETE fails it retries with the pod-scoped key" {
+  make_fixture_repo
+  resp_status DELETE_v2_pods_pod123 401 204
+  run -1 bootstrap_bounded DRBM25_REPO_URL="file://$BATS_TEST_TMPDIR/nope"
+  [[ $(sed -n 1p "$STUB_DIR/auth_stdin.log") == "Authorization: Bearer $RP" ]]
+  [[ $(sed -n 2p "$STUB_DIR/auth_stdin.log") == 'Authorization: Bearer pod_scoped_key' ]]
+}
+
+@test "bootstrap: the run's environment carries the pod-scoped key for run_all.sh's terminate fallback" {
+  make_fixture_repo
+  printf 'echo "pod_key=$DRBM25_POD_RUNPOD_API_KEY" >>"$STUB_DIR/run_all.out"\n' >>"$FIXTURE_REPO/scripts/runpod/run_all.sh"
+  git -C "$FIXTURE_REPO" -c user.name=t -c user.email=t@t commit -q -am pod-key
+  run -0 bootstrap_bounded
+  grep -qx 'pod_key=pod_scoped_key' "$STUB_DIR/run_all.out"
+}
+
+@test "bootstrap: the watchdog terminates the pod at the hard deadline while run_all.sh is still running" {
+  make_fixture_repo
+  # run_all.sh "trains" until it sees the DELETE (at most 20 s).
+  cat >"$FIXTURE_REPO/scripts/runpod/run_all.sh" <<'EOF'
+#!/usr/bin/env bash
+for i in $(seq 1 40); do
+  if grep -q '^DELETE' "$STUB_DIR/calls.log"; then echo saw_delete >>"$STUB_DIR/run_all.out"; exit 0; fi
+  sleep 0.5
+done
+echo no_delete >>"$STUB_DIR/run_all.out"
+EOF
+  git -C "$FIXTURE_REPO" -c user.name=t -c user.email=t@t commit -q -am slow
+  run bootstrap_bounded DRBM25_HARD_DEADLINE_UNIX=$(($(date +%s) - 1))
+  grep -qx saw_delete "$STUB_DIR/run_all.out"
+  grep -q 'watchdog: hard deadline' "$BATS_TEST_TMPDIR"/ws/drbm25/logs/bootstrap-*.log
+}
+
+@test "bootstrap: the watchdog stays quiet before the deadline and is stopped when the run ends" {
+  make_fixture_repo
+  run -0 bootstrap_bounded DRBM25_HARD_DEADLINE_UNIX=$(($(date +%s) + 3600)) TERMINATE_ON_FINISH=no
+  ! grep -q '^DELETE' "$STUB_DIR/calls.log"
+  local pid i
+  pid=$(sed -n 's/.*watchdog started (pid \([0-9]*\).*/\1/p' "$BATS_TEST_TMPDIR"/ws/drbm25/logs/bootstrap-*.log)
+  [[ -n $pid ]]
+  for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.3; done
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+@test "bootstrap: an unwritable volume still reaches terminate, logging to TMPDIR" {
+  make_fixture_repo
+  : >"$BATS_TEST_TMPDIR/not-a-dir"
+  BOOT_ROOT=$BATS_TEST_TMPDIR/not-a-dir/drbm25 run -1 bootstrap_bounded
+  grep -q '^DELETE https://api.runpod.io/v2/pods/pod123$' "$STUB_DIR/calls.log"
+  ls "$TMPDIR"/drbm25-bootstrap-*.log
+  grep -q 'not writable' "$TMPDIR"/drbm25-bootstrap-*.log
+}
+
+@test "bootstrap: when terminate keeps failing it retries a bounded number of times and exits, never waiting forever" {
+  make_fixture_repo
+  resp_status DELETE_v2_pods_pod123 500
+  # The image's services would run forever; the bootstrap must not wait on them.
+  printf '#!/usr/bin/env bash\necho $$ >"$STUB_DIR/start.pid"\nexec sleep 120\n' >"$BATS_TEST_TMPDIR/start.sh"
+  chmod +x "$BATS_TEST_TMPDIR/start.sh"
+  run bootstrap_bounded DRBM25_HARD_DEADLINE_UNIX=$(($(date +%s) + 3600))
+  kill "$(cat "$STUB_DIR/start.pid")" 2>/dev/null || true
+  ((status != 0 && status != 142)) # 142: killed by the 60 s alarm, i.e. a hang
+  (($(grep -c '^DELETE' "$STUB_DIR/calls.log") > 2))
+  grep -q 'ERROR: could not terminate' "$BATS_TEST_TMPDIR"/ws/drbm25/logs/bootstrap-*.log
+}
+
+@test "bootstrap: with neither the volume nor TMPDIR writable, terminate is still called" {
+  make_fixture_repo
+  : >"$BATS_TEST_TMPDIR/not-a-dir"
+  BOOT_ROOT=$BATS_TEST_TMPDIR/not-a-dir/drbm25 TMPDIR=$BATS_TEST_TMPDIR/not-a-dir/tmp run -1 bootstrap_bounded
   grep -q '^DELETE https://api.runpod.io/v2/pods/pod123$' "$STUB_DIR/calls.log"
 }

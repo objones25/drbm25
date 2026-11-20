@@ -30,6 +30,8 @@ make_stubs() {
   cat >"$bin/curl" <<'EOF'
 #!/usr/bin/env bash
 echo "curl $*" >>"$STUB_LOG"
+# -H @-: the auth header arrives on stdin; keep it so tests can see which key was used.
+if [[ " $* " == *" @- "* ]]; then cat >>"$STUB_DIR/curl_stdin"; fi
 n=$(cat "$STUB_DIR/curl_n" 2>/dev/null || echo 0)
 echo $((n + 1)) >"$STUB_DIR/curl_n"
 if ((n < ${STUB_CURL_FAILS:-0})); then exit 22; fi
@@ -1159,4 +1161,25 @@ make_uv_tarball() {
   [[ $output == 1700000500 ]]
   run -0 in_lib DRBM25_POD_START_UNIX=1800000000 DRBM25_NOW_UNIX=1700000500
   [[ $output == 1700000500 ]]
+}
+
+@test "terminate_pod uses the pod-scoped key when RUNPOD_API_KEY is an unreplaced secret reference" {
+  SNIPPET='terminate_pod'
+  run -0 in_lib RUNPOD_POD_ID=pod123 'RUNPOD_API_KEY={{ RUNPOD_SECRET_drbm25_runpod_api_key }}' DRBM25_POD_RUNPOD_API_KEY=pod_key
+  [[ $(cat "$STUB_DIR/curl_stdin") == 'Authorization: Bearer pod_key' ]]
+  [[ $(grep -c '^curl' "$STUB_LOG") == 1 ]]
+}
+
+@test "terminate_pod falls back to the pod-scoped key when the user key's call fails, without waiting" {
+  SNIPPET='terminate_pod'
+  run -0 in_lib RUNPOD_POD_ID=pod123 RUNPOD_API_KEY=rp_key DRBM25_POD_RUNPOD_API_KEY=pod_key STUB_CURL_FAILS=1
+  [[ $(sed -n 1p "$STUB_DIR/curl_stdin") == 'Authorization: Bearer rp_key' ]]
+  [[ $(sed -n 2p "$STUB_DIR/curl_stdin") == 'Authorization: Bearer pod_key' ]]
+  ! grep -q '^sleep' "$STUB_LOG"
+}
+
+@test "terminate_pod with only the pod-scoped key still terminates" {
+  SNIPPET='terminate_pod'
+  run -0 in_lib RUNPOD_POD_ID=pod123 DRBM25_POD_RUNPOD_API_KEY=pod_key
+  [[ $(cat "$STUB_DIR/curl_stdin") == 'Authorization: Bearer pod_key' ]]
 }

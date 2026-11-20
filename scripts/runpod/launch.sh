@@ -14,6 +14,7 @@
 # RunPod REST API v2 (base https://api.runpod.io, bearer key; https://docs.runpod.io/api-reference-v2/overview),
 # endpoints used, each checked against its reference page on 2026-11-20:
 #   GET    /v2/catalog/gpus     https://docs.runpod.io/api-reference-v2/catalog/list-gpu-types
+#   GET    /v2/catalog/datacenters  https://docs.runpod.io/api-reference-v2/catalog/list-data-centers
 #   GET    /v2/network-volumes  https://docs.runpod.io/api-reference-v2/network-volumes/list-network-volumes
 #   POST   /v2/network-volumes  https://docs.runpod.io/api-reference-v2/network-volumes/create-a-network-volume
 #   GET    /v2/account/secrets  https://docs.runpod.io/api-reference-v2/account/list-secrets
@@ -64,6 +65,8 @@ readonly LOG_LINES=40
 readonly WATCH_LOG_LINES=10
 readonly WATCH_MAX_POLLS=2000 # 2000 x 10 min is about 14 days, longer than any budget buys
 readonly CONSOLE_URL=https://console.runpod.io/pods
+# The pod's watchdog terminates it at launch + budget / price + this margin, whatever the run is doing.
+readonly HARD_DEADLINE_MARGIN_S=3600
 # Run inside the pod by --logs and --watch (sh -c, fixed text; the line count comes in through env).
 # shellcheck disable=SC2016 # expanded by the pod's shell, not here
 readonly LOG_SCRIPT='cd /workspace/drbm25 2>/dev/null || { echo "no /workspace/drbm25 yet (the pod is still starting)"; exit 0; }
@@ -103,7 +106,8 @@ Other modes:
   --status           print the $POD_NAME pod's id, status, price and data center
   --logs             print the FAILED marker, spend and the last $LOG_LINES lines of the newest logs (via the exec API)
   --watch            poll status and logs every --interval-min minutes (default 10) until the pod is gone
-  --stop             terminate the pod after you type 'yes' (the volume and its data are kept)
+  --stop             terminate the pod after you type 'yes' (the volume and its data are kept);
+                     --stop --yes terminates without asking
   --pod ID           act on this pod id instead of the one named $POD_NAME
   -h, --help         show this help
 
@@ -198,17 +202,22 @@ _require_command() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required but not found${2:+ ($2)}"
 }
 
-# Default ref: this checkout's HEAD, which the pod can fetch only if it was pushed.
+# The ref must exist on the public repository, or the pod's fetch fails after billing has started. Default:
+# this checkout's HEAD sha, which must be the tip of a branch or tag there (git ls-remote lists only tips).
 resolve_ref() {
-  local sha
-  if [[ -n $OPT_REF ]]; then return 0; fi
+  local refs found
   _require_command git
-  sha=$(git -C "$REPO_ROOT" rev-parse HEAD) || die "cannot read this checkout's HEAD; pass --ref"
-  # shellcheck disable=SC1083 # @{u} is git syntax for the upstream branch
-  if ! git -C "$REPO_ROOT" merge-base --is-ancestor HEAD @{u} 2>/dev/null; then
-    die "HEAD ($sha) is not on its upstream branch, so the pod could not fetch it: push it first, or pass --ref"
+  if [[ -z $OPT_REF ]]; then
+    OPT_REF=$(git -C "$REPO_ROOT" rev-parse HEAD) || die "cannot read this checkout's HEAD; pass --ref"
   fi
-  OPT_REF=$sha
+  # No terminal prompts for credentials, and give up on a transfer slower than 1 KB/s for 30 s.
+  refs=$(GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=30 git ls-remote "$OPT_REPO_URL") ||
+    die "cannot list the refs of $OPT_REPO_URL (git ls-remote failed); check the URL and your network"
+  found=$(printf '%s\n' "$refs" | awk -v r="$OPT_REF" '
+    $1 == r || $2 == "refs/heads/" r || $2 == "refs/tags/" r { print "yes"; exit }')
+  if [[ $found != yes ]]; then
+    die "ref $OPT_REF is not a branch, tag or branch-tip commit on $OPT_REPO_URL: push it first (git push), or pass --ref <pushed branch>"
+  fi
 }
 
 ask_api_key() {
@@ -291,10 +300,11 @@ find_volume() {
   [[ $VOLUME_ID =~ ^[A-Za-z0-9_-]+$ ]] || die "unexpected volume id from the API: '$VOLUME_ID'"
 }
 
-# Sets OFFER_PRICE (USD/h for all GPUs), OFFER_GPU, OFFER_DC, OFFER_AVAIL: the cheapest stocked offer, in
-# DC_FILTER when given. Prices are list prices per GPU per cloud (catalog docs); stock is per data center.
+# Sets OFFER_PRICE (USD/h for all GPUs), OFFER_GPU, OFFER_DC, OFFER_AVAIL: the cheapest stocked offer in one of
+# ALLOWED_DCS (a JSON array of data center ids, or null for any). Prices are list prices per GPU per cloud
+# (catalog docs); stock is per data center.
 find_offer() {
-  local dc_filter=$1 out=$TMP_DIR/gpus.json ids row
+  local allowed=$1 out=$TMP_DIR/gpus.json ids row
   case $OPT_GPU in
     sxm) ids=$(jq -cn --arg a "$GPU_ID_SXM" '[$a]') ;;
     pcie) ids=$(jq -cn --arg a "$GPU_ID_PCIE" '[$a]') ;;
@@ -304,15 +314,30 @@ find_offer() {
   api "$out" GET "/v2/catalog/gpus?include=AVAILABILITY&product=POD&count=$GPU_COUNT&cloud=SECURE&minCudaVersion=$MIN_CUDA" ||
     api_fail "reading GPU stock and prices" "$out"
   # Price rounded to cents; the 1e-6 keeps float noise (2.19 x 200 = 438.00000000000006) from rounding up.
-  row=$(jq -r --argjson ids "$ids" --argjson n "$GPU_COUNT" --arg dc "$dc_filter" '
+  row=$(jq -r --argjson ids "$ids" --argjson n "$GPU_COUNT" --argjson dcs "$allowed" '
     [ .gpus[] | select(.id as $id | $ids | index($id)) | select(.secure == true and .price.secure != null)
       | . as $g | ((($g.price.secure * $n * 100) - 0.000001 | ceil) / 100) as $price
-      | ($g.dataCenters // [])[] | select(.availability != "NONE") | select($dc == "" or .id == $dc)
+      | ($g.dataCenters // [])[] | select(.availability != "NONE") | .id as $d | select($dcs == null or ($dcs | index($d)))
       | {price: $price, gpu: $g.id, dc: .id, avail: .availability} ]
     | sort_by(.price, ({"HIGH": 0, "MEDIUM": 1, "LOW": 2}[.avail] // 3))
     | .[0] // empty | [(.price | tostring), .gpu, .dc, .avail] | @tsv' "$out")
   OFFER_PRICE='' OFFER_GPU='' OFFER_DC='' OFFER_AVAIL=''
   if [[ -n $row ]]; then IFS=$'\t' read -r OFFER_PRICE OFFER_GPU OFFER_DC OFFER_AVAIL <<<"$row"; fi
+}
+
+# Prints a JSON array of the data centers that offer STANDARD network volumes (networkVolumeTypes, from the
+# data center catalog). A new volume is STANDARD so its documented price is the one quoted.
+standard_volume_dcs() {
+  local out=$TMP_DIR/datacenters.json
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  api "$out" GET /v2/catalog/datacenters || api_fail "reading the data center catalog" "$out"
+  jq -c '[.dataCenters[] | select((.networkVolumeTypes // []) | index("STANDARD")) | .id]' "$out"
+}
+
+# Prints "DC: TYPES" for every data center, for the message when no STANDARD one has stock.
+_volume_types_summary() {
+  jq -r '[.dataCenters[] | .id + ": " + (((.networkVolumeTypes // []) | join("+")) | if . == "" then "none" else . end)] | join(", ")' \
+    "$TMP_DIR/datacenters.json"
 }
 
 # ---------------------------------------------------------------- writes
@@ -364,7 +389,7 @@ pod_body() {
     --arg runpod "{{ RUNPOD_SECRET_$SECRET_RUNPOD }}" \
     --arg project "$WANDB_PROJECT" --arg entity "$WANDB_ENTITY" --arg budget "$BUDGET_USD" \
     --arg price "$OFFER_PRICE" --arg volume_gb "$VOLUME_SIZE" --arg repo "$OPT_REPO_URL" --arg ref "$OPT_REF" \
-    --arg clear "$OPT_CLEAR_FAILED" '{
+    --arg clear "$OPT_CLEAR_FAILED" --arg hard_deadline "$HARD_DEADLINE_UNIX" '{
       name: $name, image: $image, cloud: "SECURE", dataCenterIds: [$dc],
       gpu: {id: $gpu, count: $count, minCudaVersion: $min_cuda},
       disk: $disk, ports: ["8888/http", "22/tcp"], startSsh: true, startJupyter: true,
@@ -374,13 +399,17 @@ pod_body() {
         HF_TOKEN: $hf, WANDB_API_KEY: $wandb, DRBM25_RUNPOD_API_KEY: $runpod,
         WANDB_PROJECT: $project, WANDB_ENTITY: $entity, BUDGET_USD: $budget, PRICE_PER_HOUR: $price,
         TERMINATE_ON_FINISH: "yes", VOLUME_GB: $volume_gb, DRBM25_REPO_URL: $repo, DRBM25_REF: $ref,
-        DRBM25_NONINTERACTIVE: "1", DRBM25_CLEAR_FAILED: $clear
+        DRBM25_NONINTERACTIVE: "1", DRBM25_CLEAR_FAILED: $clear, DRBM25_HARD_DEADLINE_UNIX: $hard_deadline
       }
     }'
 }
 
 create_pod() {
-  local out=$TMP_DIR/pod-resp.json body=$TMP_DIR/pod.json cost
+  local out=$TMP_DIR/pod-resp.json body=$TMP_DIR/pod.json cost now
+  now=$(date +%s)
+  # Launch time + the hours the confirmed budget buys at the quoted price + a margin (the pod's watchdog).
+  HARD_DEADLINE_UNIX=$(awk -v t="$now" -v b="$BUDGET_USD" -v p="$OFFER_PRICE" -v m="$HARD_DEADLINE_MARGIN_S" \
+    'BEGIN { printf "%d", t + b / p * 3600 + m }')
   pod_body >"$body"
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   if ! api "$out" POST /v2/pods "$body"; then
@@ -401,7 +430,7 @@ create_pod() {
 # ---------------------------------------------------------------- modes
 
 do_launch() {
-  local hours monthly volume_line
+  local hours monthly volume_line allowed_dcs types
   resolve_ref
   collect_launch_settings
   # shellcheck disable=SC2310 # find_pod returns 1 for "no pod", which is what is wanted here
@@ -409,12 +438,18 @@ do_launch() {
     die "pod $POD_ID ($POD_NAME, $POD_STATUS) already exists; two pods must not share the volume. See $SCRIPT_NAME --status, or --stop it first"
   fi
   find_volume
-  find_offer "$VOLUME_DC"
+  if [[ -n $VOLUME_ID ]]; then
+    allowed_dcs=$(jq -cn --arg dc "$VOLUME_DC" '[$dc]')
+  else
+    allowed_dcs=$(standard_volume_dcs)
+  fi
+  find_offer "$allowed_dcs"
   if [[ -z $OFFER_GPU ]]; then
     if [[ -n $VOLUME_ID ]]; then
       die "no ${GPU_COUNT}x A100 80GB ($OPT_GPU) is in stock in $VOLUME_DC, where volume $VOLUME_NAME ($VOLUME_ID) lives. A volume is tied to its data center, so try again later (or move the data yourself); no second volume is created"
     fi
-    die "no ${GPU_COUNT}x A100 80GB ($OPT_GPU) is in stock on the secure cloud right now; try again later"
+    types=$(_volume_types_summary)
+    die "no ${GPU_COUNT}x A100 80GB ($OPT_GPU) is in stock on the secure cloud in a data center that offers STANDARD network volumes right now (volume types per data center: $types). HIGH_PERFORMANCE volumes cost more and their price is not published in the docs, so this launcher does not create them: try again later, or create a volume named $VOLUME_NAME yourself in the console and run again"
   fi
 
   hours=$(awk -v b="$BUDGET_USD" -v p="$OFFER_PRICE" 'BEGIN { printf "%.1f", b / p }')
@@ -429,6 +464,7 @@ do_launch() {
   say "  pod:     ${GPU_COUNT}x $OFFER_GPU, secure cloud, data center $OFFER_DC (stock $OFFER_AVAIL)"
   say "  price:   \$$OFFER_PRICE/h (list price) while the pod exists, plus ${CONTAINER_DISK_GB} GB container disk"
   say "  budget:  \$$BUDGET_USD remaining buys about $hours h; the run stops, evaluates, reports and terminates the pod"
+  say "           (a watchdog in the pod terminates it anyway $((HARD_DEADLINE_MARGIN_S / 3600)) h after that)"
   say "  volume:  $volume_line"
   say "  code:    $OPT_REPO_URL at $OPT_REF"
   say ""

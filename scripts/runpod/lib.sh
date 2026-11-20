@@ -18,7 +18,7 @@
 #   load_env_file PATH         export NAME=value lines for allowed names not already set
 #   collect_settings           prompts for what is missing, validates, rewrites the .env
 #   step_done MARKER / mark_done MARKER / mark_failed REASON
-#   terminate_pod              DELETE the pod through the RunPod API, 3 attempts
+#   terminate_pod              DELETE the pod through the RunPod API, 3 attempts (user key, then pod key)
 #   install_java21, install_uv, sync_deps, prepare_data_stage, download_model
 #   smoke_stage                GPU tests, then the memory check at micro batch 8, 4, 2 (first that
 #                              passes is saved to $DRBM25_ROOT/micro_batch and used by every chunk)
@@ -531,8 +531,19 @@ _check_disk() {
 
 # ---------------------------------------------------------------- terminate
 
+# One DELETE with KEY (header on stdin, -H @- curl 7.55+, so the key is never in ps output).
+# RunPod docs, "Terminate a pod": DELETE /v2/pods/{id}, 204 on success; the key needs pods:write.
+_delete_pod_with() {
+  curl --fail --silent --show-error --max-time 30 -X DELETE \
+    -H @- "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID" >/dev/null <<<"Authorization: Bearer $1"
+}
+
+# Keys, in order: RUNPOD_API_KEY (the user's pods:write key) unless it is missing or an unreplaced
+# {{ RUNPOD_SECRET_* }} reference, then DRBM25_POD_RUNPOD_API_KEY, the pod-scoped key RunPod injects
+# (https://docs.runpod.io/pods/templates/environment-variables), saved by pod_bootstrap.sh. Each attempt tries
+# both, so a rejected user key falls back at once.
 _terminate_pod_body() {
-  local sleep_cmd=${DRBM25_SLEEP:-sleep} attempt
+  local sleep_cmd=${DRBM25_SLEEP:-sleep} attempt user=${RUNPOD_API_KEY-} pod=${DRBM25_POD_RUNPOD_API_KEY-}
   if [[ -z ${RUNPOD_POD_ID-} ]]; then
     _runpod_log "WARNING: RUNPOD_POD_ID is not set (RunPod sets it inside pods), so this pod was NOT terminated. Terminate it yourself at $RUNPOD_CONSOLE_URL or billing continues."
     return 1
@@ -541,16 +552,23 @@ _terminate_pod_body() {
     _runpod_log "WARNING: RUNPOD_POD_ID has unexpected characters; not calling the API. Terminate the pod at $RUNPOD_CONSOLE_URL"
     return 1
   fi
-  if [[ -z ${RUNPOD_API_KEY-} ]]; then
+  if [[ $user == *RUNPOD_SECRET_* ]]; then
+    _runpod_log "WARNING: RUNPOD_API_KEY is an unreplaced RunPod secret reference; using the pod-scoped key"
+    user=''
+  fi
+  if [[ -z $user && -z $pod ]]; then
     _runpod_log "WARNING: RUNPOD_API_KEY is not set, so pod $RUNPOD_POD_ID was NOT terminated. Terminate it at $RUNPOD_CONSOLE_URL"
     return 1
   fi
   for ((attempt = 1; attempt <= TERMINATE_ATTEMPTS; attempt++)); do
-    # The header is read from stdin (-H @-, curl 7.55+) so the key never appears in ps output.
-    # RunPod docs, "Terminate a pod": DELETE /v2/pods/{id}, 204 on success; the key needs pods:write.
-    if curl --fail --silent --show-error --max-time 30 -X DELETE \
-      -H @- "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID" >/dev/null <<<"Authorization: Bearer $RUNPOD_API_KEY"; then
+    # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+    if [[ -n $user ]] && _delete_pod_with "$user"; then
       _runpod_log "terminated pod $RUNPOD_POD_ID"
+      return 0
+    fi
+    # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+    if [[ -n $pod ]] && _delete_pod_with "$pod"; then
+      _runpod_log "terminated pod $RUNPOD_POD_ID (with the pod-scoped key)"
       return 0
     fi
     _runpod_log "terminate attempt $attempt/$TERMINATE_ATTEMPTS failed for pod $RUNPOD_POD_ID"
