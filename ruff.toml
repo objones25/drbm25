@@ -1,8 +1,7 @@
-# Ruff config for the lint gate. Merge into pyproject.toml under [tool.ruff], or
-# keep standalone: ruff check --config ruff-pytest.toml .
+# Ruff config for the lint gate (standalone; ruff discovers it as ruff.toml).
 # Verified against ruff 0.17.3 (PT001-PT031, S = bandit rules).
 
-target-version = "py311"
+target-version = "py312"
 line-length = 120
 # mutmut writes a mutated copy of the project into mutants/; never lint it.
 # Gate scripts are vendored verbatim from the skills; do not restyle them.

@@ -32,13 +32,6 @@ SEED = 20260826
 # Environment variable prefixes owned by the project under test. Edit these.
 APP_ENV_PREFIXES = ("DRBM25_",)
 
-MARKERS = (
-    "java: needs a JVM (Java 21) for pyserini/Lucene",
-    "gpu: requires CUDA; deselected by default",
-    "integration: crosses a process, service, or network boundary; deselected by default",
-    "slow: takes more than ~1s",
-)
-
 DIRECTORY_MARKERS = ("integration",)
 
 
@@ -205,7 +198,7 @@ def _torch_determinism(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
     Determinism is slower. That is the trade you are making on purpose.
     """
-    torch = pytest.importorskip("torch")
+    import torch
 
     # CUBLAS needs this set before the first CUDA context to be deterministic.
     monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -341,12 +334,6 @@ def assert_close():
 # --------------------------------------------------------------------------
 # Markers and reporting
 # --------------------------------------------------------------------------
-def pytest_configure(config: pytest.Config) -> None:
-    """Register markers in code too, so this conftest works before pyproject is updated."""
-    for line in MARKERS:
-        config.addinivalue_line("markers", line)
-
-
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Mark tests by directory, so the default -m deselection cannot be forgotten."""
     for item in items:
