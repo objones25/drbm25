@@ -33,12 +33,46 @@ def test_b_sees_clean_state_and_caplog_works(caplog):
 '''
 
 
+_COUNT_TESTS = '''
+import logging
+import pytest
+
+
+@pytest.mark.parametrize("i", range(5))
+def test_n(i):
+    print("ROOT_HANDLERS", len(logging.getLogger().handlers))
+'''
+
+
 def test_shutdown_makes_configure_effective_again() -> None:
-    setup.configure(level="INFO", force=True)
+    first = setup.configure(level="INFO", force=True)
+    assert first["root"]["handlers"] == ["queue"]
     assert setup._configured is True
+    assert setup.configure(level="DEBUG") == {}  # second call is a no-op while configured
     setup.shutdown()
     assert setup._configured is False
-    assert setup.configure(level="INFO") != {}  # not a no-op
+    again = setup.configure(level="DEBUG")
+    assert again["root"]["handlers"] == ["queue"]
+    assert again["handlers"]["stdout"]["level"] == "DEBUG"
+    assert setup._configured is True
+
+
+def test_root_handler_count_does_not_grow_across_tests(tmp_path: Path) -> None:
+    """Five tests in a fresh pytest process; the root handler count must stay constant."""
+    shutil.copy(CONFTEST, tmp_path / "conftest.py")
+    (tmp_path / "test_count.py").write_text(_COUNT_TESTS)
+    proc = subprocess.run(  # noqa: S603 -- fixed argv, no external input
+        [sys.executable, "-m", "pytest", "-p", "no:randomly", "-p", "no:cacheprovider", "-q", "-s", "--no-header", "--rootdir", str(tmp_path), str(tmp_path / "test_count.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=tmp_path,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    counts = [int(line.split()[1]) for line in proc.stdout.splitlines() if "ROOT_HANDLERS" in line]
+    assert len(counts) == 5
+    assert len(set(counts)) == 1, counts
 
 
 def test_configure_in_one_test_does_not_leak_into_the_next(tmp_path: Path) -> None:

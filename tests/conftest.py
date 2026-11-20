@@ -70,9 +70,11 @@ def _restore_logging() -> Iterator[None]:
     lib_levels = {n: logging.getLogger(n).level for n in DEFAULT_LIBRARY_LEVELS}
     yield
     shutdown()
-    for h in list(root.handlers):
+    # Diff against the snapshot instead of replacing the list: pytest's own per-phase
+    # capture handlers come and go on root and must not be re-added or dropped here.
+    for h in [h for h in root.handlers if h not in handlers]:
         root.removeHandler(h)
-    for h in handlers:
+    for h in [h for h in handlers if h not in root.handlers]:
         root.addHandler(h)
     root.setLevel(level)
     for n, lvl in lib_levels.items():
