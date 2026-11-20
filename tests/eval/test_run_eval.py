@@ -101,6 +101,22 @@ def test_rewrite_scored_under_both_modes_with_repeated_terms(searcher: Bm25Searc
     assert 0.0 < record.ndcg_normal < 1.0  # docA outranks docB when solar counts three times
 
 
+def test_score_rewrites_records_the_think_length_in_characters(searcher: Bm25Searcher) -> None:
+    texts = [
+        '  weigh the terms \n</think>\n<answer>\n{"query": "solar"}\n</answer>',
+        "no tags at all",
+    ]
+    records = score_rewrites(
+        [_example("q1"), _example("q2")], _TextEngine(texts), searcher, k=K, source="untrained"
+    )
+    assert [r.think_chars for r in records] == [len("weigh the terms"), None]  # stripped; none on a format error
+
+
+def test_score_original_has_no_think_length(searcher: Bm25Searcher) -> None:
+    records = score_original([_example("q1"), _example("q2")], searcher, k=K)
+    assert [r.think_chars for r in records] == [None, None]
+
+
 def test_score_rewrites_rejects_length_mismatch(searcher: Bm25Searcher) -> None:
     with pytest.raises(ValueError, match="responses"):
         score_rewrites([_example(), _example("q2")], _TextEngine(["x"]), searcher, k=K, source="s")
@@ -423,6 +439,47 @@ def test_cli_scores_best_labelled_from_its_meta_and_records_provenance(
     assert header["eval_seed"] == 1234
     assert set(header["git"]) == {"sha", "dirty"}  # the eval code's own version
     assert len(header["eval_config_sha256"]) == 64
+
+
+def test_cli_best_header_records_the_runs_latest_trained_step(workdir: Path, toy_index: Path) -> None:
+    run_dir = workdir / "out" / "normal"
+    best, models = _lora_best(run_dir)  # selected at step 100
+    state = TrainState(step=150, data_cursor=600, wandb_run_id=None, reward_mode="normal")
+    save_checkpoint(run_dir, train_state=state, model=models.trainable_state_dict(), optimizers={}, scaler=None, keep=1)
+    out = workdir / "trained.jsonl"
+    argv = _argv(workdir, toy_index, out, "--source", "checkpoint", "--checkpoint", str(best), "--limit", "2")
+    assert main(argv) == 0
+    header = read_header(out)
+    assert header is not None
+    assert header["trained_steps"] == 150
+
+
+def test_cli_best_without_a_resume_checkpoint_has_unknown_trained_steps(workdir: Path, toy_index: Path) -> None:
+    best, _ = _lora_best(workdir / "out" / "normal")
+    out = workdir / "trained.jsonl"
+    argv = _argv(workdir, toy_index, out, "--source", "checkpoint", "--checkpoint", str(best), "--limit", "2")
+    assert main(argv) == 0
+    header = read_header(out)
+    assert header is not None
+    assert header["trained_steps"] is None
+
+
+def test_cli_step_checkpoint_header_records_its_own_step(workdir: Path, toy_index: Path) -> None:
+    ckpt = _write_tiny_checkpoint(workdir)  # step 2
+    out = workdir / "trained.jsonl"
+    argv = _argv(workdir, toy_index, out, "--source", "checkpoint", "--checkpoint", str(ckpt), "--limit", "2")
+    assert main(argv) == 0
+    header = read_header(out)
+    assert header is not None
+    assert header["trained_steps"] == 2
+
+
+def test_cli_original_header_has_no_trained_steps(workdir: Path, toy_index: Path) -> None:
+    out = workdir / "orig.jsonl"
+    assert main(_argv(workdir, toy_index, out, "--source", "original", "--limit", "2")) == 0
+    header = read_header(out)
+    assert header is not None
+    assert header["trained_steps"] is None
 
 
 def test_cli_original_header_has_no_best(workdir: Path, toy_index: Path) -> None:

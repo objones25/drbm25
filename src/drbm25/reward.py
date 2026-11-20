@@ -77,6 +77,13 @@ def parse_response(response_text: str) -> ParsedRewrite | FormatError:
     return ParsedRewrite(query)
 
 
+def think_length_chars(response_text: str) -> int:
+    """Characters of the reasoning (stripped) before the single ``</think>`` of a well-formed response."""
+    if response_text.count(_THINK_CLOSE) != 1:
+        raise ValueError(f"expected exactly one {_THINK_CLOSE} in the response")
+    return len(response_text[: response_text.find(_THINK_CLOSE)].strip())
+
+
 def ndcg_at_k(ranked_ids: Sequence[str], relevant_ids: frozenset[str], k: int) -> float:
     """nDCG@k with binary gains; DCG is the sum of 1/log2(rank+1), rank from 1."""
     if not relevant_ids:

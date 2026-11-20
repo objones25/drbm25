@@ -29,7 +29,9 @@ class QueryRecord:
     is one, else the original. A format error keeps the raw response in ``rewrite_text``, sets
     ``format_error`` to the reason and scores 0.0 in both modes. ``search_error`` names the
     modes whose search overflowed Lucene's clause limit (those score 0.0), as
-    ``"too_many_clauses:<mode>[,<mode>]"``.
+    ``"too_many_clauses:<mode>[,<mode>]"``. ``think_chars`` is the length in characters of the
+    stripped reasoning before ``</think>`` of a rewrite without a format error; None for the
+    original queries and for format errors.
     """
 
     qid: str
@@ -41,6 +43,7 @@ class QueryRecord:
     ndcg_normal: float
     ndcg_count_once: float
     search_error: str | None = None
+    think_chars: int | None = None
 
 
 _HEADER_KEY: Final = "header"

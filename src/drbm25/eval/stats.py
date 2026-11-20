@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -45,17 +46,22 @@ def query_stats(records: Sequence[QueryRecord]) -> dict[str, float]:
 
     Term statistics cover the records without a format error (those have no terms);
     ``format_error_rate`` covers all records. ``repeat_ratio`` is repeated term occurrences
-    over all term occurrences; ``any_repeat_rate`` is the share of queries with a repeated term.
+    over all term occurrences, pooled over the source's queries (not the per-query mean that
+    training logs as ``rewrite/repeat_ratio``); ``any_repeat_rate`` is the share of queries with a
+    repeated term. ``mean_think_chars`` is the mean ``think_chars`` (characters) over the records
+    that have one, NaN when none has (original queries).
     """
     if not records:
         raise ValueError("no records")
     valid = [r for r in records if r.format_error is None]
     total_terms = sum(len(r.terms) for r in valid)
     total_unique = sum(len(set(r.terms)) for r in valid)
+    think = [r.think_chars for r in records if r.think_chars is not None]
     return {
         "mean_n_terms": total_terms / len(valid) if valid else 0.0,
         "mean_n_unique_terms": total_unique / len(valid) if valid else 0.0,
         "repeat_ratio": (total_terms - total_unique) / total_terms if total_terms else 0.0,
         "any_repeat_rate": sum(len(set(r.terms)) < len(r.terms) for r in valid) / len(valid) if valid else 0.0,
         "format_error_rate": (len(records) - len(valid)) / len(records),
+        "mean_think_chars": sum(think) / len(think) if think else math.nan,
     }

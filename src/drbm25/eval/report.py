@@ -4,16 +4,19 @@
         [--n-resamples N] [--bootstrap-seed S] [--wandb --config PATH]
 
 Each input file holds one source (see ``drbm25.eval.records``). All sources must cover the
-same qids. Output: nDCG@10 per source under both scorers, with each trained run's best step and
-its validation score (from the file headers), paired bootstrap CIs, query statistics per
-source, and a reproducibility block (bootstrap resamples and seed; config sha256 and seeds per
-source).
+same qids. Output: nDCG@10 per source under both scorers, with each trained run's best step,
+its validation score and its training steps (from the file headers; a note when the runs trained
+for different numbers of steps), paired bootstrap CIs, query statistics per source, and a
+reproducibility block (bootstrap resamples and seed; config sha256 and seeds per source). With
+``--wandb`` the tables go to a W&B run and the input jsonl files plus the report are logged as
+one ``evaluation`` artifact.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,8 +45,21 @@ logger = logging.getLogger(__name__)
 
 _NORMAL = "nDCG@10 normal"
 _COUNT_ONCE = "nDCG@10 count_once"
-_STAT_NAMES = ("mean_n_terms", "mean_n_unique_terms", "repeat_ratio", "any_repeat_rate", "format_error_rate")
-_STAT_FORMATS = ("{:.2f}", "{:.2f}", "{:.3f}", "{:.3f}", "{:.3f}")
+_STAT_NAMES = (
+    "mean_n_terms",
+    "mean_n_unique_terms",
+    "repeat_ratio",
+    "any_repeat_rate",
+    "format_error_rate",
+    "mean_think_chars",
+)
+_STAT_FORMATS = ("{:.2f}", "{:.2f}", "{:.3f}", "{:.3f}", "{:.3f}", "{:.1f}")
+_STATS_NOTE = (
+    "repeat_ratio here is pooled over terms: repeated term occurrences over all term occurrences of a "
+    "source's valid rewrites. Training logs rewrite/repeat_ratio as the per-query mean of 1 - unique/total, "
+    "which weights short and long queries equally, so the two need not match. mean_think_chars is the "
+    "mean length in characters of the stripped reasoning before </think>, over rewrites without a format error."
+)
 
 
 _NO_HEADERS: Mapping[str, Mapping[str, Any]] = MappingProxyType({})
@@ -142,6 +158,19 @@ def _best_cells(header: Mapping[str, Any] | None) -> tuple[str, str]:
     return str(best["step"]), f"{score:.4f} ({metric})"
 
 
+def _trained_steps(header: Mapping[str, Any] | None) -> int | None:
+    return None if header is None else header.get("trained_steps")
+
+
+def _steps_cell(header: Mapping[str, Any] | None) -> str:
+    steps = _trained_steps(header)
+    return "-" if steps is None else str(steps)
+
+
+def _stat_cell(value: float, fmt: str) -> str:
+    return "-" if math.isnan(value) else fmt.format(value)
+
+
 def _git_text(git: Mapping[str, Any] | None) -> str:
     if git is None or git.get("sha") is None:
         return "unknown"
@@ -156,14 +185,24 @@ def render_markdown(report: Report) -> str:
     lines = [
         f"Queries: {report.n_queries}",
         "",
-        f"| source | {_NORMAL} | {_COUNT_ONCE} | best step | val score (selection metric) |",
-        "|---|---|---|---|---|",
+        f"| source | {_NORMAL} | {_COUNT_ONCE} | best step | val score (selection metric) | training steps |",
+        "|---|---|---|---|---|---|",
         *(
-            f"| {name} | {n:.4f} | {c:.4f} | {' | '.join(_best_cells(report.headers.get(name)))} |"
+            f"| {name} | {n:.4f} | {c:.4f} | {' | '.join(_best_cells(report.headers.get(name)))} "
+            f"| {_steps_cell(report.headers.get(name))} |"
             for name, n, c in report.ndcg
         ),
         "",
     ]
+    steps = {name: _trained_steps(h) for name, h in report.headers.items() if _trained_steps(h) is not None}
+    if len(set(steps.values())) > 1:
+        lines += [
+            "Training steps differ: "
+            + ", ".join(f"{name} {n}" for name, n in steps.items())
+            + ". A budget stop can leave one run a chunk behind; each row is still that run's best/ policy "
+            "(best step), so compare the rows knowing the runs did not train equally long.",
+            "",
+        ]
     if report.paired_ci:
         lines += [
             "Paired bootstrap 95% CI of the mean per-query difference, as written (b - a).",
@@ -180,9 +219,11 @@ def render_markdown(report: Report) -> str:
         f"| source | {' | '.join(_STAT_NAMES)} |",
         "|---|" + "---|" * len(_STAT_NAMES),
         *(
-            f"| {name} | {' | '.join(fmt.format(values[key]) for key, fmt in zip(_STAT_NAMES, _STAT_FORMATS, strict=True))} |"
+            f"| {name} | {' | '.join(_stat_cell(values[key], fmt) for key, fmt in zip(_STAT_NAMES, _STAT_FORMATS, strict=True))} |"
             for name, values in report.stats
         ),
+        "",
+        _STATS_NOTE,
         "",
         "Reproducibility",
         "",
@@ -230,8 +271,21 @@ def _load_inputs(paths: Sequence[Path]) -> tuple[dict[str, list[QueryRecord]], d
     return sources, headers
 
 
+def _results_artifact(inputs: Sequence[Path], out: Path) -> wandb.Artifact:
+    """The per-query jsonl files and the report, as one versioned artifact."""
+    artifact = wandb.Artifact(name="eval-results", type="evaluation")
+    for path in [*inputs, out]:
+        artifact.add_file(str(path), name=path.name)
+    return artifact
+
+
 def _log_to_wandb(
-    cfg_path: Path, overrides: Mapping[str, str], report: Report, inputs: Sequence[Path], n_resamples: int
+    cfg_path: Path,
+    overrides: Mapping[str, str],
+    report: Report,
+    inputs: Sequence[Path],
+    out: Path,
+    n_resamples: int,
 ) -> None:
     cfg = load_config(cfg_path, dict(overrides))
     extra: dict[str, object] = {
@@ -256,10 +310,13 @@ def _log_to_wandb(
                 ),
                 "report/query_stats": wandb.Table(
                     columns=["source", *_STAT_NAMES],
-                    data=[[n, *(v[key] for key in _STAT_NAMES)] for n, v in report.stats],
+                    # NaN (no think length for original queries) goes to W&B as a missing value.
+                    data=[[n, *(None if math.isnan(v[key]) else v[key] for key in _STAT_NAMES)] for n, v in report.stats],
                 ),
             }
         )
+        run.log_artifact(_results_artifact(inputs, out))
+        logger.info("logged eval-results artifact: %d jsonl files and %s", len(inputs), out)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -287,7 +344,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ns.out.write_text(render_markdown(report), encoding="utf-8")
     logger.info("wrote %s", ns.out)
     if ns.wandb:
-        _log_to_wandb(ns.config, overrides, report, ns.inputs, ns.n_resamples)
+        _log_to_wandb(ns.config, overrides, report, ns.inputs, ns.out, ns.n_resamples)
     return 0
 
 

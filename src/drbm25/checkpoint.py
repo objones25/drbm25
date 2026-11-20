@@ -356,6 +356,11 @@ def _read_meta(path: Path) -> tuple[dict[str, Any], TrainState]:
     return meta, state
 
 
+def read_train_state(path: Path) -> TrainState:
+    """The ``TrainState`` of a complete checkpoint dir (single-file or sharded), without loading tensors."""
+    return _read_meta(path)[1]
+
+
 def _barrier(dist: DistInfo) -> None:
     if dist.world_size > 1:
         tdist.barrier()

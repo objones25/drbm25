@@ -19,7 +19,7 @@ uv run pyright
 pipeline on `configs/smoke_cpu.yaml` (tiny local model, the 1,002-document toy index): it trains 4 steps
 under each reward mode in two chunks (`--until-step 2`, then `4`, as the RunPod launcher does), scores the
 original queries, the untrained policy and each run's `best/` with `run_eval`, builds the report, and
-checks the four table rows, nDCG in [0, 1], best step and validation score columns, `run_manifest.json`
+checks the four table rows, nDCG in [0, 1], best step, validation score and training steps columns, `run_manifest.json`
 seeds, and that both runs saw the same data order. It needs Java 21 on `PATH` (on the dev Mac:
 `JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home PATH=/opt/homebrew/opt/openjdk@21/bin:$PATH`).
 It checks that the stages connect, not that training helps.
@@ -56,6 +56,30 @@ a checkpoint) is killed by NCCL's watchdog.
 
 Splits: validation = `data.val_size` (500) train queries picked by `data.split_seed` (1234); training uses
 the other 21,916; the test set is all 2,305 dev queries (`run_eval` never sees validation queries).
+
+## Reading the report
+
+`python -m drbm25.eval.report` writes `report.md` from the per-source eval jsonl files:
+
+- nDCG@10 table: one row per source under both scorers. Trained rows also show the `best/` policy's step
+  and validation score (selection metric), and **training steps**: how far the run had trained when it
+  was evaluated (its latest complete checkpoint, recorded as `trained_steps` in the eval jsonl header).
+  The two runs alternate in chunks, so after a budget stop `count_once` can be one chunk behind `normal`;
+  the report then prints "Training steps differ: ..." under the table. Each row is still that run's best
+  validated policy, but the runs did not train equally long: read a gap between them with that in mind
+  (and compare the best steps, which may be well before either run's last step).
+- Paired bootstrap 95% CIs of the per-query differences.
+- Query statistics per source: `mean_n_terms`, `mean_n_unique_terms`, `repeat_ratio`, `any_repeat_rate`,
+  `format_error_rate`, `mean_think_chars`. Term statistics cover rewrites without a format error.
+  `repeat_ratio` is pooled over terms: repeated term occurrences over all term occurrences of the source.
+  The training metric `rewrite/repeat_ratio` (W&B, `metrics.jsonl`) is instead the per-query mean of
+  1 - unique/total, which weights short and long queries equally, so the two need not agree.
+  `mean_think_chars` is the mean length in characters of the stripped reasoning before `</think>`, over
+  rewrites without a format error (`-` for the original queries, which have none).
+- Reproducibility: bootstrap resamples and seed; each trained run's config sha256, seeds and training git sha.
+
+With `--wandb` (and `--config`) the tables are also logged to a W&B run (`job_type` report), and the input
+jsonl files plus `report.md` are logged as one artifact, `eval-results` (type `evaluation`).
 
 ## Running on SDSC Expanse (2x V100 32GB)
 
@@ -257,7 +281,8 @@ Template and stock: the official "Runpod Pytorch 2.8.0" image `runpod/pytorch:1.
    and the previous chunk's wall-clock, which the launcher measures and passes as `--prev-chunk-s` (it includes
    torchrun start, model loads, vLLM init, validation and the checkpoint save). Both runs advance in chunks of
    `run.chunk_steps` (50), so they stop within one chunk of each other: after a budget stop `count_once` can be
-   one chunk behind `normal`. The evaluation scores each run's `best/` policy so far.
+   one chunk behind `normal`. The evaluation scores each run's `best/` policy so far, and the report's
+   training steps column shows how far each run got (see "Reading the report").
    The report's W&B upload is best effort: if it fails after `report.md` is written, the launcher logs a
    `WARNING` and still ends successfully (the results are on the volume; sync them by hand).
 6. Hangs: each training chunk runs under GNU `timeout` (time to the deadline plus 30 min), evaluation commands under

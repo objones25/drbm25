@@ -1,5 +1,7 @@
 """paired_bootstrap_ci and query_stats."""
 
+import math
+
 import numpy as np
 import pytest
 
@@ -7,7 +9,9 @@ from drbm25.eval.records import QueryRecord
 from drbm25.eval.stats import PairedCI, paired_bootstrap_ci, query_stats
 
 
-def _record(terms: tuple[str, ...], *, format_error: str | None = None, qid: str = "q") -> QueryRecord:
+def _record(
+    terms: tuple[str, ...], *, format_error: str | None = None, qid: str = "q", think_chars: int | None = None
+) -> QueryRecord:
     return QueryRecord(
         qid=qid,
         source="s",
@@ -17,6 +21,7 @@ def _record(terms: tuple[str, ...], *, format_error: str | None = None, qid: str
         terms=terms,
         ndcg_normal=0.0,
         ndcg_count_once=0.0,
+        think_chars=think_chars,
     )
 
 
@@ -124,6 +129,7 @@ def test_query_stats_format_errors_counted_but_not_in_term_means() -> None:
 
 def test_query_stats_all_format_errors() -> None:
     stats = query_stats([_record((), format_error="bad_json")])
+    assert math.isnan(stats.pop("mean_think_chars"))  # no rewrite has a think length
     assert stats == {
         "mean_n_terms": 0.0,
         "mean_n_unique_terms": 0.0,
@@ -131,6 +137,19 @@ def test_query_stats_all_format_errors() -> None:
         "any_repeat_rate": 0.0,
         "format_error_rate": 1.0,
     }
+
+
+def test_query_stats_mean_think_chars_covers_records_with_a_think_length() -> None:
+    records = [
+        _record(("a",), think_chars=10),
+        _record(("b",), think_chars=30),
+        _record((), format_error="bad_json"),  # no think length: left out, not counted as 0
+    ]
+    assert query_stats(records)["mean_think_chars"] == pytest.approx(20.0)
+
+
+def test_query_stats_mean_think_chars_is_nan_without_any_think_length() -> None:
+    assert math.isnan(query_stats([_record(("a", "b"))])["mean_think_chars"])
 
 
 def test_query_stats_rejects_empty() -> None:

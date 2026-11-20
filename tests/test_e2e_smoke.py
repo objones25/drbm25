@@ -94,12 +94,13 @@ def _check_rows(rows: list[list[str]], out: Path) -> None:
         assert 0.0 <= float(row[1]) <= 1.0
         assert 0.0 <= float(row[2]) <= 1.0
     for row in rows[:2]:
-        assert row[3:] == ["-", "-"]
+        assert row[3:] == ["-", "-", "-"]
     for row, mode in zip(rows[2:], MODES, strict=True):
         meta = read_best_meta(out / mode / "best")
         assert meta.reward_mode == mode
         assert row[3] == str(meta.step)
         assert row[4] == f"{meta.score:.4f} (val/ndcg_{mode})"
+        assert row[5] == "4"  # both runs trained 4 steps (two chunks of 2)
 
 
 def _check_records(evals: Path, names: list[str]) -> None:

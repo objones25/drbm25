@@ -1,8 +1,7 @@
 """Score queries on the full dev set under both BM25 modes and write one JSON-lines file.
 
     python -m drbm25.eval.run_eval --config PATH --source {original,untrained,checkpoint}
-        [--checkpoint STEP_DIR --label {trained-normal,trained-count_once}] --out FILE.jsonl
-        [--limit N] [--set key=value ...]
+        [--checkpoint DIR] --out FILE.jsonl [--limit N] [--set key=value ...]
 
 ``original`` scores the dataset queries as they are (CPU, no model). ``untrained`` rewrites them
 with the base model (LoRA adapters at initialisation equal the base). ``checkpoint`` loads a
@@ -14,8 +13,9 @@ The record source is ``trained-<reward_mode>``, read from the checkpoint. Rewrit
 with ``rollout.max_new_tokens`` from the config.
 
 The output starts with a header line (``drbm25.eval.records``): source, checkpoint path, the
-eval config's sha256 and seed, the eval code's git sha and dirty flag, and for ``best/`` its
-step, validation scores, training config sha256, seeds and training git sha.
+eval config's sha256 and seed, the eval code's git sha and dirty flag, ``trained_steps`` (for
+``best/`` the run's latest complete checkpoint step, for a step dir its own step, else None), and
+for ``best/`` its step, validation scores, training config sha256, seeds and training git sha.
 """
 
 from __future__ import annotations
@@ -35,10 +35,12 @@ from drbm25.checkpoint import (
     BestMeta,
     checkpoint_layout,
     is_best_dir,
+    latest_checkpoint,
     load_best,
     load_checkpoint,
     load_sharded_actor,
     read_best_meta,
+    read_train_state,
 )
 from drbm25.config import Config, ScoringMode, load_config
 from drbm25.data import DEV_FILE, Example, load_examples
@@ -53,7 +55,7 @@ from drbm25.obs import configure
 from drbm25.ppo.models import LoraPolicyModels
 from drbm25.ppo.trainer import Searcher, score_responses, search_all
 from drbm25.prompt import build_prompt
-from drbm25.reward import ParsedRewrite, ndcg_at_k
+from drbm25.reward import ParsedRewrite, ndcg_at_k, think_length_chars
 from drbm25.rollout.base import RolloutEngine
 from drbm25.rollout.hf_generate import HFGenerateEngine
 from drbm25.tiny import build_tiny_qwen2
@@ -121,9 +123,11 @@ def score_rewrites(
     records = []
     for i, (example, parsed) in enumerate(zip(examples, scored.parsed, strict=True)):
         row: dict[ScoringMode, SearchResult | None] = {mode: scored.results[mode][i] for mode in _MODES}
+        think_chars: int | None = None
         if isinstance(parsed, ParsedRewrite):
             rewrite_text, format_error = parsed.query, None
             terms, error = tuple(searcher.analyze(parsed.query)), _search_error(row)
+            think_chars = think_length_chars(batch.response_text[i])
         else:
             rewrite_text, format_error, terms, error = batch.response_text[i], parsed.reason.value, (), None
         records.append(
@@ -137,6 +141,7 @@ def score_rewrites(
                 ndcg_normal=scored.ndcg["normal"][i],
                 ndcg_count_once=scored.ndcg["count_once"][i],
                 search_error=error,
+                think_chars=think_chars,
             )
         )
     return records
@@ -273,6 +278,18 @@ def _best_record(meta: BestMeta) -> dict[str, object]:
     }
 
 
+def _trained_steps(checkpoint: Path | None) -> int | None:
+    """How far the run had trained: for ``best/`` its run's latest complete checkpoint (None if
+    there is none), for a ``step_NNNNNN`` dir its own step. After a budget stop the two runs can
+    differ by one chunk, which the report shows."""
+    if checkpoint is None:
+        return None
+    if is_best_dir(checkpoint):
+        latest = latest_checkpoint(checkpoint.parent)
+        return None if latest is None else read_train_state(latest).step
+    return read_train_state(checkpoint).step
+
+
 def _header(cfg: Config, source: str, checkpoint: Path | None) -> dict[str, object]:
     """Where the scores come from: the eval config, the checkpoint, and a best/ policy's provenance."""
     best = None if checkpoint is None or not is_best_dir(checkpoint) else _best_record(read_best_meta(checkpoint))
@@ -284,6 +301,7 @@ def _header(cfg: Config, source: str, checkpoint: Path | None) -> dict[str, obje
         "eval_config_sha256": config_sha256(cfg),
         "eval_seed": cfg.run.seed,
         "git": {"sha": env.git_sha, "dirty": env.git_dirty},
+        "trained_steps": _trained_steps(checkpoint),
         "best": best,
     }
 

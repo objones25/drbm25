@@ -1,6 +1,7 @@
 """The report: input checks, tables (with each run's best step), CIs, provenance, W&B logging."""
 
 import json
+import math
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,7 +19,12 @@ SMOKE = REPO / "configs" / "smoke_cpu.yaml"
 
 
 def _records(
-    source: str, normal: list[float], once: list[float], *, qids: list[str] | None = None
+    source: str,
+    normal: list[float],
+    once: list[float],
+    *,
+    qids: list[str] | None = None,
+    think_chars: int | None = None,
 ) -> list[QueryRecord]:
     ids = qids or [f"q{i}" for i in range(len(normal))]
     return [
@@ -31,6 +37,7 @@ def _records(
             terms=("a", "a"),
             ndcg_normal=n,
             ndcg_count_once=c,
+            think_chars=think_chars,
         )
         for qid, n, c in zip(ids, normal, once, strict=True)
     ]
@@ -121,6 +128,21 @@ def test_report_includes_query_stats_per_source() -> None:
     assert "| original | 2.00 | 1.00 | 0.500 | 1.000 | 0.000 |" in text
 
 
+def test_report_query_stats_show_mean_think_length_in_characters() -> None:
+    sources = _all_sources()
+    sources["untrained"] = _records("untrained", [0.0, 0.2, 0.4], [0.0, 0.2, 0.4], think_chars=120)
+    text = build_report(sources)
+    assert "| repeat_ratio | any_repeat_rate | format_error_rate | mean_think_chars |" in text
+    assert "| untrained | 2.00 | 1.00 | 0.500 | 1.000 | 0.000 | 120.0 |" in text
+    assert "| original | 2.00 | 1.00 | 0.500 | 1.000 | 0.000 | - |" in text  # no rewrite, no think
+
+
+def test_report_states_how_repeat_ratio_differs_from_the_training_metric() -> None:
+    text = build_report(_all_sources())
+    assert "repeat_ratio here is pooled over terms" in text
+    assert "rewrite/repeat_ratio" in text  # the per-query mean logged during training
+
+
 def test_report_aligns_queries_by_qid_not_by_position() -> None:
     a = _records("original", [0.1, 0.9], [0.1, 0.9], qids=["x", "y"])
     b = _records("untrained", [0.9, 0.1], [0.9, 0.1], qids=["y", "x"])
@@ -173,6 +195,29 @@ def test_report_table_shows_each_runs_best_step_and_validation_score() -> None:
     assert "| original | 0.4000 | 0.4000 | - | - |" in text
     assert "| trained-normal | 0.7000 | 0.5000 | 1450 | 0.4211 (val/ndcg_normal) |" in text
     assert "| trained-count_once | 0.6000 | 0.7000 | 900 | 0.3907 (val/ndcg_count_once) |" in text
+
+
+def _headers_with_trained_steps(normal: int, count_once: int) -> dict[str, dict[str, Any]]:
+    headers = _headers()
+    headers["trained-normal"]["trained_steps"] = normal
+    headers["trained-count_once"]["trained_steps"] = count_once
+    return headers
+
+
+def test_report_table_shows_each_runs_trained_steps() -> None:
+    headers = _headers_with_trained_steps(1500, 1500)
+    text = render_markdown(build_report_data(_all_sources(), headers=headers, n_resamples=50))
+    assert "| best step | val score (selection metric) | training steps |" in text
+    assert "| original | 0.4000 | 0.4000 | - | - | - |" in text
+    assert "| trained-normal | 0.7000 | 0.5000 | 1450 | 0.4211 (val/ndcg_normal) | 1500 |" in text
+    assert "| trained-count_once | 0.6000 | 0.7000 | 900 | 0.3907 (val/ndcg_count_once) | 1500 |" in text
+    assert "Training steps differ" not in text
+
+
+def test_report_flags_unequal_trained_steps() -> None:
+    headers = _headers_with_trained_steps(1500, 1450)
+    text = render_markdown(build_report_data(_all_sources(), headers=headers, n_resamples=50))
+    assert "Training steps differ: trained-normal 1500, trained-count_once 1450" in text
 
 
 def test_report_records_the_bootstrap_seed_and_each_sources_seeds() -> None:
@@ -231,9 +276,15 @@ def test_records_header_round_trips_and_is_not_a_record(tmp_path: Path) -> None:
 class _FakeRun:
     def __init__(self) -> None:
         self.logged: list[dict[str, Any]] = []
+        self.artifacts: list[Any] = []
 
     def log(self, data: Mapping[str, Any]) -> None:
         self.logged.append(dict(data))
+
+    def log_artifact(self, artifact: Any, **kwargs: Any) -> Any:
+        del kwargs
+        self.artifacts.append(artifact)
+        return artifact
 
 
 def test_wandb_flag_logs_tables_in_a_report_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -259,6 +310,51 @@ def test_wandb_flag_logs_tables_in_a_report_run(tmp_path: Path, monkeypatch: pyt
     assert set(row) == {"report/ndcg", "report/paired_ci", "report/query_stats"}
     assert row["report/ndcg"].columns == ["source", "ndcg10_normal", "ndcg10_count_once"]
     assert len(row["report/ndcg"].data) == 4
+
+
+def test_wandb_flag_logs_the_eval_jsonl_files_and_report_as_an_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = _FakeRun()
+
+    @contextmanager
+    def fake_open_run(cfg: object, **kwargs: Any) -> Generator[_FakeRun]:
+        del cfg, kwargs
+        yield run
+
+    monkeypatch.setattr(report_module, "open_run", fake_open_run)
+    paths = []
+    for name, recs in _all_sources().items():
+        path = tmp_path / f"{name}.jsonl"
+        write_records(path, recs)
+        paths.append(str(path))
+    argv = ["--inputs", *paths, "--out", str(tmp_path / "report.md"), "--n-resamples", "50"]
+    assert main([*argv, "--wandb", "--config", str(SMOKE)]) == 0
+    (artifact,) = run.artifacts
+    assert artifact.type == "evaluation"
+    assert sorted(artifact.manifest.entries) == sorted([*(f"{n}.jsonl" for n in _all_sources()), "report.md"])
+
+
+def test_wandb_query_stats_table_has_no_nan_for_a_missing_think_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = _FakeRun()
+
+    @contextmanager
+    def fake_open_run(cfg: object, **kwargs: Any) -> Generator[_FakeRun]:
+        del cfg, kwargs
+        yield run
+
+    monkeypatch.setattr(report_module, "open_run", fake_open_run)
+    path = tmp_path / "original.jsonl"
+    write_records(path, _records("original", [0.1], [0.1]))
+    argv = ["--inputs", str(path), "--out", str(tmp_path / "r.md"), "--n-resamples", "10"]
+    assert main([*argv, "--wandb", "--config", str(SMOKE)]) == 0
+    (row,) = run.logged
+    table = row["report/query_stats"]
+    think = table.data[0][table.columns.index("mean_think_chars")]
+    assert think is None
+    assert not any(isinstance(v, float) and math.isnan(v) for v in table.data[0][1:])
 
 
 def test_wandb_report_applies_set_overrides_to_the_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -299,7 +395,9 @@ def test_wandb_flag_needs_config(tmp_path: Path) -> None:
 
 
 def test_jsonl_round_trip_keeps_every_field(tmp_path: Path) -> None:
-    rec = QueryRecord("q", "s", "text", "rw", "bad_json", ("a",), 0.25, 0.5, search_error="too_many_clauses:normal")
+    rec = QueryRecord(
+        "q", "s", "text", "rw", "bad_json", ("a",), 0.25, 0.5, search_error="too_many_clauses:normal", think_chars=42
+    )
     path = tmp_path / "r.jsonl"
     write_records(path, [rec])
     assert json.loads(path.read_text())["terms"] == ["a"]

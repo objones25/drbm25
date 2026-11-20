@@ -306,16 +306,25 @@ A100 / full layout (`configs/runpod_a100_full.yaml`):
 ### 6.7 Evaluation outputs
 - Exp 1: rows = {original query, untrained rewrite}; columns = {normal, count-once} nDCG@10.
 - Exp 2: rows = {trained-normal, trained-count-once}, each run's `best/` policy
-  (§6.6); same columns, plus each run's best step and its validation score.
+  (§6.6); same columns, plus each run's best step, its validation score and its
+  training steps (the run's latest complete checkpoint when evaluated, recorded in
+  the eval jsonl header as `trained_steps`). A budget stop can leave count-once one
+  chunk behind normal; the report then notes that the runs trained for different
+  numbers of steps.
 - Test set = all 2,305 dev queries for every row (never used for selection).
-- Per-query jsonl with query text, rewrite, analyzed terms, both scores; its first
-  line is a header with the source, checkpoint, eval config sha256 and seed, and for
-  `best/` the step, validation scores, training config sha256 and seeds.
+- Per-query jsonl with query text, rewrite, analyzed terms, both scores and the
+  `<think>` length in characters; its first line is a header with the source,
+  checkpoint, eval config sha256 and seed, training steps, and for `best/` the step,
+  validation scores, training config sha256 and seeds.
 - Paired bootstrap 95% CI (10,000 resamples, seed `--bootstrap-seed`, default 0,
   recorded in the report) for each difference the questions ask about.
 - Query statistics per model: analyzed length, unique terms, **repeat ratio**
-  (1 − unique/total analyzed terms), share of rewrites with any repeat, format-error
-  rate, mean `<think>` length.
+  (1 − unique/total analyzed terms, pooled over the source's terms: repeated
+  occurrences over all occurrences; the training metric `rewrite/repeat_ratio` is
+  the per-query mean instead, so the two need not agree, and the report says so),
+  share of rewrites with any repeat, format-error rate, mean `<think>` length in
+  characters (stripped reasoning before `</think>`, rewrites without a format
+  error only). Term statistics cover rewrites without a format error.
 
 ### 6.8 Observability
 - stdlib logging, JSON lines to stdout and file, tagged with run id, rank, step.
@@ -355,7 +364,9 @@ A100 / full layout (`configs/runpod_a100_full.yaml`):
   the share of responses that hit `max_new_tokens` without emitting EOS.
 - Every 50 steps: validation nDCG@10 under both modes, and a W&B table of 8 sample
   rewrites (query, rewrite, analyzed terms, reward under both modes).
-- Final evaluation summaries and per-query jsonl are logged as W&B artifacts.
+- Final evaluation summaries and per-query jsonl are logged as W&B artifacts:
+  `report --wandb` logs the tables and one `eval-results` artifact (type
+  `evaluation`) holding every input jsonl and `report.md`.
   LoRA adapters (small) are logged as artifacts; full-FT checkpoints stay on disk.
 - Alerts: `run.alert` on NaN abort, budget stop, and run completion, so the lead
   is notified without watching.

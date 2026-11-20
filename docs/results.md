@@ -22,7 +22,9 @@ only 5.2% of original queries repeat an analyzed term; 971 queries score 0 in no
 Lucene's clause limit.
 
 Query statistics (analyzed terms, original queries): mean terms 5.22, mean unique terms 5.15,
-repeat_ratio 0.012, any_repeat_rate 0.052, format_error_rate 0.000.
+repeat_ratio 0.012, any_repeat_rate 0.052, format_error_rate 0.000. (`repeat_ratio` here is pooled over
+terms, not the per-query mean that training logs as `rewrite/repeat_ratio`; see README "Reading the report".
+Original queries have no `<think>` length.)
 
 - Reproducibility: no seed affects this row (no model, no sampling, no train/validation split: the
   test set is all of dev) and no bootstrap was run (one source). The run predates the reproducibility
