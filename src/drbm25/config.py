@@ -92,7 +92,8 @@ class DataCfg:
     hf_dataset: str
     hf_revision: str
     data_dir: Path
-    val_size: int
+    val_size: int  # validation queries carved out of train (data.split_train); test = all of dev
+    split_seed: int  # seeds the train/val split only, so it stays fixed if run.seed changes
 
 
 @dataclass(frozen=True)

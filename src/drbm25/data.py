@@ -1,4 +1,6 @@
-"""MS MARCO-Science data: download, parsing, dev split, and the seeded data order."""
+"""MS MARCO-Science data: download, parsing, the train/val split, and the seeded data order.
+
+The test set is all of dev; the validation set is a seeded sample of train (see `split_train`)."""
 
 from __future__ import annotations
 
@@ -97,11 +99,19 @@ def load_examples(path: Path) -> list[Example]:
     return examples
 
 
-def split_dev(dev: Sequence[Example], *, val_size: int) -> tuple[list[Example], list[Example]]:
-    """Return (val, test): val is the first `val_size` dev rows, test is all of dev."""
-    if not 0 < val_size <= len(dev):
-        raise ValueError(f"val_size must be in 1..{len(dev)}, got {val_size}")
-    return list(dev[:val_size]), list(dev)
+def split_train(train: Sequence[Example], *, val_size: int, seed: int) -> tuple[list[Example], list[Example]]:
+    """Return (train_rest, val): `val_size` rows drawn by `default_rng(seed).permutation`, the rest kept.
+
+    Both lists keep the order of `train`, so `batch_indices` over `train_rest` depends only on the
+    split and its own seed. The split depends only on `seed` and the file, never on the reward
+    mode or `run.seed`, so both runs validate on the same queries.
+    """
+    if not 0 < val_size < len(train):
+        raise ValueError(f"val_size must be in 1..{len(train) - 1} (train has {len(train)} rows), got {val_size}")
+    chosen = set(np.random.default_rng(seed).permutation(len(train))[:val_size].tolist())
+    rest = [e for i, e in enumerate(train) if i not in chosen]
+    val = [e for i, e in enumerate(train) if i in chosen]
+    return rest, val
 
 
 def batch_indices(cursor: int, batch_size: int, n_examples: int, seed: int) -> list[int]:

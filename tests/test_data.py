@@ -14,7 +14,7 @@ from drbm25.data import (
     batch_indices,
     download_msmarco_science,
     load_examples,
-    split_dev,
+    split_train,
 )
 
 SHA = "44eb79992e8c5ed4784dbe6559f8b097d7d03855"
@@ -54,16 +54,48 @@ def test_load_examples_rejects_row_without_docs(tmp_path: Path):
         load_examples(path)
 
 
-def test_split_dev_takes_first_101_as_val_and_all_as_test():
-    dev = _examples(120)
-    val, test = split_dev(dev, val_size=101)
-    assert val == dev[:101]
-    assert test == dev
+def _train_examples(n: int) -> list[Example]:
+    return [Example(qid=f"train-{i}", query=f"train q{i}", relevant_ids=frozenset({str(i)})) for i in range(n)]
 
 
-def test_split_dev_rejects_val_size_larger_than_dev():
+def test_split_train_val_has_val_size_rows_and_partitions_train_exactly():
+    train = _train_examples(50)
+    rest, val = split_train(train, val_size=12, seed=1234)
+    assert len(val) == 12
+    assert len(rest) == 38
+    assert sorted(rest + val, key=lambda e: int(e.qid.split("-")[1])) == train
+    assert {e.qid for e in rest}.isdisjoint({e.qid for e in val})
+    assert {e.query for e in rest}.isdisjoint({e.query for e in val})
+
+
+def test_split_train_keeps_train_order_in_the_remaining_rows():
+    # batch_indices permutes indices of the remaining list, so its order must be the file order.
+    rest, _ = split_train(_train_examples(30), val_size=10, seed=7)
+    positions = [int(e.qid.split("-")[1]) for e in rest]
+    assert positions == sorted(positions)
+
+
+def test_split_train_is_a_seeded_sample_not_the_first_rows():
+    train = _train_examples(100)
+    rest, val = split_train(train, val_size=10, seed=1234)
+    assert split_train(train, val_size=10, seed=1234) == (rest, val)
+    assert split_train(train, val_size=10, seed=4321)[1] != val
+    assert val != train[:10]
+
+
+def test_split_train_val_is_disjoint_from_the_dev_test_set():
+    train, dev = _train_examples(40), _examples(15)
+    rest, val = split_train(train, val_size=8, seed=1234)
+    test = list(dev)  # the test set is all of dev, untouched by the split
+    assert {e.qid for e in val}.isdisjoint({e.qid for e in test})
+    assert {e.query for e in val}.isdisjoint({e.query for e in test})
+    assert {e.qid for e in rest}.isdisjoint({e.qid for e in test})
+
+
+@pytest.mark.parametrize("val_size", [0, -1, 20, 21])
+def test_split_train_rejects_val_size_outside_1_to_n_minus_1(val_size: int):
     with pytest.raises(ValueError, match="val_size"):
-        split_dev(_examples(5), val_size=6)
+        split_train(_train_examples(20), val_size=val_size, seed=1)
 
 
 def test_batch_indices_deterministic_and_identical_across_calls():
@@ -93,7 +125,9 @@ def test_batch_indices_rejects_nonpositive_sizes():
 
 
 def _cfg(tmp_path: Path) -> DataCfg:
-    return DataCfg(hf_dataset="DeepRetrieval/datasets", hf_revision=SHA, data_dir=tmp_path / "d", val_size=101)
+    return DataCfg(
+        hf_dataset="DeepRetrieval/datasets", hf_revision=SHA, data_dir=tmp_path / "d", val_size=500, split_seed=1234
+    )
 
 
 def test_download_uses_pinned_revision(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -222,5 +256,11 @@ def test_real_msmarco_science_sizes(tmp_path: Path):
     cfg = _cfg(tmp_path)
     train = Path(data._download_with_retry(cfg, data.TRAIN_FILE))
     dev = Path(data._download_with_retry(cfg, data.DEV_FILE))
-    assert len(load_examples(train)) == 22416
-    assert len(load_examples(dev)) == 2305
+    train_examples, dev_examples = load_examples(train), load_examples(dev)
+    assert len(train_examples) == 22416
+    assert len(dev_examples) == 2305
+    rest, val = split_train(train_examples, val_size=cfg.val_size, seed=cfg.split_seed)
+    assert (len(rest), len(val)) == (21916, 500)
+    test_queries = {e.query for e in dev_examples}
+    assert {e.query for e in val}.isdisjoint(test_queries)
+    assert {e.query for e in val}.isdisjoint({e.query for e in rest})

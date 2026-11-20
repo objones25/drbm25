@@ -8,7 +8,7 @@ lora: null
 ppo:
   batch_size: 64
   mini_batch_size: 16
-  micro_batch_size: 2
+  micro_batch_size: 8  # A100 80GB ceiling (per-rank mini-batch 8); run_all.sh falls back to 4, then 2
   ppo_epochs: 1
   clip_ratio: 0.2
   value_clip: 0.5
@@ -40,14 +40,15 @@ data:
   hf_dataset: DeepRetrieval/datasets
   hf_revision: 44eb79992e8c5ed4784dbe6559f8b097d7d03855
   data_dir: /workspace/drbm25/data
-  val_size: 101
+  val_size: 500  # validation queries sampled from train (best-checkpoint selection); test = all 2,305 dev
+  split_seed: 1234  # seeds the train/val split only (separate from run.seed)
 run:
   output_dir: /workspace/drbm25/runs
   total_steps: 1751
   chunk_steps: 50
   val_every: 50
   ckpt_every: 50
-  keep_ckpts: 1  # a save needs the old checkpoint beside the new one (peak 2 per run); see README
+  keep_ckpts: 1  # one resume checkpoint (a save needs the old one beside the new: peak 2), plus best/; see README
   deep_log_every: 10
   seed: 1234
   wandb_project: drbm25

@@ -44,7 +44,8 @@ data:
   hf_dataset: DeepRetrieval/datasets
   hf_revision: 44eb79992e8c5ed4784dbe6559f8b097d7d03855
   data_dir: runs/smoke/data
-  val_size: 101
+  val_size: 101  # validation queries sampled from train (best-checkpoint selection); test = all of dev
+  split_seed: 1234  # seeds the train/val split only (separate from run.seed)
 run:
   output_dir: runs/smoke/out
   total_steps: 4

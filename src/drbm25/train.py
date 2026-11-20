@@ -62,7 +62,7 @@ from drbm25.checkpoint import (
     save_sharded_checkpoint,
 )
 from drbm25.config import Config, ConfigError, LoraCfg, ScoringMode, load_config, validate_for_runtime
-from drbm25.data import DEV_FILE, TRAIN_FILE, Example, batch_indices, load_examples, split_dev
+from drbm25.data import TRAIN_FILE, Example, batch_indices, load_examples, split_train
 from drbm25.distributed import DistInfo, assert_params_equal, broadcast_params, init_distributed
 from drbm25.obs import configure
 from drbm25.obs.context import bind_log_context
@@ -435,8 +435,8 @@ def _train(args: _Args, cfg: Config, dist: DistInfo, run_dir: Path) -> int:
         tdist.barrier()
 
     data_dir = cfg.data.data_dir
-    train = load_examples(data_dir / TRAIN_FILE)
-    val, _ = split_dev(load_examples(data_dir / DEV_FILE), val_size=cfg.data.val_size)
+    # Validation (best-checkpoint selection) uses train queries held out of training; dev is the test set only.
+    train, val = split_train(load_examples(data_dir / TRAIN_FILE), val_size=cfg.data.val_size, seed=cfg.data.split_seed)
     layout = init_layout(cfg, dist)  # seeds: shared for construction, then seed + rank
     models, engine = layout.models, layout.engine
     r = cfg.retrieval

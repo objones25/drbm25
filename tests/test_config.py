@@ -287,6 +287,31 @@ def test_smoke_profile_uses_lora_layout():
     assert cfg.lora.dropout == pytest.approx(0.0)
 
 
+@pytest.mark.parametrize("path", [EXPANSE, RUNPOD, SMOKE], ids=lambda p: p.stem)
+def test_profiles_record_split_seed(path: Path):
+    assert load_config(path).data.split_seed == 1234
+
+
+@pytest.mark.parametrize("path", [EXPANSE, RUNPOD], ids=lambda p: p.stem)
+def test_real_profiles_keep_one_checkpoint_and_validate_on_500_train_queries(path: Path):
+    cfg = load_config(path)
+    assert cfg.run.keep_ckpts == 1
+    assert cfg.data.val_size == 500
+
+
+def test_runpod_profile_uses_micro_batch_8():
+    cfg = load_config(RUNPOD)
+    assert cfg.ppo.micro_batch_size == 8
+    assert (cfg.ppo.batch_size, cfg.ppo.mini_batch_size) == (64, 16)
+    assert validate_for_runtime(cfg, device_capability=(8, 0), world_size=2) is None
+
+
+def test_split_seed_is_required(tmp_path: Path):
+    p = _write_variant(tmp_path, lambda r: r["data"].pop("split_seed", None))
+    with pytest.raises(ConfigError, match=r"missing key 'data\.split_seed'"):
+        load_config(p)
+
+
 def test_rejects_non_positive_expected_docs():
     cfg = load_config(SMOKE, {"retrieval.expected_docs": "0"})
     with pytest.raises(ConfigError, match="expected_docs"):

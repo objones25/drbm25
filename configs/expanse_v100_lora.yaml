@@ -44,14 +44,15 @@ data:
   hf_dataset: DeepRetrieval/datasets
   hf_revision: 44eb79992e8c5ed4784dbe6559f8b097d7d03855
   data_dir: /expanse/lustre/projects/ACCOUNT/USER/drbm25/data
-  val_size: 101
+  val_size: 500  # validation queries sampled from train (best-checkpoint selection); test = all 2,305 dev
+  split_seed: 1234  # seeds the train/val split only (separate from run.seed)
 run:
   output_dir: /expanse/lustre/projects/ACCOUNT/USER/drbm25/runs
   total_steps: 1751
   chunk_steps: 50
   val_every: 50
   ckpt_every: 50
-  keep_ckpts: 2
+  keep_ckpts: 1  # the one resume checkpoint; the best policy is kept separately in best/
   deep_log_every: 10
   seed: 1234
   wandb_project: drbm25

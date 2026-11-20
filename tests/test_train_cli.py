@@ -19,7 +19,7 @@ import drbm25.train as train_module
 import wandb
 from drbm25.bm25.index import read_index_info
 from drbm25.config import load_config
-from drbm25.data import DEV_FILE, TRAIN_FILE
+from drbm25.data import DEV_FILE, TRAIN_FILE, Example, load_examples, split_train
 from drbm25.obs.runs import STEP_METRIC
 from drbm25.obs.setup import shutdown
 from drbm25.ppo.trainer import NonFiniteError, PPOTrainer
@@ -508,6 +508,32 @@ def test_cli_full_layout_two_ranks_writes_sharded_checkpoints_and_resumes(workdi
     rows = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()]
     assert [row["step"] for row in rows] == [0, 1, 2]
     assert all(math.isfinite(row["ppo/policy_loss"]) for row in rows)
+
+
+@pytest.mark.java
+def test_cli_validates_on_held_out_train_queries_and_never_trains_on_them(
+    workdir: Path, toy_index: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trained: list[str] = []
+    validated: list[str] = []
+    real_step, real_validate = PPOTrainer.step, PPOTrainer.validate_with_samples
+
+    def record_step(self: PPOTrainer, examples: list[Example], *, step: int) -> dict[str, float]:
+        trained.extend(e.qid for e in examples)
+        return real_step(self, examples, step=step)
+
+    def record_validate(self: PPOTrainer, examples: list[Example]) -> Any:
+        validated.extend(e.qid for e in examples)
+        return real_validate(self, examples)
+
+    monkeypatch.setattr(PPOTrainer, "step", record_step)
+    monkeypatch.setattr(PPOTrainer, "validate_with_samples", record_validate)
+    assert _main(_argv(workdir, toy_index, "heldout", "--until-step", "4")) == EXIT_OK
+    _, val = split_train(load_examples(workdir / "data" / TRAIN_FILE), val_size=4, seed=1234)
+    assert sorted(set(validated)) == sorted(e.qid for e in val)
+    assert all(q.startswith("train-") for q in validated)  # never dev (the test set)
+    assert set(trained).isdisjoint(validated)
+    assert len(set(trained)) == N_TRAIN - 4  # 4 steps x 4 = 16 rows: one full epoch of the rest
 
 
 # --------------------------------------------------------------------------- startup checks
