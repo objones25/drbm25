@@ -616,7 +616,8 @@ _install_jdk_tarball() (
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
     --max-time 900 --output "$tarball" "$JDK_URL"
   verify_sha256 "$tarball" "$JDK_SHA256"
-  tar -xzf "$tarball" -C "$staging"
+  # --no-same-owner: as root on a pod, restoring the archive's uid fails on the network volume.
+  tar --no-same-owner -xzf "$tarball" -C "$staging"
   [[ -x $staging/$JDK_RELEASE/bin/java ]] || {
     _common_log "error: tarball did not contain $JDK_RELEASE/bin/java"
     exit 1
@@ -658,7 +659,8 @@ _install_uv_tarball() (
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
     --max-time 300 --output "$tarball" "$UV_URL"
   verify_sha256 "$tarball" "$UV_SHA256"
-  tar -xzf "$tarball" -C "$staging"
+  # --no-same-owner: as root on a pod, restoring the archive's uid fails on the network volume.
+  tar --no-same-owner -xzf "$tarball" -C "$staging"
   [[ -x $staging/uv-x86_64-unknown-linux-gnu/uv ]] || {
     _common_log "error: tarball did not contain uv-x86_64-unknown-linux-gnu/uv"
     exit 1

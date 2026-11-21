@@ -1122,6 +1122,33 @@ make_uv_tarball() {
   ! grep -q pip "$STUB_LOG"
 }
 
+# tar as root on a RunPod pod: restoring the archive's owner (uid 1001 for uv) fails on the network volume
+# unless --no-same-owner is passed. This shim behaves that way and delegates to the real tar otherwise.
+make_root_tar_shim() {
+  local real d=$BATS_TEST_TMPDIR/roottar
+  real=$(command -v tar)
+  mkdir -p "$d"
+  cat >"$d/tar" <<EOF
+#!/usr/bin/env bash
+if [[ " \$* " == *" -x"* && " \$* " != *" --no-same-owner "* ]]; then
+  echo "tar: uv-x86_64-unknown-linux-gnu/uv: Cannot change ownership to uid 1001, gid 117: Operation not permitted" >&2
+  exit 2
+fi
+exec "$real" "\$@"
+EOF
+  chmod +x "$d/tar"
+  export PATH="$d:$PATH"
+}
+
+@test "install_uv unpacks without restoring the archive's owner (root on a RunPod network volume)" {
+  make_uv_tarball
+  make_root_tar_shim
+  SNIPPET='install_uv; uv --version'
+  run -0 --separate-stderr in_lib
+  [[ -x $DRBM25_ROOT/bin/uv ]]
+  [[ $output == 'uv 0.13.7'* ]]
+}
+
 @test "install_uv refuses a tarball whose SHA-256 differs from the pin and installs nothing" {
   make_uv_tarball
   SNIPPET='install_uv'
