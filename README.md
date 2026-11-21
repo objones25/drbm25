@@ -323,8 +323,9 @@ the dollars still left to spend. Then it:
 
 1. refuses if a pod named `drbm25` already exists (two pods must never share the volume);
 2. reads live stock and list prices for 2x A100 80GB, SXM and PCIe, on the secure cloud with CUDA 12.8 or
-   newer, and picks the cheapest offer in stock (`--gpu sxm|pcie|any`, default `any`). Community cloud is not
-   offered: RunPod network volumes only work on Secure Cloud pods;
+   newer, and picks the cheapest offer in stock (`--gpu sxm|pcie|any`, default `any`). `--gpu pro6000` instead
+   asks for 2x RTX PRO 6000 96GB (Blackwell), for when no A100 pair is in stock where the volume lives; `any`
+   never picks it. Community cloud is not offered: RunPod network volumes only work on Secure Cloud pods;
 3. reuses the network volume named `drbm25` if there is one. A volume is tied to its data center, so the pod
    must go there: if that data center has no stock, it says so and stops (it never creates a second volume).
    With no volume it offers to create one (`--volume-gb`, default 400; standard tier) in the chosen data center,

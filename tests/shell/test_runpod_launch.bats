@@ -125,6 +125,9 @@ default_responses() {
     {"id":"NVIDIA A100 80GB PCIe","name":"A100 PCIe","memory":80,"secure":true,"community":true,
      "price":{"secure":2.09,"community":1.19},"availability":"MEDIUM",
      "dataCenters":[{"id":"US-KS-2","name":"US Kansas 2","availability":"MEDIUM"}]},
+    {"id":"NVIDIA RTX PRO 6000 Blackwell Server Edition","name":"RTX PRO 6000","memory":96,"secure":true,"community":true,
+     "price":{"secure":2.69,"community":1.69},"availability":"LOW",
+     "dataCenters":[{"id":"US-MD-1","name":"US Maryland 1","availability":"LOW"}]},
     {"id":"NVIDIA GeForce RTX 4090","name":"RTX 4090","memory":24,"secure":true,"community":true,
      "price":{"secure":0.44,"community":0.31},"availability":"HIGH",
      "dataCenters":[{"id":"US-MD-1","name":"US Maryland 1","availability":"HIGH"}]}]}'
@@ -429,6 +432,29 @@ running_pod() { # STDOUT: what the pod's exec of the volume check prints
   run -1 launch --gpu pcie --yes
   [[ $output == *US-MD-1* ]]
   no_billable_calls
+}
+
+@test "--gpu pro6000 launches 2x RTX PRO 6000 in the volume's data center at its price" {
+  run -0 launch --gpu pro6000 --yes
+  [[ $output == *'$5.38/h'* ]]
+  run -0 body_of POST_v2_pods
+  [[ $(jq -r '.gpu.id' <<<"$output") == "NVIDIA RTX PRO 6000 Blackwell Server Edition" ]]
+  [[ $(jq -r '.gpu.count' <<<"$output") == 2 ]]
+}
+
+@test "--gpu any never picks the RTX PRO 6000, even when no A100 is in stock" {
+  resp GET_v2_network-volumes '{"networkVolumes":[{"id":"vol1","name":"drbm25","size":400,"dataCenter":"US-MD-1","type":"STANDARD"}],"pagination":{"hasNextPage":false}}'
+  resp GET_v2_catalog_gpus '{"gpus":[
+    {"id":"NVIDIA RTX PRO 6000 Blackwell Server Edition","name":"RTX PRO 6000","memory":96,"secure":true,"community":true,
+     "price":{"secure":2.69,"community":1.69},"availability":"LOW",
+     "dataCenters":[{"id":"US-MD-1","name":"US Maryland 1","availability":"LOW"}]}]}'
+  run -1 launch --yes
+  no_billable_calls
+}
+
+@test "--gpu rejects an unknown value and names the choices" {
+  run -2 launch --gpu h100 --yes
+  [[ $output == *pro6000* ]]
 }
 
 @test "with no volume it creates one of --volume-gb in the cheapest data center, after showing size and monthly cost" {
