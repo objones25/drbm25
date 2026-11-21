@@ -98,6 +98,8 @@ runpod_paths() {
   # The runpod/pytorch image sets HF_HUB_ENABLE_HF_TRANSFER=1; the venv has no hf_transfer, so huggingface_hub
   # would refuse every download (dataset and model).
   unset HF_HUB_ENABLE_HF_TRANSFER
+  # vLLM's usage-stats thread phones home; under the test suite's network guard it raises in a thread.
+  export VLLM_NO_USAGE_STATS=1
   DRBM25_DONE_DIR="$DRBM25_ROOT/.done"
   DRBM25_LOG_DIR="$DRBM25_ROOT/logs"
   DRBM25_ENV_FILE="$DRBM25_ROOT/.env"
@@ -718,6 +720,21 @@ print(f"model cached: {cfg.model.name}@{cfg.model.revision} -> {path}")
 PY
 }
 
+# Prints the configured model's snapshot dir from the HF cache, offline; fails when it is not cached.
+_model_snapshot_dir() {
+  HF_HUB_OFFLINE=1 _uv python -c '
+import sys
+from pathlib import Path
+
+from huggingface_hub import snapshot_download
+
+from drbm25.config import load_config
+
+cfg = load_config(Path(sys.argv[1]))
+print(snapshot_download(cfg.model.name, revision=cfg.model.revision, local_files_only=True))
+' "$RUNPOD_CONFIG"
+}
+
 # Prints "yes" when either run has a complete training checkpoint, else "no".
 _training_started() {
   local mode have
@@ -733,13 +750,22 @@ _training_started() {
 }
 
 smoke_stage() {
-  local micro saved='' rc tried='' started
+  local micro saved='' rc tried='' started snapshot
   local candidates=("${MICRO_BATCH_CANDIDATES[@]}")
   runpod_set_args
-  _runpod_log "GPU smoke: the gpu-marked tests (vLLM engine), then the 2-GPU memory check"
-  # --no-cov: the repo's coverage gate would fail a two-file run.
+  # The cache holds the pinned commit only (no refs/main), and the tests' network guard blocks resolving a
+  # repo name online, so the gpu tests load the snapshot directory offline.
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  if ! _uv_timeout "$SMOKE_TIMEOUT_S" pytest -p no:randomly --no-cov -m gpu tests/rollout/test_vllm_engine.py tests/ppo/test_models_full.py; then
+  if ! snapshot=$(_model_snapshot_dir); then
+    _runpod_log "error: the model snapshot is not in the HF cache ($HF_HOME); the model snapshot stage should have put it there"
+    return 1
+  fi
+  _runpod_log "GPU smoke: the gpu-marked tests (vLLM engine) on $snapshot, then the 2-GPU memory check"
+  # --no-cov: the repo's coverage gate would fail a two-file run. -W default: the suite's filterwarnings=error
+  # is for our code; a warning from real vLLM/torch (never run under it on CPU) must not fail the smoke.
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  if ! DRBM25_VLLM_TEST_MODEL=$snapshot HF_HUB_OFFLINE=1 _uv_timeout "$SMOKE_TIMEOUT_S" \
+    pytest -p no:randomly --no-cov -W default -m gpu tests/rollout/test_vllm_engine.py tests/ppo/test_models_full.py; then
     _runpod_log "error: GPU pytest failed"
     return 1
   fi

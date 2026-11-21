@@ -100,9 +100,17 @@ case $cmd in
     fi
     exit 1 # torchrun collapses worker codes
     ;;
-  pytest) exit "${STUB_PYTEST_RC:-0}" ;;
+  pytest)
+    echo "pytest env: model=${DRBM25_VLLM_TEST_MODEL-UNSET} offline=${HF_HUB_OFFLINE-UNSET} usage_stats_off=${VLLM_NO_USAGE_STATS-UNSET}" >>"$STUB_LOG"
+    exit "${STUB_PYTEST_RC:-0}"
+    ;;
   python)
     if [[ $* == *deadline_from_budget* ]]; then echo 1234567890; fi
+    if [[ $* == *local_files_only* ]]; then
+      if [[ -n ${STUB_NO_SNAPSHOT-} ]]; then exit 1; fi
+      echo /vol/hf/hub/models--Qwen/snapshots/abc
+      exit 0
+    fi
     if [[ $* == *spike_monitor.py* ]]; then exit "${STUB_SPIKE_RC:-0}"; fi
     if [[ $* == *drbm25.publish* ]]; then
       # Writes RUN_DIR/UPLOADED.json and exits 0, unless STUB_PUBLISH_RC_<mode> is set (then exits with it).
@@ -543,6 +551,19 @@ prev_chunk_args() { grep '^uv .*drbm25.train' "$STUB_LOG" | grep -o -- '--prev-c
   run -0 in_lib
   grep -q 'pytest .*-m gpu tests/rollout/test_vllm_engine.py tests/ppo/test_models_full.py' "$STUB_LOG"
   grep -q 'torchrun --nproc_per_node 2 scripts/memory_check.py --config configs/runpod_a100_full.yaml' "$STUB_LOG"
+}
+
+@test "smoke_stage runs the gpu pytest offline on the cached snapshot, warnings not fatal, vLLM usage stats off" {
+  SNIPPET='runpod_paths; smoke_stage'
+  run -0 in_lib
+  grep -q 'pytest env: model=/vol/hf/hub/models--Qwen/snapshots/abc offline=1 usage_stats_off=1' "$STUB_LOG"
+  grep -q 'pytest .*-W default .*-m gpu' "$STUB_LOG"
+}
+
+@test "smoke_stage fails before the gpu pytest when the model snapshot is not cached" {
+  SNIPPET='runpod_paths; smoke_stage'
+  run -1 in_lib STUB_NO_SNAPSHOT=1
+  ! grep -q 'pytest env' "$STUB_LOG"
 }
 
 memchecks() { grep '^memcheck micro=' "$STUB_LOG" | sed 's/memcheck micro=//' | tr '\n' ' '; }
