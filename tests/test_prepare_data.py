@@ -52,6 +52,18 @@ def test_prepare_is_idempotent(cfg: Config, fake_download: Any, monkeypatch: pyt
 
 
 @pytest.mark.java
+def test_prepare_builds_into_empty_index_dir(cfg: Config, fake_download: Any) -> None:
+    # The launch scripts `mkdir -p` the index dir before preparing; an empty dir is not an index.
+    cfg.retrieval.index_dir.mkdir(parents=True)
+
+    info = prepare(cfg, expected_docs=TOY_DOCS)
+
+    assert info.n_docs == TOY_DOCS
+    assert read_index_info(cfg.retrieval.index_dir) == info
+    fake_download.assert_called_once()
+
+
+@pytest.mark.java
 def test_prepare_writes_index_info_json(cfg: Config, fake_download: Any) -> None:
     info = prepare(cfg, expected_docs=TOY_DOCS)
     written = json.loads((cfg.retrieval.index_dir / "INDEX_INFO.json").read_text(encoding="utf-8"))

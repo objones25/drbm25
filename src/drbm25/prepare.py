@@ -34,6 +34,9 @@ def prepare(cfg: Config, *, expected_docs: int = EXPECTED_DOCS) -> IndexInfo:
     `os.replace`, so an interrupted build never leaves something that looks complete.
     """
     index_dir = cfg.retrieval.index_dir
+    # The launch scripts `mkdir -p` the index dir up front, so an empty dir means "not built yet".
+    if index_dir.is_dir() and not any(index_dir.iterdir()):
+        index_dir.rmdir()
     try:
         existing = read_index_info(index_dir)
     except FileNotFoundError:
