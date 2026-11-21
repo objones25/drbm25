@@ -172,6 +172,14 @@ calls() { cat "$STUB_LOG"; }
 
 train_calls() { grep '^uv ' "$STUB_LOG" | grep -o 'torchrun.*--run-name [a-z_]* .*--until-step [0-9]*' | sed 's/.*--run-name \([a-z_]*\) .*--until-step \([0-9]*\)/\1@\2/'; }
 
+# ---------------------------------------------------------------- paths
+
+@test "runpod_paths turns off hf_transfer, which the RunPod image enables but the venv does not have" {
+  SNIPPET='printf "[%s]" "${HF_HUB_ENABLE_HF_TRANSFER-UNSET}"'
+  run -0 in_lib HF_HUB_ENABLE_HF_TRANSFER=1
+  [ "$output" = "[UNSET]" ]
+}
+
 # ---------------------------------------------------------------- env file
 
 @test "write_env_file writes mode 600, NAME=value lines, and echoes no value" {

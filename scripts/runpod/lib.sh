@@ -95,6 +95,9 @@ runpod_paths() {
   export UV_PYTHON_PREFERENCE=only-managed
   # The cache is on the network volume and the venv is not: hardlinks cannot cross filesystems.
   export UV_LINK_MODE=copy
+  # The runpod/pytorch image sets HF_HUB_ENABLE_HF_TRANSFER=1; the venv has no hf_transfer, so huggingface_hub
+  # would refuse every download (dataset and model).
+  unset HF_HUB_ENABLE_HF_TRANSFER
   DRBM25_DONE_DIR="$DRBM25_ROOT/.done"
   DRBM25_LOG_DIR="$DRBM25_ROOT/logs"
   DRBM25_ENV_FILE="$DRBM25_ROOT/.env"
