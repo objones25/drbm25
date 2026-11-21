@@ -1191,6 +1191,12 @@ make_uv_tarball() {
   [[ $output == 'hf_a|' ]]
 }
 
+@test "prompt_var with DRBM25_NONINTERACTIVE=1 treats an unset optional variable as empty (RunPod drops empty env vars)" {
+  SNIPPET='unset WANDB_ENTITY; prompt_var WANDB_ENTITY "Entity" --optional; printf "[%s]" "${WANDB_ENTITY-UNSET}"'
+  run -0 --separate-stderr in_lib DRBM25_NONINTERACTIVE=1
+  [[ $output == '[]' ]]
+}
+
 @test "collect_settings rejects a RunPod secret reference that was never substituted" {
   SNIPPET='collect_settings'
   run -1 --separate-stderr in_lib DRBM25_NONINTERACTIVE=1 'HF_TOKEN={{ RUNPOD_SECRET_drbm25_hf_token }}' \

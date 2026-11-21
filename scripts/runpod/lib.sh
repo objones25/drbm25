@@ -187,6 +187,13 @@ _prompt_var_body() {
     return 0
   fi
   # shellcheck disable=SC2310 # a predicate: its status is the answer
+  if noninteractive && ((optional)); then
+    # RunPod drops empty pod env vars, so an optional answer skipped at launch arrives unset: treat it as empty.
+    printf -v "$name" '%s' ''
+    export "${name?}"
+    return 0
+  fi
+  # shellcheck disable=SC2310 # a predicate: its status is the answer
   if noninteractive; then
     _common_log "error: $name is not set and this run is unattended (DRBM25_NONINTERACTIVE or no terminal), so nobody can be asked; set it in the environment"
     return 1
