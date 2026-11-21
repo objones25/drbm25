@@ -188,6 +188,38 @@ train_calls() { grep '^uv ' "$STUB_LOG" | grep -o 'torchrun.*--run-name [a-z_]* 
   [ "$output" = "[UNSET]" ]
 }
 
+# ---------------------------------------------------------------- java
+
+# A fake JDK 21 at $DRBM25_ROOT/jdk/current: bin/java prints a 21 version, lib/libjsig.so exists unless $1 is "nojsig".
+fake_jdk() {
+  local home=$DRBM25_ROOT/jdk/current
+  mkdir -p "$home/bin" "$home/lib"
+  printf '#!/usr/bin/env bash\necho "openjdk version \\"21.0.13\\" 2026-01-20 LTS" >&2\n' >"$home/bin/java"
+  chmod +x "$home/bin/java"
+  if [[ ${1-} != nojsig ]]; then : >"$home/lib/libjsig.so"; fi
+}
+
+@test "install_java21 preloads the JDK's libjsig so a later SIGSEGV handler (tvm_ffi, via vLLM) cannot take the JVM's" {
+  fake_jdk
+  SNIPPET='install_java21; printf "[%s]" "$LD_PRELOAD"'
+  run -0 --separate-stderr in_lib
+  [ "$output" = "[$DRBM25_ROOT/jdk/current/lib/libjsig.so]" ]
+}
+
+@test "jvm_signal_chaining keeps an existing LD_PRELOAD and does not add libjsig twice" {
+  fake_jdk
+  SNIPPET='jdk_env; LD_PRELOAD=/x/other.so; jvm_signal_chaining; jvm_signal_chaining; printf "[%s]" "$LD_PRELOAD"'
+  run -0 --separate-stderr in_lib
+  [ "$output" = "[$DRBM25_ROOT/jdk/current/lib/libjsig.so:/x/other.so]" ]
+}
+
+@test "jvm_signal_chaining fails naming the file when the JDK has no libjsig" {
+  fake_jdk nojsig
+  SNIPPET='jdk_env; jvm_signal_chaining'
+  run -1 --separate-stderr in_lib
+  [[ $stderr == *"$DRBM25_ROOT/jdk/current/lib/libjsig.so"* ]]
+}
+
 # ---------------------------------------------------------------- env file
 
 @test "write_env_file writes mode 600, NAME=value lines, and echoes no value" {

@@ -647,6 +647,23 @@ install_java21() {
     jdk_env
   fi
   require_java21
+  jvm_signal_chaining
+}
+
+# The JVM (pyserini, in-process via pyjnius) raises SIGSEGV on purpose and handles it itself. tvm_ffi, loaded by
+# vLLM, replaces the SIGSEGV handler from a library constructor, so the JVM's first routine SIGSEGV killed training
+# ("!!!!!!! Segfault encountered !!!!!!!"). libjsig is the JDK's signal chaining: preloaded, it keeps the JVM's
+# handler first and passes other signals on to tvm_ffi's. Exported, so every later Python process gets it.
+jvm_signal_chaining() {
+  local jsig=$JAVA_HOME/lib/libjsig.so
+  if [[ ! -f $jsig ]]; then
+    _runpod_log "error: $jsig not found; without it a SIGSEGV handler loaded after the JVM (tvm_ffi, via vLLM) kills training"
+    return 1
+  fi
+  case ":${LD_PRELOAD-}:" in
+    *":$jsig:"*) ;;
+    *) export LD_PRELOAD="$jsig${LD_PRELOAD:+:$LD_PRELOAD}" ;;
+  esac
 }
 
 _install_uv_tarball() (
