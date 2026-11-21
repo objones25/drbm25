@@ -25,3 +25,8 @@ wandb/
 
 # OS
 .DS_Store
+
+# SDD scratch
+.superpowers/
+coverage.xml
+.coverage.*

@@ -1,0 +1,352 @@
+"""Exp 1 / Exp 2 report from per-source JSON-lines files.
+
+    python -m drbm25.eval.report --inputs A.jsonl B.jsonl ... --out report.md
+        [--n-resamples N] [--bootstrap-seed S] [--wandb --config PATH]
+
+Each input file holds one source (see ``drbm25.eval.records``). All sources must cover the
+same qids. Output: nDCG@10 per source under both scorers, with each trained run's best step,
+its validation score and its training steps (from the file headers; a note when the runs trained
+for different numbers of steps), paired bootstrap CIs, query statistics per source, and a
+reproducibility block (bootstrap resamples and seed; config sha256 and seeds per source). With
+``--wandb`` the tables go to a W&B run and the input jsonl files plus the report are logged as
+one ``evaluation`` artifact.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any
+
+import numpy as np
+import wandb
+
+from drbm25.config import load_config
+from drbm25.eval.records import (
+    SOURCE_ORIGINAL,
+    SOURCE_TRAINED_COUNT_ONCE,
+    SOURCE_TRAINED_NORMAL,
+    SOURCE_UNTRAINED,
+    SOURCES,
+    QueryRecord,
+    read_header,
+    read_records,
+)
+from drbm25.eval.stats import PairedCI, paired_bootstrap_ci, query_stats
+from drbm25.obs import configure
+from drbm25.obs.runs import open_run
+
+logger = logging.getLogger(__name__)
+
+_NORMAL = "nDCG@10 normal"
+_COUNT_ONCE = "nDCG@10 count_once"
+_STAT_NAMES = (
+    "mean_n_terms",
+    "mean_n_unique_terms",
+    "repeat_ratio",
+    "any_repeat_rate",
+    "format_error_rate",
+    "mean_think_chars",
+)
+_STAT_FORMATS = ("{:.2f}", "{:.2f}", "{:.3f}", "{:.3f}", "{:.3f}", "{:.1f}")
+_STATS_NOTE = (
+    "repeat_ratio here is pooled over terms: repeated term occurrences over all term occurrences of a "
+    "source's valid rewrites. Training logs rewrite/repeat_ratio as the per-query mean of 1 - unique/total, "
+    "which weights short and long queries equally, so the two need not match. mean_think_chars is the "
+    "mean length in characters of the stripped reasoning before </think>, over rewrites without a format error."
+)
+
+
+_NO_HEADERS: Mapping[str, Mapping[str, Any]] = MappingProxyType({})
+
+
+@dataclass(frozen=True)
+class Report:
+    n_queries: int
+    ndcg: list[tuple[str, float, float]]  # source, mean normal, mean count_once
+    paired_ci: list[tuple[str, str, PairedCI]]  # comparison, scorer, CI of (b - a)
+    stats: list[tuple[str, dict[str, float]]]
+    headers: dict[str, dict[str, Any]]  # source -> its file header (provenance), when it has one
+    n_resamples: int
+    bootstrap_seed: int
+
+
+def _align(sources: Mapping[str, Sequence[QueryRecord]]) -> dict[str, list[QueryRecord]]:
+    """Each source's records ordered by qid; every source must hold the same qid set."""
+    if not sources:
+        raise ValueError("no inputs")
+    unknown = sorted(set(sources) - set(SOURCES))
+    if unknown:
+        raise ValueError(f"unknown source {unknown}; expected a subset of {SOURCES}")
+    aligned: dict[str, list[QueryRecord]] = {}
+    for name in SOURCES:
+        if name not in sources:
+            continue
+        qids = [r.qid for r in sources[name]]
+        if len(set(qids)) != len(qids):
+            raise ValueError(f"source {name} has a duplicate qid")
+        if not qids:
+            raise ValueError(f"source {name} has no records")
+        aligned[name] = sorted(sources[name], key=lambda r: r.qid)
+    reference_name, reference = next(iter(aligned.items()))
+    reference_qids = [r.qid for r in reference]
+    for name, records in aligned.items():
+        if [r.qid for r in records] != reference_qids:
+            raise ValueError(f"qid sets differ between {reference_name} and {name}")
+    return aligned
+
+
+def _scores(records: Sequence[QueryRecord], scorer: str) -> np.ndarray:
+    return np.array([r.ndcg_normal if scorer == _NORMAL else r.ndcg_count_once for r in records])
+
+
+def build_report_data(
+    sources: Mapping[str, Sequence[QueryRecord]],
+    *,
+    headers: Mapping[str, Mapping[str, Any]] = _NO_HEADERS,
+    n_resamples: int = 10_000,
+    seed: int = 0,
+) -> Report:
+    """``seed`` is the bootstrap seed (``--bootstrap-seed``); ``headers`` are the input files' headers by source."""
+    aligned = _align(sources)
+    unknown = sorted(set(headers) - set(aligned))
+    if unknown:
+        raise ValueError(f"headers for sources without records: {unknown}")
+
+    def ci(a: np.ndarray, b: np.ndarray) -> PairedCI:
+        return paired_bootstrap_ci(a, b, n_resamples=n_resamples, seed=seed)
+
+    rows: list[tuple[str, str, PairedCI]] = []
+    if SOURCE_TRAINED_NORMAL in aligned and SOURCE_TRAINED_COUNT_ONCE in aligned:
+        for scorer in (_NORMAL, _COUNT_ONCE):
+            a = _scores(aligned[SOURCE_TRAINED_NORMAL], scorer)
+            b = _scores(aligned[SOURCE_TRAINED_COUNT_ONCE], scorer)
+            rows.append((f"{SOURCE_TRAINED_COUNT_ONCE} - {SOURCE_TRAINED_NORMAL}", scorer, ci(a, b)))
+    for name in (SOURCE_TRAINED_NORMAL, SOURCE_TRAINED_COUNT_ONCE):
+        if name in aligned:
+            gap = ci(_scores(aligned[name], _COUNT_ONCE), _scores(aligned[name], _NORMAL))
+            rows.append((f"{name}: normal - count_once", "nDCG@10", gap))
+    if SOURCE_UNTRAINED in aligned and SOURCE_ORIGINAL in aligned:
+        for scorer in (_NORMAL, _COUNT_ONCE):
+            a, b = _scores(aligned[SOURCE_ORIGINAL], scorer), _scores(aligned[SOURCE_UNTRAINED], scorer)
+            rows.append((f"{SOURCE_UNTRAINED} - {SOURCE_ORIGINAL}", scorer, ci(a, b)))
+    return Report(
+        n_queries=len(next(iter(aligned.values()))),
+        ndcg=[
+            (name, float(_scores(r, _NORMAL).mean()), float(_scores(r, _COUNT_ONCE).mean()))
+            for name, r in aligned.items()
+        ],
+        paired_ci=rows,
+        stats=[(name, query_stats(r)) for name, r in aligned.items()],
+        headers={name: dict(headers[name]) for name in aligned if name in headers},
+        n_resamples=n_resamples,
+        bootstrap_seed=seed,
+    )
+
+
+def _best_cells(header: Mapping[str, Any] | None) -> tuple[str, str]:
+    best = None if header is None else header.get("best")
+    if best is None:
+        return "-", "-"
+    metric = best["selection_metric"]
+    score = best["val_ndcg_normal"] if metric == "val/ndcg_normal" else best["val_ndcg_count_once"]
+    return str(best["step"]), f"{score:.4f} ({metric})"
+
+
+def _trained_steps(header: Mapping[str, Any] | None) -> int | None:
+    return None if header is None else header.get("trained_steps")
+
+
+def _steps_cell(header: Mapping[str, Any] | None) -> str:
+    steps = _trained_steps(header)
+    return "-" if steps is None else str(steps)
+
+
+def _stat_cell(value: float, fmt: str) -> str:
+    return "-" if math.isnan(value) else fmt.format(value)
+
+
+def _git_text(git: Mapping[str, Any] | None) -> str:
+    if git is None or git.get("sha") is None:
+        return "unknown"
+    return f"{git['sha']} (dirty)" if git.get("dirty") else str(git["sha"])
+
+
+def _seed_text(seeds: Mapping[str, Any]) -> str:
+    return ", ".join(f"{k}={seeds[k]}" for k in ("run_seed", "split_seed") if k in seeds)
+
+
+def render_markdown(report: Report) -> str:
+    lines = [
+        f"Queries: {report.n_queries}",
+        "",
+        f"| source | {_NORMAL} | {_COUNT_ONCE} | best step | val score (selection metric) | training steps |",
+        "|---|---|---|---|---|---|",
+        *(
+            f"| {name} | {n:.4f} | {c:.4f} | {' | '.join(_best_cells(report.headers.get(name)))} "
+            f"| {_steps_cell(report.headers.get(name))} |"
+            for name, n, c in report.ndcg
+        ),
+        "",
+    ]
+    steps = {name: _trained_steps(h) for name, h in report.headers.items() if _trained_steps(h) is not None}
+    if len(set(steps.values())) > 1:
+        lines += [
+            "Training steps differ: "
+            + ", ".join(f"{name} {n}" for name, n in steps.items())
+            + ". A budget stop can leave one run a chunk behind; each row is still that run's best/ policy "
+            "(best step), so compare the rows knowing the runs did not train equally long.",
+            "",
+        ]
+    if report.paired_ci:
+        lines += [
+            "Paired bootstrap 95% CI of the mean per-query difference, as written (b - a).",
+            "",
+            "| comparison | scorer | mean diff | CI low | CI high |",
+            "|---|---|---|---|---|",
+            *(
+                f"| {name} | {scorer} | {ci.mean_diff:+.4f} | {ci.low:+.4f} | {ci.high:+.4f} |"
+                for name, scorer, ci in report.paired_ci
+            ),
+            "",
+        ]
+    lines += [
+        f"| source | {' | '.join(_STAT_NAMES)} |",
+        "|---|" + "---|" * len(_STAT_NAMES),
+        *(
+            f"| {name} | {' | '.join(_stat_cell(values[key], fmt) for key, fmt in zip(_STAT_NAMES, _STAT_FORMATS, strict=True))} |"
+            for name, values in report.stats
+        ),
+        "",
+        _STATS_NOTE,
+        "",
+        "Reproducibility",
+        "",
+        f"Bootstrap: {report.n_resamples} resamples, seed {report.bootstrap_seed}",
+        "",
+    ]
+    trained = [(name, h["best"]) for name, h in report.headers.items() if h.get("best") is not None]
+    if trained:
+        lines += [
+            "| source | training config sha256 | seeds | training git sha |",
+            "|---|---|---|---|",
+            *(
+                f"| {name} | {best['config_sha256']} | {_seed_text(best['seeds'])} | {_git_text(best.get('git'))} |"
+                for name, best in trained
+            ),
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def build_report(sources: Mapping[str, Sequence[QueryRecord]], *, n_resamples: int = 10_000, seed: int = 0) -> str:
+    return render_markdown(build_report_data(sources, n_resamples=n_resamples, seed=seed))
+
+
+def _load_inputs(paths: Sequence[Path]) -> tuple[dict[str, list[QueryRecord]], dict[str, dict[str, Any]]]:
+    """Records and (when present) the file header, by source."""
+    sources: dict[str, list[QueryRecord]] = {}
+    headers: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        records = read_records(path)
+        names = {r.source for r in records}
+        if len(names) > 1:
+            raise ValueError(f"{path} holds more than one source: {sorted(names)}")
+        if not names:
+            raise ValueError(f"{path} has no records")
+        (name,) = names
+        if name in sources:
+            raise ValueError(f"source {name} appears in more than one input")
+        sources[name] = records
+        header = read_header(path)
+        if header is not None:
+            if header.get("source") != name:
+                raise ValueError(f"{path}: header source {header.get('source')!r} differs from its records' {name!r}")
+            headers[name] = header
+    return sources, headers
+
+
+def _results_artifact(inputs: Sequence[Path], out: Path) -> wandb.Artifact:
+    """The per-query jsonl files and the report, as one versioned artifact."""
+    artifact = wandb.Artifact(name="eval-results", type="evaluation")
+    for path in [*inputs, out]:
+        artifact.add_file(str(path), name=path.name)
+    return artifact
+
+
+def _log_to_wandb(
+    cfg_path: Path,
+    overrides: Mapping[str, str],
+    report: Report,
+    inputs: Sequence[Path],
+    out: Path,
+    n_resamples: int,
+) -> None:
+    cfg = load_config(cfg_path, dict(overrides))
+    extra: dict[str, object] = {
+        "inputs": [str(p) for p in inputs],
+        "n_queries": report.n_queries,
+        "n_resamples": n_resamples,
+        "bootstrap_seed": report.bootstrap_seed,
+        "best": {name: h["best"] for name, h in report.headers.items() if h.get("best") is not None},
+    }
+    with open_run(
+        cfg, run_name="report", reward_mode="normal", job_type="report", resume_id=None, extra_config=extra
+    ) as run:
+        run.log(
+            {
+                "report/ndcg": wandb.Table(
+                    columns=["source", "ndcg10_normal", "ndcg10_count_once"],
+                    data=[[n, a, b] for n, a, b in report.ndcg],
+                ),
+                "report/paired_ci": wandb.Table(
+                    columns=["comparison", "scorer", "mean_diff", "ci_low", "ci_high"],
+                    data=[[n, s, ci.mean_diff, ci.low, ci.high] for n, s, ci in report.paired_ci],
+                ),
+                "report/query_stats": wandb.Table(
+                    columns=["source", *_STAT_NAMES],
+                    # NaN (no think length for original queries) goes to W&B as a missing value.
+                    data=[[n, *(None if math.isnan(v[key]) else v[key] for key in _STAT_NAMES)] for n, v in report.stats],
+                ),
+            }
+        )
+        run.log_artifact(_results_artifact(inputs, out))
+        logger.info("logged eval-results artifact: %d jsonl files and %s", len(inputs), out)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m drbm25.eval.report", description="Exp 1 / Exp 2 report.")
+    parser.add_argument("--inputs", type=Path, nargs="+", required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--n-resamples", type=int, default=10_000)
+    parser.add_argument("--bootstrap-seed", type=int, default=0, help="seed of the paired bootstrap (recorded)")
+    parser.add_argument("--wandb", action="store_true", help="also log the tables to a W&B run (job_type report)")
+    parser.add_argument("--config", type=Path, default=None, help="config for the W&B project (with --wandb)")
+    parser.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE")
+    ns = parser.parse_args(argv)
+    if ns.wandb and ns.config is None:
+        parser.error("--wandb needs --config (it names the W&B project)")
+    overrides: dict[str, str] = {}
+    for item in ns.overrides:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            parser.error(f"--set expects key=value, got {item!r}")
+        overrides[key] = value
+    configure(level="INFO", fmt="json")
+    sources, headers = _load_inputs(ns.inputs)
+    report = build_report_data(sources, headers=headers, n_resamples=ns.n_resamples, seed=ns.bootstrap_seed)
+    ns.out.parent.mkdir(parents=True, exist_ok=True)
+    ns.out.write_text(render_markdown(report), encoding="utf-8")
+    logger.info("wrote %s", ns.out)
+    if ns.wandb:
+        _log_to_wandb(ns.config, overrides, report, ns.inputs, ns.out, ns.n_resamples)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

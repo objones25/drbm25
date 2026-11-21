@@ -1,0 +1,427 @@
+"""Two-rank FSDP2 cases for ``test_models_full.py``, run as a script (not collected by pytest).
+
+    python fsdp_cases.py CASE OUT_DIR
+
+``torch.multiprocessing.spawn`` starts two gloo ranks on CPU with the tiny fp32 Qwen2; rank 0
+writes the case's tensors to ``OUT_DIR/result.pt``. The test process compares them with a
+single-process reference built from the same helpers (imported from this file by path).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+import socket
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Final
+
+import torch
+import torch.distributed as tdist
+from torch import Tensor
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.multiprocessing.spawn import spawn
+
+from drbm25.bm25.searcher import SearchResult
+from drbm25.checkpoint import TrainState, latest_checkpoint, load_sharded_checkpoint, save_sharded_checkpoint
+from drbm25.config import Config, ScoringMode, load_config
+from drbm25.data import Example
+from drbm25.distributed import DistInfo
+from drbm25.ppo.models import PolicyModels, token_logprobs
+from drbm25.ppo.models_full import FullPolicyModels
+from drbm25.ppo.trainer import PPOTrainer
+from drbm25.rollout.base import RolloutBatch, encode_prompts, finalize_rollout, special_ids
+from drbm25.tiny import build_tiny_qwen2, build_tiny_tokenizer
+
+WORLD: Final = 2
+CPU: Final = torch.device("cpu")
+LR: Final = 1e-3
+SMOKE: Final = Path(__file__).resolve().parents[2] / "configs" / "smoke_cpu.yaml"
+
+
+# ----------------------------------------------------------------------------- shared helpers
+def build_models(mesh: DeviceMesh, *, seed: int = 0, gradient_checkpointing: bool = False) -> FullPolicyModels:
+    return FullPolicyModels(
+        build_tiny_qwen2(seed),
+        build_tiny_qwen2(seed).model,
+        build_tiny_qwen2(seed),
+        mesh=mesh,
+        compute_dtype=torch.float32,
+        gradient_checkpointing=gradient_checkpointing,
+    )
+
+
+def lm_batch() -> tuple[Tensor, Tensor]:
+    """4 rows x 8 tokens, the same on every rank (fixed generator)."""
+    gen = torch.Generator().manual_seed(7)
+    ids = torch.randint(3, 128, (4, 8), generator=gen)
+    return ids, torch.ones_like(ids)
+
+
+def lm_loss(logits: Tensor, ids: Tensor) -> Tensor:
+    return -token_logprobs(logits, ids).mean()
+
+
+def full_cfg() -> Config:
+    """Smoke config switched to the full layout: local batch 2 per rank on 2 ranks."""
+    cfg = load_config(SMOKE, {"model.train_mode": "full", "run.deep_log_every": "1"})
+    return dataclasses.replace(cfg, lora=None)
+
+
+def same_examples(n: int) -> list[Example]:
+    return [Example(qid=f"q{i}", query="solar efficiency", relevant_ids=frozenset({"hit"})) for i in range(n)]
+
+
+class FixedEngine:
+    """Every row answers ``w4 w5`` then EOS (no sampling), in the answer format the reward parses."""
+
+    def __init__(self) -> None:
+        self._tokenizer = build_tiny_tokenizer()
+        self._ids = special_ids(self._tokenizer)
+        self.synced = 0
+
+    def generate(self, prompts: Sequence[str], *, greedy: bool) -> RolloutBatch:
+        del greedy
+        prompt_ids, prompt_mask = encode_prompts(self._tokenizer, prompts, CPU, max_prompt_tokens=256)
+        row = self._tokenizer("w4 w5").data["input_ids"] + [self._ids.eos]
+        response = torch.tensor([row] * len(prompts))
+        batch = finalize_rollout(prompt_ids, prompt_mask, response, tokenizer=self._tokenizer, ids=self._ids)
+        texts = tuple(f'</think>\n<answer>{{"query": "{t}"}}</answer>' for t in batch.response_text)
+        return dataclasses.replace(batch, response_text=texts)
+
+    def sync_weights(self, models: PolicyModels) -> None:
+        models.merged_actor_state_dict()  # collective on FSDP: every rank must take part
+        self.synced += 1
+
+
+class HitSearcher:
+    """``hit`` (relevant) ranks first iff the query contains ``w4``."""
+
+    def search(self, query: str, *, mode: ScoringMode, k: int) -> SearchResult:
+        del mode, k
+        words = query.split()
+        return SearchResult(("hit" if "w4" in words else "miss",), len(words), len(set(words)), (1.0,))
+
+    def batch_search(self, queries: Sequence[str], *, mode: ScoringMode, k: int) -> list[SearchResult]:
+        return [self.search(q, mode=mode, k=k) for q in queries]
+
+    def analyze(self, text: str) -> list[str]:
+        return text.split()
+
+
+class EchoW4Engine:
+    """Answers ``w4`` when the prompt contains ``w4``, else ``zz``; records how many prompts it saw."""
+
+    def __init__(self) -> None:
+        self.seen = 0
+
+    def generate(self, prompts: Sequence[str], *, greedy: bool) -> RolloutBatch:
+        del greedy
+        self.seen += len(prompts)
+        texts = tuple(
+            f'</think>\n<answer>{{"query": "{"w4" if "w4" in p else "zz"}"}}</answer>' for p in prompts
+        )
+        z = torch.zeros(len(prompts), 1, dtype=torch.long)
+        return RolloutBatch(z, z, z, z, texts, torch.zeros(len(prompts), dtype=torch.bool))
+
+    def sync_weights(self, models: PolicyModels) -> None:
+        del models
+
+
+# Seven validation examples, three of them hits (indices 0, 3, 4): mean nDCG 3/7. Split by rank
+# (rank::2) the halves score 2/4 and 1/3, so only a correct all-reduce gives 3/7 on every rank.
+VAL_QUERIES: Final = ("w4 solar", "solar", "panel", "w4 w9", "w4", "heart", "aspirin")
+
+
+def val_examples() -> list[Example]:
+    return [Example(qid=f"v{i}", query=q, relevant_ids=frozenset({"hit"})) for i, q in enumerate(VAL_QUERIES)]
+
+
+def lora_validate(dist: DistInfo) -> tuple[dict[str, float], int]:
+    """LoRA-layout ``PPOTrainer.validate`` on ``val_examples``; returns the metrics and prompts seen."""
+    import drbm25.train as train_module
+
+    cfg = load_config(SMOKE)
+    layout = train_module.init_layout(cfg, dist)
+    engine = EchoW4Engine()
+    trainer = PPOTrainer(
+        cfg, models=layout.models, engine=engine, searcher=HitSearcher(), reward_mode="normal", dist=dist, scaler=None
+    )
+    return trainer.validate(val_examples()), engine.seen
+
+
+class PerRankEngine(EchoW4Engine):
+    """Rank 0 echoes like ``EchoW4Engine``; rank 1 always answers ``w4``: valid rewrites that differ per rank.
+
+    Models independent per-rank vLLM engines whose greedy output is not bit-identical across instances.
+    """
+
+    def __init__(self, rank: int) -> None:
+        super().__init__()
+        self._rank = rank
+
+    def generate(self, prompts: Sequence[str], *, greedy: bool) -> RolloutBatch:
+        if self._rank == 0:
+            return super().generate(prompts, greedy=greedy)
+        self.seen += len(prompts)
+        texts = tuple('</think>\n<answer>{"query": "w4"}</answer>' for _ in prompts)
+        z = torch.zeros(len(prompts), 1, dtype=torch.long)
+        return RolloutBatch(z, z, z, z, texts, torch.zeros(len(prompts), dtype=torch.bool))
+
+
+def full_vllm_validate(mesh: DeviceMesh, dist: DistInfo) -> tuple[dict[str, float], int, str]:
+    """Full-layout ``validate`` with ``rollout.backend: vllm`` and per-rank engines that disagree.
+
+    Returns the metrics, the prompts this rank generated, and the message (empty if none) of the
+    best-policy consistency check run on the validation score, as ``train`` does.
+    """
+    import drbm25.train as train_module
+
+    cfg = load_config(SMOKE, {"model.train_mode": "full", "rollout.backend": "vllm"})
+    cfg = dataclasses.replace(cfg, lora=None)
+    engine = PerRankEngine(dist.rank)
+    trainer = PPOTrainer(
+        cfg, models=build_models(mesh), engine=engine, searcher=HitSearcher(), reward_mode="normal", dist=dist,
+        scaler=None,
+    )  # fmt: skip
+    metrics = trainer.validate(val_examples())
+    try:
+        train_module._check_same_on_all_ranks([metrics["val/ndcg_normal"]], dist)  # pyright: ignore[reportPrivateUsage]
+        message = ""
+    except RuntimeError as exc:
+        message = str(exc)
+    return metrics, engine.seen, message
+
+
+def ppo_step(mesh: DeviceMesh, dist: DistInfo, cfg: Config) -> tuple[FullPolicyModels, dict[str, float]]:
+    """One PPOTrainer step on the full layout; every rank gets the same 2 examples."""
+    torch.manual_seed(0)
+    models = build_models(mesh)
+    trainer = PPOTrainer(
+        cfg, models=models, engine=FixedEngine(), searcher=HitSearcher(), reward_mode="normal", dist=dist, scaler=None
+    )
+    metrics = trainer.step(same_examples(cfg.ppo.batch_size // dist.world_size), step=0)
+    return models, metrics
+
+
+def gathered_critic(models: FullPolicyModels) -> dict[str, Tensor]:
+    return {k[len("critic.") :]: v for k, v in models.trainable_state_dict().items() if k.startswith("critic.")}
+
+
+# ----------------------------------------------------------------------------- cases
+def case_actor_step(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    """Each rank trains on its half of the batch; FSDP must average to the full-batch step."""
+    models = build_models(mesh, gradient_checkpointing=True)
+    params = models.actor_parameters()
+    opt = torch.optim.AdamW(params, lr=LR, weight_decay=0.0)
+    ids, attn = lm_batch()
+    rows = slice(2 * rank, 2 * rank + 2)
+    for _ in range(2):
+        lm_loss(models.actor_logits(ids[rows], attn[rows]), ids[rows]).backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+    merged = models.merged_actor_state_dict()
+    if rank == 0:
+        torch.save({k: v.clone() for k, v in merged.items()}, out / "result.pt")
+
+
+def case_checkpoint(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    """Train one step, save sharded; a fresh model + optimizer loads it back exactly."""
+    dist = DistInfo(rank, WORLD, rank, CPU)
+    run_dir = out / "run"
+    trained = build_models(mesh, seed=0)
+    opts = {
+        "actor": torch.optim.AdamW(trained.actor_parameters(), lr=LR, weight_decay=0.0),
+        "critic": torch.optim.AdamW(trained.critic_parameters(), lr=LR, weight_decay=0.0),
+    }
+    ids, attn = lm_batch()
+    lm_loss(trained.actor_logits(ids, attn), ids).backward()
+    (trained.critic_values(ids, attn) - 1.0).pow(2).mean().backward()  # nonzero grad at a zero head
+    for opt in opts.values():
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+    state = TrainState(step=3, data_cursor=12, wandb_run_id="abc", reward_mode="count_once")
+    save_sharded_checkpoint(run_dir, train_state=state, state=trained.sharded_state(opts), keep=2, dist=dist)
+
+    fresh = build_models(mesh, seed=1)
+    fresh_opts = {
+        "actor": torch.optim.AdamW(fresh.actor_parameters(), lr=LR, weight_decay=0.0),
+        "critic": torch.optim.AdamW(fresh.critic_parameters(), lr=LR, weight_decay=0.0),
+    }
+    path = latest_checkpoint(run_dir)
+    if path is None:
+        raise RuntimeError("no complete checkpoint after save_sharded_checkpoint")
+    template = fresh.sharded_state(fresh_opts)
+    loaded = load_sharded_checkpoint(path, template)
+    fresh.load_sharded_state(template, fresh_opts)
+
+    want, got = trained.trainable_state_dict(), fresh.trainable_state_dict()
+    exp_avg = {
+        name: [
+            s["exp_avg"].full_tensor()
+            for s in (opts[name].state[p] for p in group)  # pyright: ignore[reportAttributeAccessIssue]
+        ]
+        for name, group in (("actor", trained.actor_parameters()), ("critic", trained.critic_parameters()))
+    }
+    fresh_exp_avg = {
+        name: [s["exp_avg"].full_tensor() for s in (fresh_opts[name].state[p] for p in group)]  # pyright: ignore[reportAttributeAccessIssue]
+        for name, group in (("actor", fresh.actor_parameters()), ("critic", fresh.critic_parameters()))
+    }
+    if rank == 0:
+        torch.save(
+            {
+                "want": want,
+                "got": got,
+                "exp_avg": exp_avg,
+                "fresh_exp_avg": fresh_exp_avg,
+                "train_state": dataclasses.asdict(loaded.train_state),
+                "files": sorted(p.name for p in path.iterdir()),
+                "path": str(path),
+            },
+            out / "result.pt",
+        )
+
+
+def case_ppo_step(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    models, metrics = ppo_step(mesh, DistInfo(rank, WORLD, rank, CPU), full_cfg())
+    actor = {k: v.clone() for k, v in models.merged_actor_state_dict().items()}
+    critic = gathered_critic(models)
+    if rank == 0:
+        torch.save({"actor": actor, "critic": critic, "metrics": metrics}, out / "result.pt")
+
+
+def _lora_init(rank: int, out: Path, *, broadcast: bool) -> None:
+    """``train.init_layout`` on the LoRA smoke config; every rank saves its trainable state."""
+    import drbm25.train as train_module
+
+    if not broadcast:
+        # Construction alone must already give every rank the same weights.
+        def no_broadcast(params: object, dist: object) -> None:
+            del params, dist
+
+        train_module.broadcast_params = no_broadcast
+    cfg = load_config(SMOKE)
+    dist = DistInfo(rank, WORLD, rank, CPU)
+    layout = train_module.init_layout(cfg, dist)
+    init = layout.models.trainable_state_dict()
+    stepped: dict[str, Tensor] = {}
+    if broadcast:
+        trainer = PPOTrainer(
+            cfg, models=layout.models, engine=FixedEngine(), searcher=HitSearcher(), reward_mode="normal", dist=dist,
+            scaler=None,
+        )  # fmt: skip
+        # Different prompts per rank, so the ranks' gradients differ and only the all-reduce keeps them equal.
+        local = cfg.ppo.batch_size // WORLD
+        examples = [
+            Example(qid=f"r{rank}q{i}", query=f"w{rank + 3} w9", relevant_ids=frozenset({"hit"})) for i in range(local)
+        ]
+        trainer.step(examples, step=0)
+        stepped = layout.models.trainable_state_dict()
+    torch.save({"init": init, "stepped": stepped}, out / f"result_rank{rank}.pt")
+
+
+def case_lora_init(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    del mesh
+    _lora_init(rank, out, broadcast=True)
+
+
+def case_lora_init_construction(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    del mesh
+    _lora_init(rank, out, broadcast=False)
+
+
+def case_lora_validate(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    del mesh
+    metrics, seen = lora_validate(DistInfo(rank, WORLD, rank, CPU))
+    torch.save({"metrics": metrics, "seen": seen}, out / f"result_rank{rank}.pt")
+
+
+def case_full_vllm_validate(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    metrics, seen, message = full_vllm_validate(mesh, DistInfo(rank, WORLD, rank, CPU))
+    torch.save({"metrics": metrics, "seen": seen, "message": message}, out / f"result_rank{rank}.pt")
+
+
+def case_assert_params(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    """assert_params_equal raises on different values and passes after broadcast_params."""
+    del mesh
+    from drbm25.distributed import assert_params_equal, broadcast_params
+
+    dist = DistInfo(rank, WORLD, rank, CPU)
+    params = [torch.nn.Parameter(torch.full((3,), float(rank))), torch.nn.Parameter(torch.ones(2))]
+    try:
+        assert_params_equal(params, dist)
+        message = ""
+    except RuntimeError as exc:
+        message = str(exc)
+    broadcast_params(params, dist)
+    assert_params_equal(params, dist)
+    torch.save({"message": message, "after": params[0].detach().clone()}, out / f"result_rank{rank}.pt")
+
+
+EVAL_QUERIES: Final = ("solar panel efficiency", "w4 w9 w12", "heart attack aspirin")
+
+
+def case_eval_ckpt(rank: int, mesh: DeviceMesh, out: Path) -> None:
+    """Train the actor a little, save a sharded checkpoint, record the live actor's greedy rewrites."""
+    from drbm25.prompt import build_prompt
+    from drbm25.rollout.hf_generate import HFGenerateEngine
+
+    cfg = full_cfg()
+    dist = DistInfo(rank, WORLD, rank, CPU)
+    models = build_models(mesh, seed=0)
+    opts = {
+        "actor": torch.optim.AdamW(models.actor_parameters(), lr=0.05, weight_decay=0.0),
+        "critic": torch.optim.AdamW(models.critic_parameters(), lr=LR, weight_decay=0.0),
+    }
+    ids, attn = lm_batch()
+    for _ in range(3):
+        lm_loss(models.actor_logits(ids, attn), ids).backward()
+        opts["actor"].step()
+        opts["actor"].zero_grad(set_to_none=True)
+    state = TrainState(step=5, data_cursor=20, wandb_run_id=None, reward_mode="count_once")
+    path = save_sharded_checkpoint(out / "run", train_state=state, state=models.sharded_state(opts), keep=1, dist=dist)
+    engine = HFGenerateEngine(models, build_tiny_tokenizer(), cfg.rollout, CPU, synced_gpus=True)
+    live = engine.generate([build_prompt(q) for q in EVAL_QUERIES], greedy=True)
+    if rank == 0:
+        torch.save(
+            {"path": str(path), "response_ids": live.response_ids, "texts": list(live.response_text)},
+            out / "result.pt",
+        )
+
+
+CASES: Final = {
+    "eval_ckpt": case_eval_ckpt,
+    "assert_params": case_assert_params,
+    "actor_step": case_actor_step,
+    "checkpoint": case_checkpoint,
+    "ppo_step": case_ppo_step,
+    "lora_init": case_lora_init,
+    "lora_init_construction": case_lora_init_construction,
+    "lora_validate": case_lora_validate,
+    "full_vllm_validate": case_full_vllm_validate,
+}
+
+
+def _worker(rank: int, case: str, port: int, out: str) -> None:
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo0" if sys.platform == "darwin" else "lo"
+    tdist.init_process_group("gloo", rank=rank, world_size=WORLD)
+    try:
+        CASES[case](rank, init_device_mesh("cpu", (WORLD,)), Path(out))
+    finally:
+        tdist.destroy_process_group()
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+if __name__ == "__main__":
+    case_name, out_dir = sys.argv[1], sys.argv[2]
+    if case_name not in CASES:
+        raise SystemExit(f"unknown case {case_name!r}; expected one of {sorted(CASES)}")
+    spawn(_worker, args=(case_name, _free_port(), out_dir), nprocs=WORLD, join=True)

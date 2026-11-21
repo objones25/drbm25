@@ -1,0 +1,115 @@
+[project]
+name = "drbm25"
+version = "0.1.0"
+description = "PPO training of an LLM query rewriter with a BM25 reward"
+readme = "README.md"
+authors = [
+    { name = "objones25", email = "59661118+objones25@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "huggingface-hub==0.36.2",
+    "numpy==2.2.6",
+    "peft==0.21.2",
+    "pyserini==2.0.0",
+    "pyyaml==6.0.3",
+    "requests==2.34.2",
+    "safetensors==0.8.0",
+    "torch==2.10.0",
+    "transformers==4.57.6",
+    "wandb==0.31.0",
+]
+
+[project.optional-dependencies]
+vllm = [
+    "vllm==0.19.0 ; sys_platform == 'linux'",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+exclude-newer = "2026-11-05T00:00:00Z"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.170.14",
+    "pyright==1.1.414",
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "pytest-randomly>=5.0.0",
+    "pytest-xdist>=3.8.0",
+    "pyyaml==6.0.3",
+    "ruff>=0.17.3",
+]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+strict = true
+addopts = [
+    "--import-mode=importlib",
+    "-ra",
+    "--showlocals",
+    "--tb=short",
+    "--cov",
+    "--cov-branch",
+    "--cov-report=term-missing:skip-covered",
+    "--cov-report=xml",
+    "--cov-fail-under=80",
+    "-m", "not gpu and not integration",
+]
+markers = [
+    "java: needs a JVM (Java 21) for pyserini/Lucene",
+    "gpu: requires CUDA; deselected by default",
+    "integration: crosses a process, service, or network boundary; deselected by default",
+    "slow: takes more than ~1s",
+]
+filterwarnings = [
+    "error",
+    # pyserini 2.0.0 trectools/_base.py has '\s' in non-raw strings; Python compiles it with a
+    # SyntaxWarning the first time (fresh venv), which "error" turns into a collection error.
+    # Our own code is covered by ruff W605.
+    "ignore:invalid escape sequence:SyntaxWarning",
+]
+faulthandler_timeout = 120
+pythonpath = ["src"]
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+omit = ["*/tests/*", "*/__main__.py", "*/_version.py"]
+parallel = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 80
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "\\.\\.\\.",
+]
+
+[tool.coverage.paths]
+source = ["src", "*/site-packages"]
+
+[tool.mutmut]
+source_paths = ["src"]
+also_copy = []
+pytest_add_cli_args = ["-p", "no:randomly", "--no-cov", "-q"]
+pytest_add_cli_args_test_selection = ["tests"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+include = ["src", "tests"]
+exclude = ["scripts", "upstream", ".venv", "runs", "data", "indexes"]
+typeCheckingMode = "standard"
+extraPaths = ["src"]
+stubPath = "typings"
