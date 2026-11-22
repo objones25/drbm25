@@ -45,13 +45,19 @@ class _ExtraRecord(logging.LogRecord):
     """LogRecord whose `extra=` fields the checker may read as attributes."""
 
     if TYPE_CHECKING:
+
         def __getattr__(self, name: str) -> Any: ...
 
 
 def make_record(**extra) -> _ExtraRecord:
     record = _ExtraRecord(
-        name="t", level=logging.INFO, pathname=__file__, lineno=1,
-        msg="order %s received", args=(1001,), exc_info=None,
+        name="t",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="order %s received",
+        args=(1001,),
+        exc_info=None,
     )
     for key, value in extra.items():
         setattr(record, key, value)
@@ -59,6 +65,7 @@ def make_record(**extra) -> _ExtraRecord:
 
 
 # --- JSON formatter -------------------------------------------------------
+
 
 def test_json_formatter_emits_one_object_per_record():
     out = json.loads(JSONFormatter().format(make_record()))
@@ -101,6 +108,7 @@ def test_unserializable_value_does_not_kill_the_record():
 
 # --- context --------------------------------------------------------------
 
+
 def test_context_filter_attaches_ambient_fields():
     record = make_record()
     with log_context(request_id="abc123"):
@@ -137,6 +145,7 @@ def test_new_request_id_is_unique():
 
 # --- redaction ------------------------------------------------------------
 
+
 def test_secret_named_field_is_redacted():
     record = make_record(api_key="sk-live-1234567890", user="ana")
     RedactingFilter().filter(record)
@@ -152,8 +161,7 @@ def test_nested_dict_secrets_are_redacted():
 
 def test_ml_config_names_are_not_mistaken_for_secrets():
     """Substring matching used to redact max_tokens, tokenizer, author, passes."""
-    benign = dict(max_tokens=512, tokenizer="gpt2", tokens_per_sec=1e4,
-                  author="ana", num_passes=2, pad_token_id=0)
+    benign = dict(max_tokens=512, tokenizer="gpt2", tokens_per_sec=1e4, author="ana", num_passes=2, pad_token_id=0)
     secrets = {"hf_token": "hf_x", "apiKey": "k", "db_password": "p"}
     record = make_record(**benign, **secrets)
     RedactingFilter().filter(record)
@@ -170,6 +178,7 @@ def test_message_scanning_is_opt_in():
 
 
 # --- setup / dictConfig ---------------------------------------------------
+
 
 def test_all_handlers_live_on_root():
     config = build_config()
@@ -205,8 +214,11 @@ def test_build_config_works_without_configure():
         "logging.getLogger('app').warning('visible')\n"
     )
     proc = subprocess.run(  # noqa: S603 -- fixed argv, no external input
-        [sys.executable, "-c", code], capture_output=True, text=True,
-        env={"PYTHONPATH": str(SRC), "PATH": ""}, timeout=60,
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env={"PYTHONPATH": str(SRC), "PATH": ""},
+        timeout=60,
     )
     assert "visible" in proc.stdout, proc.stderr
 
@@ -253,8 +265,8 @@ def test_stock_queue_handler_would_lose_the_structure(capsys):
     listener.stop()
 
     out = json.loads(capsys.readouterr().out.splitlines()[-1])
-    assert "exception" not in out          # exc_info was cleared
-    assert "Traceback" in out["message"]   # ...and flattened into the message
+    assert "exception" not in out  # exc_info was cleared
+    assert "Traceback" in out["message"]  # ...and flattened into the message
 
 
 # --- W&B (offline) --------------------------------------------------------
@@ -308,7 +320,9 @@ def test_summary_goal_changes_the_shape_of_the_summary_value(offline_env):
     from drbm25.obs.wandb_run import start_run
 
     with start_run(
-        project="test", config={}, dir=str(offline_env),
+        project="test",
+        config={},
+        dir=str(offline_env),
         summary_goals={"val/loss": "min"},
     ) as run:
         run.log({"val/loss": 0.5})
@@ -364,9 +378,7 @@ def test_resolve_mode_asks_wandb_about_credentials(monkeypatch):
     assert wandb_run.resolve_mode() == "online"
 
 
-def test_start_run_falls_back_offline_when_server_unreachable(
-    offline_env, monkeypatch
-):
+def test_start_run_falls_back_offline_when_server_unreachable(offline_env, monkeypatch):
     """With credentials but no network, wandb.init raises CommError after
     init_timeout instead of degrading; start_run must degrade for it."""
     from drbm25.obs import wandb_run
@@ -400,8 +412,9 @@ def test_start_run_does_not_hide_a_bad_key(offline_env, monkeypatch):
         raise wandb.errors.AuthenticationError("invalid API key")
 
     monkeypatch.setattr(wandb, "init", fake_init)
-    with pytest.raises(wandb.errors.AuthenticationError), wandb_run.start_run(
-        project="t", config={}, dir=str(offline_env)
+    with (
+        pytest.raises(wandb.errors.AuthenticationError),
+        wandb_run.start_run(project="t", config={}, dir=str(offline_env)),
     ):
         pass
 

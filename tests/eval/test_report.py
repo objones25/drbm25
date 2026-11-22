@@ -371,7 +371,17 @@ def test_wandb_report_applies_set_overrides_to_the_config(tmp_path: Path, monkey
         path = tmp_path / f"{name}.jsonl"
         write_records(path, recs)
         paths.append(str(path))
-    argv = ["--inputs", *paths, "--out", str(tmp_path / "r.md"), "--n-resamples", "50", "--wandb", "--config", str(SMOKE)]
+    argv = [
+        "--inputs",
+        *paths,
+        "--out",
+        str(tmp_path / "r.md"),
+        "--n-resamples",
+        "50",
+        "--wandb",
+        "--config",
+        str(SMOKE),
+    ]
     argv += ["--set", "run.wandb_project=my-proj", "--set", "run.wandb_entity=my-team"]
     assert main(argv) == 0
     (cfg,) = seen

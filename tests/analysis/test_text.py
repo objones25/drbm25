@@ -49,7 +49,7 @@ def test_term_diff_bounds(a: list[str], b: list[str]) -> None:
 
 @given(TERMS)
 def test_term_diff_of_itself_is_identical(a: list[str]) -> None:
-    assert term_diff(a, a).jaccard == 1.0
+    assert term_diff(a, a).jaccard == pytest.approx(1.0)
 
 
 def test_repetition_profile() -> None:
@@ -101,7 +101,7 @@ def test_distinct_n_over_samples() -> None:
 
 
 def test_distinct_n_without_ngrams_is_zero() -> None:
-    assert distinct_n([["a"], []], 2) == 0.0
+    assert distinct_n([["a"], []], 2) == pytest.approx(0.0)
 
 
 @given(st.lists(TERMS, max_size=5), st.integers(min_value=1, max_value=3))
@@ -114,4 +114,4 @@ def test_reasoning_overlap_is_share_of_rewrite_terms_in_reasoning() -> None:
 
 
 def test_reasoning_overlap_of_empty_rewrite_is_one() -> None:
-    assert reasoning_overlap(["x"], []) == 1.0
+    assert reasoning_overlap(["x"], []) == pytest.approx(1.0)

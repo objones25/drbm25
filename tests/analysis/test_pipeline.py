@@ -12,15 +12,15 @@ def test_pipeline_writes_all_outputs(
     out = tmp_path / "metrics"
     run_pipeline_small(db, out)
 
-    for name in [
+    expected = [
         "sample_metrics.parquet",
         "query_metrics.parquet",
         "cross_policy.parquet",
         "comparisons.json",
         "lexical.json",
         "variance.json",
-    ]:
-        assert (out / name).is_file(), name
+    ]
+    assert [n for n in expected if not (out / n).is_file()] == []
     assert pq.read_table(out / "sample_metrics.parquet").num_rows == 2 + 3 * 2 * 4
     assert pq.read_table(out / "query_metrics.parquet").num_rows == 2 + 3 * 2
 

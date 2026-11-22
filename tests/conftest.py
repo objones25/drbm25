@@ -291,7 +291,7 @@ def seeded_generator():
 def seed_worker() -> Callable[[int], None]:
     """worker_init_fn for DataLoader. Straight from the PyTorch docs.
 
-        DataLoader(ds, num_workers=2, worker_init_fn=seed_worker, generator=g)
+    DataLoader(ds, num_workers=2, worker_init_fn=seed_worker, generator=g)
     """
     torch = pytest.importorskip("torch")
 

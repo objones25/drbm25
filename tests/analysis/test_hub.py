@@ -88,8 +88,8 @@ def test_upload_rejects_another_users_namespace(db: Path, metrics_dir: Path) -> 
 def test_dataset_card_lists_sources_models_and_schema(db: Path) -> None:
     card = dataset_card(read_db(db), repo_id="objones25/drbm25-rewrites")
 
-    for text in ("untrained", "trained-normal", "trained-count_once", "original", "think_text", "ndcg_count_once"):
-        assert text in card
+    wanted = ("untrained", "trained-normal", "trained-count_once", "original", "think_text", "ndcg_count_once")
+    assert [t for t in wanted if t not in card] == []
     assert card.startswith("---\n")
     assert "license:" in card
 

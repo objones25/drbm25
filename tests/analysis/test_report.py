@@ -67,8 +67,8 @@ def test_log_analysis_logs_tables_figures_scalars_and_artifact(
     assert opened["job_type"] == "analysis"
     assert opened["run_name"] == "rewrite-analysis"
     logged = {k: v for row in run.logged for k, v in row.items()}
-    for key in ("tables/query_metrics", "tables/comparisons", "tables/browse", "figures/ndcg_ecdf"):
-        assert key in logged, key
+    wanted = ("tables/query_metrics", "tables/comparisons", "tables/browse", "figures/ndcg_ecdf")
+    assert [k for k in wanted if k not in logged] == []
     assert isinstance(logged["tables/browse"], wandb.Table)
     assert len(logged["tables/browse"].data) == 6
     assert any(k.startswith("summary/trained-normal/") for k in run.summary)

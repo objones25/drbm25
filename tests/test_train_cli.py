@@ -704,8 +704,17 @@ def test_cli_best_weights_are_the_actor_adapter_at_the_best_step(
 
     _scripted_validation(monkeypatch, {1: 0.2, 2: 0.5, 3: 0.4}, {1: 0.0, 2: 0.0, 3: 0.0})
     argv = _argv(
-        workdir, toy_index, "w", "--until-step", "3", "--set", "run.val_every=1", "--set", "run.ckpt_every=1",
-        "--set", "run.keep_ckpts=5",
+        workdir,
+        toy_index,
+        "w",
+        "--until-step",
+        "3",
+        "--set",
+        "run.val_every=1",
+        "--set",
+        "run.ckpt_every=1",
+        "--set",
+        "run.keep_ckpts=5",
     )
     assert _main(argv) == EXIT_OK
     run_dir = workdir / "out" / "w"

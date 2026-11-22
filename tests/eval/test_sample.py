@@ -89,7 +89,7 @@ def test_clause_overflow_row_has_empty_docs_and_search_error() -> None:
     over = rows[0]
     assert over.search_error == "too_many_clauses:count_once"
     assert over.doc_ids_count_once == ()
-    assert over.ndcg_count_once == 0.0
+    assert over.ndcg_count_once == pytest.approx(0.0)
     assert over.doc_ids_normal == ("d:aspirin", "d:boom")
 
 

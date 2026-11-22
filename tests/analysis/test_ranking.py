@@ -18,8 +18,8 @@ def test_rbo_ext_matches_reference_values(a: str, b: str, expected: float) -> No
 
 
 def test_rbo_ext_empty_rule() -> None:
-    assert rbo_ext([], []) == 1.0
-    assert rbo_ext(["a"], []) == 0.0
+    assert rbo_ext([], []) == pytest.approx(1.0)
+    assert rbo_ext(["a"], []) == pytest.approx(0.0)
 
 
 # Uneven lengths (a query that matched fewer than k documents), same reference package.
@@ -43,5 +43,5 @@ def test_rbo_ext_rejects_bad_p() -> None:
 
 def test_jaccard_at_k() -> None:
     assert jaccard_at_k(["a", "b", "c"], ["b", "c", "d"], 2) == pytest.approx(1 / 3)
-    assert jaccard_at_k([], [], 10) == 1.0
-    assert jaccard_at_k(["a"], [], 10) == 0.0
+    assert jaccard_at_k([], [], 10) == pytest.approx(1.0)
+    assert jaccard_at_k(["a"], [], 10) == pytest.approx(0.0)

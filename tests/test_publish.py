@@ -158,7 +158,12 @@ class FakeHub:
         return out
 
     def hf_hub_download(
-        self, repo_id: str, filename: str, *, revision: str | None = None, local_dir: str | Path | None = None,
+        self,
+        repo_id: str,
+        filename: str,
+        *,
+        revision: str | None = None,
+        local_dir: str | Path | None = None,
         force_download: bool = False,
     ) -> str:
         assert revision == self._head()
@@ -284,7 +289,12 @@ def _make_run(
     (resume / "model.safetensors").write_bytes(b"resume weights")
     lora = None
     if layout == "lora":
-        lora = {"rank": _LORA.rank, "alpha": _LORA.alpha, "dropout": _LORA.dropout, "target_modules": list(_LORA.target_modules)}
+        lora = {
+            "rank": _LORA.rank,
+            "alpha": _LORA.alpha,
+            "dropout": _LORA.dropout,
+            "target_modules": list(_LORA.target_modules),
+        }
     write_manifest(
         run_dir,
         {
@@ -306,7 +316,11 @@ def _make_run(
     source = f"trained-{mode}"
     records = [_record("1", 0.5, 0.25, source), _record("2", 0.25, 0.5, source)]  # means 0.3750 / 0.3750
     records.append(_record("3", 0.0, 0.0, source))  # means 0.2500 / 0.2500
-    header = {"source": source, "trained_steps": 50, "best": {"step": step if eval_best_step is None else eval_best_step}}
+    header = {
+        "source": source,
+        "trained_steps": 50,
+        "best": {"step": step if eval_best_step is None else eval_best_step},
+    }
     write_records(eval_dir / f"{source}.jsonl", records, header=header)
     report = report_override or (
         "Queries: 3\n\n| source | nDCG@10 normal | nDCG@10 count_once | best step | val score | training steps |\n"
@@ -427,7 +441,10 @@ def test_read_only_token_fails_before_any_upload(tmp_path: Path) -> None:
 
 def test_fine_grained_token_needs_repo_write_on_the_user() -> None:
     def who(perms: list[str]) -> dict[str, Any]:
-        token = {"role": "fineGrained", "fineGrained": {"scoped": [{"entity": {"type": "user", "name": "u"}, "permissions": perms}]}}
+        token = {
+            "role": "fineGrained",
+            "fineGrained": {"scoped": [{"entity": {"type": "user", "name": "u"}, "permissions": perms}]},
+        }
         return {"name": "u", "auth": {"accessToken": token}}
 
     assert check_write_access(who(["repo.content.read", "repo.write"])) == "u"
