@@ -51,7 +51,7 @@ def idf_summary(terms: Sequence[str], table: IdfTable) -> tuple[float, float]:
     return sum(values) / len(values), max(values)
 
 
-def _sentence_transformer(model_name: str, revision: str, batch_size: int, device: str | None) -> Encoder:
+def sentence_transformer(model_name: str, revision: str, batch_size: int, device: str | None) -> Encoder:
     from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(model_name, revision=revision, device=device)
@@ -76,7 +76,7 @@ def embed_similarity(
     string is encoded once."""
     if len(originals) != len(rewrites):
         raise ValueError(f"{len(originals)} originals but {len(rewrites)} rewrites")
-    encoder = encode or _sentence_transformer(model_name, revision, batch_size, device)
+    encoder = encode or sentence_transformer(model_name, revision, batch_size, device)
     unique = sorted({*originals, *(r for r in rewrites if r is not None)})
     vectors = np.asarray(encoder(unique), dtype=np.float64)
     if vectors.shape[0] != len(unique):
