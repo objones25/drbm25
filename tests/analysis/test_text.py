@@ -18,9 +18,10 @@ TERMS = st.lists(st.sampled_from(["a", "b", "c", "d", "e"]), max_size=8)
 def test_term_diff_counts_kept_added_dropped_on_sets() -> None:
     diff = term_diff(["heart", "attack", "aspirin", "aspirin"], ["aspirin", "myocardi", "infarct"])
 
-    assert diff == TermDiff(
-        retention=pytest.approx(1 / 3), jaccard=pytest.approx(1 / 4), n_added=2, n_dropped=2, n_kept=1
-    )
+    # 3 original terms, 3 rewrite terms, 1 shared: union 5
+    assert (diff.n_kept, diff.n_added, diff.n_dropped) == (1, 2, 2)
+    assert diff.retention == pytest.approx(1 / 3)
+    assert diff.jaccard == pytest.approx(1 / 5)
 
 
 def test_term_diff_both_empty_is_identical() -> None:
