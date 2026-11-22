@@ -4,7 +4,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import requests
 from huggingface_hub import CommitOperationAdd
+from huggingface_hub.errors import HfHubHTTPError
 
 from drbm25.analysis.hub import dataset_card, upload_database
 from drbm25.eval.sample_db import read_db
@@ -25,6 +27,7 @@ class FakeHub:
     created: list[dict[str, Any]] = field(default_factory=list)
     corrupt: str | None = None
     commits: int = 0
+    commit_failures: int = 0  # the first N commit calls fail with HTTP 503
 
     def whoami(self) -> dict[str, Any]:
         return WHOAMI
@@ -33,6 +36,11 @@ class FakeHub:
         self.created.append({"repo_id": repo_id, **kwargs})
 
     def create_commit(self, repo_id: str, operations: list[CommitOperationAdd], **kwargs: Any) -> _Commit:
+        if self.commit_failures:
+            self.commit_failures -= 1
+            response = requests.Response()
+            response.status_code = 503
+            raise HfHubHTTPError("HTTP 503", response=response)
         assert repo_id == "objones25/drbm25-rewrites"
         assert kwargs["repo_type"] == "dataset"
         for op in operations:
@@ -107,3 +115,14 @@ def test_upload_fails_on_empty_database(tmp_path: Path, metrics_dir: Path) -> No
     (tmp_path / "empty").mkdir()
     with pytest.raises(ValueError, match="no rows"):
         upload_database(tmp_path / "empty", metrics_dir, repo_id="objones25/drbm25-rewrites", api=FakeHub())
+
+
+def test_upload_retries_a_transient_commit_failure(db: Path, metrics_dir: Path) -> None:
+    hub = FakeHub(commit_failures=1)
+    waits: list[float] = []
+
+    marker = upload_database(db, metrics_dir, repo_id="objones25/drbm25-rewrites", api=hub, sleep=waits.append)
+
+    assert marker["commit"] == "sha1"
+    assert len(waits) == 1
+    assert (db / "UPLOADED.json").is_file()

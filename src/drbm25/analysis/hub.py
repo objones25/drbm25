@@ -112,7 +112,13 @@ def upload_database(
         digests = {path: digest(local) for path, local in files.items()}
         _with_retries(lambda: api.create_repo(repo_id, repo_type=REPO_TYPE, private=True, exist_ok=True), sleep=sleep)
         ops = [CommitOperationAdd(path_in_repo=p, path_or_fileobj=str(local)) for p, local in files.items()]
-        commit = api.create_commit(repo_id, ops, commit_message="Upload rewrite sampling database", repo_type=REPO_TYPE)
+        # Retried on network errors: re-committing identical files is harmless, and this runs hours into a pod.
+        commit = _with_retries(
+            lambda: api.create_commit(
+                repo_id, ops, commit_message="Upload rewrite sampling database", repo_type=REPO_TYPE
+            ),
+            sleep=sleep,
+        )
         revision = commit.oid
         logger.info("committed %d files to %s at %s; verifying", len(files), repo_id, revision)
         problems = []
