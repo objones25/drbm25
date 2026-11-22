@@ -3,7 +3,6 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from drbm25.reward import (
-    think_text,
     REWARD_FORMAT_ERROR,
     FormatError,
     FormatErrorReason,
@@ -11,6 +10,7 @@ from drbm25.reward import (
     compute_reward,
     ndcg_at_k,
     parse_response,
+    think_text,
 )
 
 R = FormatErrorReason
