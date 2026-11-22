@@ -692,6 +692,30 @@ bootstrap() {
   grep -q '^DELETE https://api.runpod.io/v2/pods/pod123$' "$STUB_DIR/calls.log"
 }
 
+@test "pod_bootstrap.sh runs the entry script named by DRBM25_ENTRY" {
+  make_fixture_repo
+  printf '#!/usr/bin/env bash\necho "entry=sampling noninteractive=$DRBM25_NONINTERACTIVE" >>"$STUB_DIR/run_all.out"\n' \
+    >"$FIXTURE_REPO/scripts/runpod/run_sampling.sh"
+  git -C "$FIXTURE_REPO" add -A
+  git -C "$FIXTURE_REPO" -c user.name=t -c user.email=t@t commit -q -m sampling
+  run -0 bootstrap DRBM25_ENTRY=scripts/runpod/run_sampling.sh
+  grep -qx 'entry=sampling noninteractive=1' "$STUB_DIR/run_all.out"
+  ! grep -q '^version=' "$STUB_DIR/run_all.out"
+}
+
+@test "pod_bootstrap.sh refuses a DRBM25_ENTRY outside scripts/runpod/*.sh and terminates" {
+  make_fixture_repo
+  run -1 bootstrap DRBM25_ENTRY='scripts/runpod/../../VERSION'
+  [[ ! -f $STUB_DIR/run_all.out ]]
+  grep -q '^DELETE https://api.runpod.io/v2/pods/pod123$' "$STUB_DIR/calls.log"
+}
+
+@test "pod_bootstrap.sh refuses a DRBM25_ENTRY that does not exist in the checkout" {
+  make_fixture_repo
+  run -1 bootstrap DRBM25_ENTRY=scripts/runpod/missing.sh
+  [[ ! -f $STUB_DIR/run_all.out ]]
+}
+
 # ---------------------------------------------------------------- fix round 1
 
 @test "--stop --yes terminates without asking" {
