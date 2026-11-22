@@ -10,7 +10,12 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final, get_args
+
+from drbm25.config import ScoringMode
+
+if TYPE_CHECKING:
+    from drbm25.bm25.searcher import SearchResult
 
 SOURCE_ORIGINAL: Final = "original"
 SOURCE_UNTRAINED: Final = "untrained"
@@ -47,6 +52,13 @@ class QueryRecord:
 
 
 _HEADER_KEY: Final = "header"
+_MODES: Final[tuple[ScoringMode, ...]] = get_args(ScoringMode)
+
+
+def search_error_label(results: Mapping[ScoringMode, SearchResult | None]) -> str | None:
+    """``"too_many_clauses:<mode>[,<mode>]"`` naming the modes whose search overflowed (None result), else None."""
+    overflowed = [mode for mode in _MODES if results[mode] is None]
+    return f"too_many_clauses:{','.join(overflowed)}" if overflowed else None
 
 
 def write_records(path: Path, records: Sequence[QueryRecord], *, header: Mapping[str, Any] | None = None) -> None:

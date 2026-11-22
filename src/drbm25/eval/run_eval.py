@@ -48,6 +48,7 @@ from drbm25.eval.records import (
     SOURCE_ORIGINAL,
     SOURCE_UNTRAINED,
     QueryRecord,
+    search_error_label,
     write_records,
 )
 from drbm25.manifest import collect_environment, config_sha256
@@ -76,11 +77,6 @@ _MODES: Final[tuple[ScoringMode, ...]] = get_args(ScoringMode)
 _SOURCE_CHECKPOINT: Final = "checkpoint"
 
 
-def _search_error(results: dict[ScoringMode, SearchResult | None]) -> str | None:
-    overflowed = [mode for mode in _MODES if results[mode] is None]
-    return f"too_many_clauses:{','.join(overflowed)}" if overflowed else None
-
-
 def _ndcg(result: SearchResult | None, example: Example, k: int) -> float:
     return 0.0 if result is None else ndcg_at_k(result.doc_ids, example.relevant_ids, k)
 
@@ -104,7 +100,7 @@ def score_original(examples: Sequence[Example], searcher: Searcher, *, k: int) -
                 terms=tuple(searcher.analyze(example.query)),
                 ndcg_normal=_ndcg(row["normal"], example, k),
                 ndcg_count_once=_ndcg(row["count_once"], example, k),
-                search_error=_search_error(row),
+                search_error=search_error_label(row),
             )
         )
     return records
@@ -126,7 +122,7 @@ def score_rewrites(
         think_chars: int | None = None
         if isinstance(parsed, ParsedRewrite):
             rewrite_text, format_error = parsed.query, None
-            terms, error = tuple(searcher.analyze(parsed.query)), _search_error(row)
+            terms, error = tuple(searcher.analyze(parsed.query)), search_error_label(row)
             think_chars = think_length_chars(batch.response_text[i])
         else:
             rewrite_text, format_error, terms, error = batch.response_text[i], parsed.reason.value, (), None
@@ -219,7 +215,9 @@ def _build_best_engine(cfg: Config, path: Path, device: torch.device) -> tuple[H
     if meta.layout != cfg.model.train_mode:
         raise ValueError(f"{path} holds a layout '{meta.layout}' policy; use a config with train_mode '{meta.layout}'")
     source = trained_source(meta.reward_mode)
-    logger.info("loaded best policy %s (step %d, %s = %.4f, %s)", path, meta.step, meta.selection_metric, meta.score, source)
+    logger.info(
+        "loaded best policy %s (step %d, %s = %.4f, %s)", path, meta.step, meta.selection_metric, meta.score, source
+    )
     tokenizer = build_tokenizer(cfg)
     check_tokenizer(tokenizer)
     if meta.layout == "full":
