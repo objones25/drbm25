@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 MODEL_SOURCES: Final = (SOURCE_UNTRAINED, SOURCE_TRAINED_NORMAL, SOURCE_TRAINED_COUNT_ONCE)
 PRIMARY_PAIR: Final = (SOURCE_TRAINED_NORMAL, SOURCE_TRAINED_COUNT_ONCE)
 PRIMARY_METRICS: Final = ("ndcg_normal_mean", "ndcg_count_once_mean")
-BEST_OF_K: Final = (1, 2, 4, 8, 16)
+BEST_OF_K: Final = (2, 4, 8, 16)  # k = 1 is the mean, already ndcg_normal_mean
 PAIRWISE_RBO_SAMPLES: Final = 8
 RANK_DEPTH: Final = 10
 FIGHTIN_TOP: Final = 30
@@ -139,7 +139,12 @@ def sample_metrics(
 
 # ---------------------------------------------------------------- per query
 
-_NOT_AVERAGED: Final = frozenset({"source", "qid", "query_index", "sample_index", "rewrite_class"})
+# ndcg_* are averaged once, as ndcg_*_mean; averaging them again would repeat the primary metric.
+_NOT_AVERAGED: Final = frozenset(
+    {"source", "qid", "query_index", "sample_index", "rewrite_class", "ndcg_normal", "ndcg_count_once"}
+)
+# Within-query metrics that are constant for the single original row: comparing them with it says nothing.
+_ACROSS_SAMPLES: Final = ("distinct_fraction", "vendi_jaccard", "pairwise_rbo", "best_of_")
 
 
 def _mean_or_none(values: Sequence[float | int | None]) -> float | None:
@@ -229,8 +234,8 @@ def comparisons(per_query: Sequence[dict[str, Any]], *, n_resamples: int) -> lis
         for a, b in pairs:
             if not table[metric].get(a) or not table[metric].get(b):
                 continue
-            if a == SOURCE_ORIGINAL and metric.endswith("_std"):
-                continue  # one sample per query: no spread
+            if a == SOURCE_ORIGINAL and (metric.endswith("_std") or metric.startswith(_ACROSS_SAMPLES)):
+                continue  # one row per query: no spread and no within-query diversity
             try:
                 cmp = paired_compare(
                     table[metric][a], table[metric][b], metric=metric, a=a, b=b, n_resamples=n_resamples

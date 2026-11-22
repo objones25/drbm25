@@ -135,7 +135,7 @@ def rows_for_responses(
                 search_error=search_error,
                 model_id=model_id,
                 model_revision=model_revision,
-                seed=None if seeds[i] is None else seeds[i] + j,  # the seed vLLM used for this sample
+                seed=None if (query_seed := seeds[i]) is None else query_seed + j,  # the seed vLLM used
             )
         )
     return rows

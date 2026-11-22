@@ -50,7 +50,8 @@ def test_pipeline_per_query_best_of_k_and_diversity(
     rows = pq.read_table(out / "query_metrics.parquet").to_pylist()
     q = next(r for r in rows if r["source"] == "trained-normal" and r["qid"] == "q0")
     assert q["ndcg_normal_mean"] == pytest.approx(0.4 + 0.15)
-    assert q["best_of_1"] == pytest.approx(0.55)
+    assert "best_of_1" not in q  # identical to the mean
+    assert q["best_of_2"] == pytest.approx((0.5 * 1 + 0.6 * 2 + 0.7 * 3) / 6)
     assert q["best_of_4"] == pytest.approx(0.7)
     assert q["distinct_fraction"] == pytest.approx(3 / 4)
 
@@ -94,3 +95,26 @@ def test_pipeline_requires_original_rows(
         p.unlink()
     with pytest.raises(ValueError, match="original"):
         run_pipeline_small(db, tmp_path / "metrics")
+
+
+def test_pipeline_primary_ndcg_is_not_repeated_in_the_secondary_family(
+    db: Path, tmp_path: Path, run_pipeline_small: Callable[[Path, Path], None]
+) -> None:
+    out = tmp_path / "metrics"
+    run_pipeline_small(db, out)
+
+    comps = json.loads((out / "comparisons.json").read_text())
+    metrics = {c["metric"] for c in comps}
+    assert not metrics & {"mean_ndcg_normal", "mean_ndcg_count_once", "best_of_1"}
+
+
+def test_pipeline_does_not_compare_diversity_of_the_single_original_row(
+    db: Path, tmp_path: Path, run_pipeline_small: Callable[[Path, Path], None]
+) -> None:
+    out = tmp_path / "metrics"
+    run_pipeline_small(db, out)
+
+    comps = json.loads((out / "comparisons.json").read_text())
+    original = {c["metric"] for c in comps if c["a"] == "original"}
+    assert "ndcg_normal_mean" in original
+    assert not original & {"distinct_fraction", "vendi_jaccard", "pairwise_rbo", "best_of_2", "best_of_4"}
