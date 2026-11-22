@@ -77,11 +77,19 @@ def parse_response(response_text: str) -> ParsedRewrite | FormatError:
     return ParsedRewrite(query)
 
 
+def think_text(response_text: str) -> str | None:
+    """The reasoning (stripped) before the single ``</think>``; None unless there is exactly one."""
+    if response_text.count(_THINK_CLOSE) != 1:
+        return None
+    return response_text[: response_text.find(_THINK_CLOSE)].strip()
+
+
 def think_length_chars(response_text: str) -> int:
     """Characters of the reasoning (stripped) before the single ``</think>`` of a well-formed response."""
-    if response_text.count(_THINK_CLOSE) != 1:
+    text = think_text(response_text)
+    if text is None:
         raise ValueError(f"expected exactly one {_THINK_CLOSE} in the response")
-    return len(response_text[: response_text.find(_THINK_CLOSE)].strip())
+    return len(text)
 
 
 def ndcg_at_k(ranked_ids: Sequence[str], relevant_ids: frozenset[str], k: int) -> float:

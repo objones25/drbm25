@@ -3,6 +3,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from drbm25.reward import (
+    think_text,
     REWARD_FORMAT_ERROR,
     FormatError,
     FormatErrorReason,
@@ -123,3 +124,15 @@ def test_reward_requires_ndcg_for_parsed():
 def test_reward_rejects_out_of_range_ndcg(bad):
     with pytest.raises(ValueError, match="ndcg"):
         compute_reward(ParsedRewrite("q"), bad)
+
+
+def test_think_text_returns_stripped_reasoning():
+    assert think_text('  plan here \n</think>\n<answer>{"query": "x"}</answer>') == "plan here"
+
+
+def test_think_text_none_without_close_tag():
+    assert think_text('no tags <answer>{"query": "x"}</answer>') is None
+
+
+def test_think_text_none_with_two_close_tags():
+    assert think_text("a</think>b</think>") is None
