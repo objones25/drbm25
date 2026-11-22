@@ -1,4 +1,5 @@
 import json
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -201,3 +202,26 @@ def test_cli_rejects_unknown_source(workdir: Path) -> None:
 def test_cli_rejects_more_samples_than_the_seed_stride() -> None:
     with pytest.raises(SystemExit):
         main(["--config", str(SMOKE), "--out-dir", "x", "--source", "untrained", "--n", "1025"])
+
+
+def test_build_llm_runs_the_vllm_engine_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The sampler starts the JVM (BM25) first; training runs vLLM's engine in-process next to it, so does this.
+    seen: dict[str, Any] = {}
+
+    class FakeVllm:
+        SamplingParams = dict
+
+        @staticmethod
+        def LLM(**kwargs: Any) -> str:
+            seen["env"] = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING")
+            seen.update(kwargs)
+            return "llm"
+
+    monkeypatch.delenv("VLLM_ENABLE_V1_MULTIPROCESSING", raising=False)
+    monkeypatch.setattr(sample_mod.importlib, "import_module", lambda name: {"vllm": FakeVllm}[name])
+
+    llm, make = sample_mod._build_llm("m", "sha", load_config(SMOKE), 7)
+
+    assert (llm, make) == ("llm", dict)
+    assert seen["env"] == "0"
+    assert (seen["model"], seen["revision"], seen["seed"]) == ("m", "sha", 7)

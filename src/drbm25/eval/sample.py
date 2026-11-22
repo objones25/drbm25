@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import logging
+import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -240,7 +241,11 @@ def generate_samples(
 
 
 def _build_llm(model: str, revision: str, cfg: Config, seed: int) -> tuple[Any, Callable[..., Any]]:
-    """A standalone vLLM engine for ``model`` at ``revision`` and its SamplingParams class."""
+    """A standalone vLLM engine for ``model`` at ``revision`` and its SamplingParams class.
+
+    The engine runs in this process (``VLLM_ENABLE_V1_MULTIPROCESSING=0``), as in training: the JVM (BM25) is
+    already running here, and training ran vLLM in-process next to it; a forked engine process would not."""
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     vllm = importlib.import_module("vllm")
     llm = vllm.LLM(
         model=model,
