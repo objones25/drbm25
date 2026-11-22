@@ -40,14 +40,14 @@ uv_calls() { grep '^uv ' "$CALLS" | sed 's/^uv //'; }
   while IFS= read -r line; do calls+=("$line"); done < <(uv_calls)
   [[ ${calls[0]} == "python -m drbm25.eval.sample "*"--source original --n 8 --out-dir $DRBM25_ROOT/samples/pilot "*"--limit 64" ]]
   [[ ${calls[3]} == *"--source trained-count_once --n 8 --out-dir $DRBM25_ROOT/samples/pilot "*"--limit 64" ]]
-  [[ ${calls[4]} == *"--source original --n 32 --out-dir $DRBM25_ROOT/samples/db "* ]]
-  [[ ${calls[5]} == *"--source untrained --n 32 "* ]]
-  [[ ${calls[6]} == *"--source trained-normal --n 32 "* ]]
-  [[ ${calls[7]} == *"--source trained-count_once --n 32 "* ]]
-  [[ ${calls[4]} != *"--limit"* ]]
-  [[ ${calls[8]} == "python -m drbm25.analysis.pipeline --db $DRBM25_ROOT/samples/db --index-dir $DRBM25_ROOT/indexes --out $DRBM25_ROOT/samples/metrics"* ]]
-  [[ ${calls[9]} == "python -m drbm25.analysis.hub --db $DRBM25_ROOT/samples/db --metrics $DRBM25_ROOT/samples/metrics --repo objones25/drbm25-rewrites" ]]
-  [[ ${calls[10]} == "python -m drbm25.analysis.report --metrics $DRBM25_ROOT/samples/metrics --db $DRBM25_ROOT/samples/db "* ]]
+  [[ ${calls[5]} == *"--source original --n 32 --out-dir $DRBM25_ROOT/samples/db "* ]]
+  [[ ${calls[6]} == *"--source untrained --n 32 "* ]]
+  [[ ${calls[7]} == *"--source trained-normal --n 32 "* ]]
+  [[ ${calls[8]} == *"--source trained-count_once --n 32 "* ]]
+  [[ ${calls[5]} != *"--limit"* ]]
+  [[ ${calls[9]} == "python -m drbm25.analysis.pipeline --db $DRBM25_ROOT/samples/db --index-dir $DRBM25_ROOT/indexes --out $DRBM25_ROOT/samples/metrics"* ]]
+  [[ ${calls[10]} == "python -m drbm25.analysis.hub --db $DRBM25_ROOT/samples/db --metrics $DRBM25_ROOT/samples/metrics --repo objones25/drbm25-rewrites" ]]
+  [[ ${calls[11]} == "python -m drbm25.analysis.report --metrics $DRBM25_ROOT/samples/metrics --db $DRBM25_ROOT/samples/db "* ]]
   [[ $(tail -1 "$CALLS") == terminate ]]
   [[ ! -f $DRBM25_ROOT/samples/FAILED ]]
 }
@@ -60,7 +60,7 @@ uv_calls() { grep '^uv ' "$CALLS" | sed 's/^uv //'; }
 @test "SAMPLE_N, PILOT_N, PILOT_LIMIT and SAMPLE_HUB_REPO override the defaults" {
   run -0 run_main SAMPLE_N=4 PILOT_N=2 PILOT_LIMIT=5 SAMPLE_HUB_REPO=objones25/other
   uv_calls | sed -n 1p | grep -q -- '--n 2 .*--limit 5'
-  uv_calls | sed -n 5p | grep -q -- '--n 4 '
+  uv_calls | sed -n 6p | grep -q -- '--n 4 '
   uv_calls | grep -q -- '--repo objones25/other'
 }
 
@@ -104,4 +104,18 @@ uv_calls() { grep '^uv ' "$CALLS" | sed 's/^uv //'; }
 @test "NO_TERMINATE=1 keeps the pod" {
   run -0 run_main NO_TERMINATE=1
   ! grep -qx terminate "$CALLS"
+}
+
+@test "the metrics pipeline runs on the pilot data before the full run, so a metrics crash shows up early" {
+  run -0 run_main
+  local calls=() line
+  while IFS= read -r line; do calls+=("$line"); done < <(uv_calls)
+  [[ ${calls[4]} == "python -m drbm25.analysis.pipeline --db $DRBM25_ROOT/samples/pilot --index-dir $DRBM25_ROOT/indexes --out $DRBM25_ROOT/samples/pilot-metrics "* ]]
+  [[ ${calls[5]} == *"--source original --n 32 "* ]]
+}
+
+@test "a pilot metrics failure stops the run before the full sampling" {
+  run -1 run_main FAIL_ON="--out $DRBM25_ROOT/samples/pilot-metrics"
+  [[ -f $DRBM25_ROOT/samples/FAILED ]]
+  ! uv_calls | grep -q -- '--n 32'
 }

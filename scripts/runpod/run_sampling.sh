@@ -6,7 +6,8 @@
 # DRBM25_ENTRY=scripts/runpod/run_sampling.sh), resuming from /workspace/drbm25/samples where it left off.
 #
 # Stages: settings, java and uv, uv sync (vllm + analysis extras), pilot (SAMPLE sources at PILOT_N samples on the
-# first PILOT_LIMIT queries, into samples/pilot), sample (all queries at SAMPLE_N into samples/db), metrics, hub,
+# first PILOT_LIMIT queries, into samples/pilot), pilot metrics (the metrics pipeline on the pilot, a smoke test),
+# sample (all queries at SAMPLE_N into samples/db), metrics, hub,
 # report. A failed report does not fail the run: the database is already on the Hub.
 #
 # Environment: HF_TOKEN and WANDB_API_KEY (RunPod secrets), WANDB_PROJECT (default drbm25), SAMPLE_N (32),
@@ -104,6 +105,11 @@ main() {
   for source in "${SAMPLE_SOURCES[@]}"; do
     sample_source "$source" "$PILOT_N" "$SAMPLES_DIR/pilot" --limit "$PILOT_LIMIT"
   done
+  stage "pilot metrics"
+  # Fast settings (few resamples and permutations): this only proves the metrics run on real rows before the
+  # hours of full sampling; the full run's metrics come later.
+  _uv_timeout "$METRICS_TIMEOUT_S" python -m drbm25.analysis.pipeline --db "$SAMPLES_DIR/pilot" \
+    --index-dir "$DRBM25_INDEX_DIR" --out "$SAMPLES_DIR/pilot-metrics" --n-resamples 200 --c2st-permutations 20
   stage sample
   for source in "${SAMPLE_SOURCES[@]}"; do
     sample_source "$source" "$SAMPLE_N" "$SAMPLES_DIR/db"
