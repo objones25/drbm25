@@ -1,28 +1,61 @@
 """Sample every query N times from a policy, parse and score each response, and store the rows.
 
-Library part: turning generated texts into :class:`~drbm25.eval.sample_db.SampleRow` rows with the training
-parser and scorer (``parse_response`` / ``score_responses``), so the database holds exactly what the policies
-were rewarded for.
+CLI: ``python -m drbm25.eval.sample --config PATH --source SOURCE --n N --out-dir DIR [--model REPO]
+[--limit N] [--shard-size Q] [--base-seed S] [--set key=value ...]``. Rows go to ``DIR/<source>/shard-<k>.parquet``
+(``drbm25.eval.sample_db``); a rerun skips complete shards, so a crashed run resumes.
+
+Responses are parsed and scored with the training parser and scorer (``parse_response`` /
+``score_responses``), and sampled with the training rollout settings (``sampling_kwargs``: temperature, top-p 1,
+no top-k, the training max_new_tokens) from the training prompt and tokenizer, so the database holds what the
+policies actually do. Each query's seed is ``base_seed * 1_000_003 + query_index`` for every source (common
+random numbers across policies). ``sum_logprob`` is vLLM's log-probability of each sampled token under the raw
+(temperature 1) model distribution, summed over the response.
 """
 
 from __future__ import annotations
 
+import argparse
+import importlib
 import logging
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Final, get_args
+from pathlib import Path
+from typing import Any, Final, get_args
 
-from drbm25.bm25.searcher import SearchResult
-from drbm25.config import ScoringMode
-from drbm25.data import Example
-from drbm25.eval.records import SOURCE_ORIGINAL, search_error_label
-from drbm25.eval.sample_db import SampleRow
+from huggingface_hub import HfApi
+from transformers import PreTrainedTokenizerBase
+
+from drbm25.bm25.searcher import Bm25Searcher, SearchResult
+from drbm25.config import Config, RolloutCfg, ScoringMode, load_config
+from drbm25.data import DEV_FILE, Example, load_examples
+from drbm25.eval.records import (
+    SOURCE_ORIGINAL,
+    SOURCE_TRAINED_COUNT_ONCE,
+    SOURCE_TRAINED_NORMAL,
+    SOURCE_UNTRAINED,
+    search_error_label,
+)
+from drbm25.eval.sample_db import SampleRow, shard_complete, write_shard
+from drbm25.obs import configure
 from drbm25.ppo.trainer import Searcher, score_responses, search_all
+from drbm25.prompt import build_prompt
 from drbm25.reward import FormatError, ParsedRewrite, ndcg_at_k, think_text
+from drbm25.rollout.base import encode_prompts, special_ids
+from drbm25.rollout.vllm_engine import sampling_kwargs
+from drbm25.train import build_tokenizer, check_index, check_java
 
 logger = logging.getLogger(__name__)
 
 _MODES: Final[tuple[ScoringMode, ...]] = get_args(ScoringMode)
+SAMPLE_SOURCES: Final = (SOURCE_ORIGINAL, SOURCE_UNTRAINED, SOURCE_TRAINED_NORMAL, SOURCE_TRAINED_COUNT_ONCE)
+# The verified uploads of the two training runs (runs/<mode>/UPLOADED.json on the volume).
+DEFAULT_MODELS: Final = {
+    SOURCE_TRAINED_NORMAL: "objones25/drbm25-qwen2.5-3b-normal",
+    SOURCE_TRAINED_COUNT_ONCE: "objones25/drbm25-qwen2.5-3b-count_once",
+}
+SEED_STRIDE: Final = 1_000_003
+VLLM_GPU_MEMORY_UTILIZATION: Final = 0.85  # inference only: nothing else shares the GPU
 
 
 @dataclass(frozen=True)
@@ -148,3 +181,185 @@ def original_rows(
             )
         )
     return rows
+
+
+# ---------------------------------------------------------------- generation
+
+
+def _completion_sample(completion: Any, eos: int, tokenizer: PreTrainedTokenizerBase) -> GeneratedText:
+    tokens = list(completion.token_ids)
+    end = tokens.index(eos) + 1 if eos in tokens else len(tokens)
+    kept = tokens[:end]
+    sum_logprob = None
+    if completion.logprobs is not None:
+        sum_logprob = float(sum(step[tok].logprob for step, tok in zip(completion.logprobs[:end], kept, strict=True)))
+    return GeneratedText(
+        text=tokenizer.decode(kept, skip_special_tokens=True),
+        n_tokens=len(kept),
+        hit_max_tokens=eos not in tokens,
+        sum_logprob=sum_logprob,
+    )
+
+
+def generate_samples(
+    llm: Any,
+    tokenizer: PreTrainedTokenizerBase,
+    prompts: Sequence[str],
+    seeds: Sequence[int],
+    cfg: RolloutCfg,
+    *,
+    n: int,
+    make_sampling_params: Callable[..., Any],
+) -> list[list[GeneratedText]]:
+    """``n`` samples per prompt with the training rollout sampling settings, one seed per prompt."""
+    if len(prompts) != len(seeds):
+        raise ValueError(f"{len(prompts)} prompts but {len(seeds)} seeds")
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+    ids = special_ids(tokenizer)
+    import torch
+
+    prompt_ids, prompt_mask = encode_prompts(
+        tokenizer, prompts, torch.device("cpu"), max_prompt_tokens=cfg.max_prompt_tokens
+    )
+    requests = [{"prompt_token_ids": row[m.bool()].tolist()} for row, m in zip(prompt_ids, prompt_mask, strict=True)]
+    base = sampling_kwargs(cfg, greedy=False, eos_id=ids.eos)
+    params = [make_sampling_params(**{**base, "n": n, "logprobs": 0, "seed": seed}) for seed in seeds]
+    outputs = llm.generate(requests, sampling_params=params, use_tqdm=False)
+    if len(outputs) != len(requests):
+        raise RuntimeError(f"vLLM returned {len(outputs)} outputs for {len(requests)} prompts")
+    result = []
+    for out in outputs:
+        if len(out.outputs) != n:
+            raise RuntimeError(f"vLLM returned {len(out.outputs)} completions, expected n={n}")
+        result.append([_completion_sample(c, ids.eos, tokenizer) for c in out.outputs])
+    return result
+
+
+def _build_llm(model: str, revision: str, cfg: Config, seed: int) -> tuple[Any, Callable[..., Any]]:
+    """A standalone vLLM engine for ``model`` at ``revision`` and its SamplingParams class."""
+    vllm = importlib.import_module("vllm")
+    llm = vllm.LLM(
+        model=model,
+        revision=revision,
+        tokenizer_revision=revision,
+        dtype="bfloat16",
+        seed=seed,
+        gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
+        max_model_len=cfg.rollout.max_prompt_tokens + cfg.rollout.max_new_tokens,
+        generation_config="vllm",
+    )
+    return llm, vllm.SamplingParams
+
+
+def _resolve_revision(model: str, revision: str | None) -> str:
+    """A pinned revision as given, else the Hub repo's current commit sha (recorded in every row)."""
+    if revision is not None:
+        return revision
+    sha = HfApi().model_info(model).sha
+    if not sha:
+        raise RuntimeError(f"could not resolve a commit sha for {model}")
+    return sha
+
+
+def _model_for(source: str, override: str | None, cfg: Config) -> tuple[str, str | None]:
+    if source == SOURCE_UNTRAINED:
+        return (override, None) if override else (cfg.model.name, cfg.model.revision)
+    return override or DEFAULT_MODELS[source], None
+
+
+# ---------------------------------------------------------------- CLI
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Sample dev queries N times from a policy into Parquet shards.")
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--source", choices=SAMPLE_SOURCES, required=True)
+    parser.add_argument("--n", type=int, required=True, help="samples per query (ignored for original)")
+    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--model", default=None, help="model repo or path (default: per source)")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--shard-size", type=int, default=128, help="queries per shard")
+    parser.add_argument("--base-seed", type=int, default=1234)
+    parser.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE")
+    ns = parser.parse_args(argv)
+    if ns.n < 1 or ns.shard_size < 1:
+        parser.error("--n and --shard-size must be >= 1")
+    overrides: dict[str, str] = {}
+    for item in ns.overrides:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            parser.error(f"--set expects key=value, got {item!r}")
+        overrides[key] = value
+    ns.overrides = overrides
+    return ns
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    ns = _parse_args(argv)
+    configure(level="INFO", fmt="json")
+    cfg = load_config(ns.config, ns.overrides)
+    check_java()
+    check_index(cfg)
+    r = cfg.retrieval
+    searcher = Bm25Searcher(r.index_dir, k1=r.k1, b=r.b, threads=r.search_threads, timeout_s=r.search_timeout_s)
+    examples = load_examples(cfg.data.data_dir / DEV_FILE)[: ns.limit]
+    out = ns.out_dir / ns.source
+    shards = [(start, examples[start : start + ns.shard_size]) for start in range(0, len(examples), ns.shard_size)]
+    pending = [(k, start, chunk) for k, (start, chunk) in enumerate(shards) if not shard_complete(_shard(out, k))]
+    logger.info("%s: %d queries in %d shards, %d to do", ns.source, len(examples), len(shards), len(pending))
+    if not pending:
+        return 0
+    if ns.source == SOURCE_ORIGINAL:
+        for k, start, chunk in pending:
+            indices = list(range(start, start + len(chunk)))
+            write_shard(_shard(out, k), original_rows(chunk, indices, searcher, k=r.eval_k))
+        return 0
+    model, pinned = _model_for(ns.source, ns.model, cfg)
+    revision = _resolve_revision(model, pinned)
+    logger.info("sampling %s from %s@%s, n=%d", ns.source, model, revision, ns.n)
+    llm, make_sampling_params = _build_llm(model, revision, cfg, ns.base_seed)
+    tokenizer = build_tokenizer(cfg)
+    for k, start, chunk in pending:
+        t0 = time.perf_counter()
+        indices = list(range(start, start + len(chunk)))
+        seeds = [ns.base_seed * SEED_STRIDE + i for i in indices]
+        gens = generate_samples(
+            llm,
+            tokenizer,
+            [build_prompt(e.query) for e in chunk],
+            seeds,
+            cfg.rollout,
+            n=ns.n,
+            make_sampling_params=make_sampling_params,
+        )
+        rows = rows_for_responses(
+            chunk,
+            indices,
+            gens,
+            searcher,
+            source=ns.source,
+            k=r.eval_k,
+            model_id=model,
+            model_revision=revision,
+            seeds=seeds,
+        )
+        write_shard(_shard(out, k), rows)
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "shard %d: %d queries, %d samples in %.1fs (%.1f samples/s)",
+            k,
+            len(chunk),
+            len(rows),
+            elapsed,
+            len(rows) / elapsed,
+        )
+    return 0
+
+
+def _shard(out: Path, k: int) -> Path:
+    return out / f"shard-{k:05d}.parquet"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
