@@ -7,9 +7,10 @@ CLI: ``python -m drbm25.eval.sample --config PATH --source SOURCE --n N --out-di
 Responses are parsed and scored with the training parser and scorer (``parse_response`` /
 ``score_responses``), and sampled with the training rollout settings (``sampling_kwargs``: temperature, top-p 1,
 no top-k, the training max_new_tokens) from the training prompt and tokenizer, so the database holds what the
-policies actually do. Each query's seed is ``base_seed * 1_000_003 + query_index`` for every source (common
-random numbers across policies). ``sum_logprob`` is vLLM's log-probability of each sampled token under the raw
-(temperature 1) model distribution, summed over the response.
+policies actually do. Each query's request seed is ``base_seed * 1_000_003 + query_index * 1024`` for every source
+(common random numbers across policies); vLLM seeds sample j with that + j, so seeds never overlap between queries
+(n <= 1024), and each row stores the seed its sample used. ``sum_logprob`` is vLLM's log-probability of each
+sampled token under the raw (temperature 1) model distribution, summed over the response.
 """
 
 from __future__ import annotations
@@ -55,6 +56,8 @@ DEFAULT_MODELS: Final = {
     SOURCE_TRAINED_COUNT_ONCE: "objones25/drbm25-qwen2.5-3b-count_once",
 }
 SEED_STRIDE: Final = 1_000_003
+# vLLM seeds sample j of an n-sample request with seed + j, so query seeds are spaced wider than any n.
+SEED_QUERY_STRIDE: Final = 1024
 VLLM_GPU_MEMORY_UTILIZATION: Final = 0.85  # inference only: nothing else shares the GPU
 
 
@@ -132,7 +135,7 @@ def rows_for_responses(
                 search_error=search_error,
                 model_id=model_id,
                 model_revision=model_revision,
-                seed=seeds[i],
+                seed=None if seeds[i] is None else seeds[i] + j,  # the seed vLLM used for this sample
             )
         )
     return rows
@@ -285,6 +288,8 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     ns = parser.parse_args(argv)
     if ns.n < 1 or ns.shard_size < 1:
         parser.error("--n and --shard-size must be >= 1")
+    if ns.n > SEED_QUERY_STRIDE:
+        parser.error(f"--n must be <= {SEED_QUERY_STRIDE} (the per-query seed stride)")
     overrides: dict[str, str] = {}
     for item in ns.overrides:
         key, sep, value = item.partition("=")
@@ -323,7 +328,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for k, start, chunk in pending:
         t0 = time.perf_counter()
         indices = list(range(start, start + len(chunk)))
-        seeds = [ns.base_seed * SEED_STRIDE + i for i in indices]
+        seeds = [ns.base_seed * SEED_STRIDE + i * SEED_QUERY_STRIDE for i in indices]
         gens = generate_samples(
             llm,
             tokenizer,

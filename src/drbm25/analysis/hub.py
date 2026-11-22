@@ -66,8 +66,8 @@ tags:
 Sampled query rewrites of the MS MARCO-Science dev queries (DeepRetrieval data) from Qwen2.5-3B-Instruct, before
 and after PPO training with a BM25 nDCG@10 reward (standard vs count-once BM25). One row per sampled response:
 the reasoning (`think_text`), the rewrite, its analyzed terms, the top-10 documents and nDCG@10 under both BM25
-scorers. Sampling used the training settings (temperature 0.6, top-p 1, no top-k, 350 new tokens) with one seed
-per query shared by all policies.
+scorers. Sampling used the training settings (temperature 0.6, top-p 1, no top-k, 350 new tokens); every policy
+used the same seeds for the same query, and `seed` is the seed each sample was drawn with.
 
 ## Sources
 

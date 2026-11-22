@@ -122,3 +122,10 @@ def test_original_rows_score_raw_query() -> None:
 def test_rows_reject_mismatched_lengths() -> None:
     with pytest.raises(ValueError, match="responses"):
         _rows([[_gen(_answer("a"))]])
+
+
+def test_row_seed_is_the_seed_vllm_used_for_that_sample() -> None:
+    # vLLM seeds child j of an n-sample request with seed + j.
+    rows = _rows([[_gen(_answer("a")), _gen(_answer("b")), _gen(_answer("c"))], [_gen(_answer("d"))]])
+
+    assert [(r.query_index, r.sample_index, r.seed) for r in rows] == [(0, 0, 11), (0, 1, 12), (0, 2, 13), (1, 0, 12)]

@@ -168,7 +168,8 @@ def test_cli_model_source_writes_n_rows_per_query_with_provenance(
     assert len(rows) == 6
     assert {r.model_id for r in rows} == {"objones25/drbm25-qwen2.5-3b-normal"}
     assert {r.model_revision for r in rows} == {"resolved-sha"}
-    assert [r.seed for r in rows if r.sample_index == 0] == [1234 * 1_000_003 + i for i in range(3)]
+    # each query's request seed is 1024 apart, so seed + sample_index never reaches the next query's seeds
+    assert [r.seed for r in rows] == [1234 * 1_000_003 + i * 1024 + j for i in range(3) for j in range(2)]
     assert sorted(p.name for p in (out / "trained-normal").glob("shard-*.parquet")) == [
         "shard-00000.parquet",
         "shard-00001.parquet",
@@ -195,3 +196,8 @@ def test_cli_resumes_skipping_complete_shards(workdir: Path, toy_index: Path, fa
 def test_cli_rejects_unknown_source(workdir: Path) -> None:
     with pytest.raises(SystemExit):
         main(["--config", str(SMOKE), "--out-dir", str(workdir / "db"), "--source", "bogus", "--n", "1"])
+
+
+def test_cli_rejects_more_samples_than_the_seed_stride() -> None:
+    with pytest.raises(SystemExit):
+        main(["--config", str(SMOKE), "--out-dir", "x", "--source", "untrained", "--n", "1025"])
