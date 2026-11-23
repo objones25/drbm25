@@ -15,10 +15,7 @@ the two reach nDCG@10 0.397 and 0.396 (raw query 0.388, untrained model 0.258); 
 scored those rewrites lower than count-once BM25), so the two rewards trained nearly the same thing, but the policies
 still differ in determinism, reasoning template and wording.
 
-- Write-up: [report/REPORT.md](report/REPORT.md); slides: `report/drbm25_results.pptx` (30-minute talk).
-- Training runs (W&B project `drbm25`): `hunfj08k` (normal), `yld3obpy` (count-once), `yk2tdsy3` (eval report).
-- Models: `objones25/drbm25-qwen2.5-3b-normal` and `objones25/drbm25-qwen2.5-3b-count_once` (private).
-- Sampled rewrites with reasoning and metrics: dataset `objones25/drbm25-rewrites` (private).
+Write-up: [report/REPORT.md](report/REPORT.md). Slides: `report/drbm25_results.pptx`.
 
 ## Setup
 
@@ -211,7 +208,7 @@ create the pod the way `launch.sh` does (same image, volume and secrets, `pod_bo
 set `DRBM25_ENTRY=scripts/runpod/run_sampling.sh`; the bootstrap only accepts a script directly under
 `scripts/runpod/`. The 2026-11-22 run took about 2.3 hours on one RTX PRO 4500 (about $1.70).
 
-To rebuild the write-up and slides from the W&B runs and the dataset:
+To rebuild the write-up and slides from the training logs and the sampled-rewrite dataset:
 
 ```bash
 uv run python scripts/report_data.py --wandb WANDB_DIR --metrics METRICS_DIR --db DB_DIR  # report/data, report/figures
@@ -219,8 +216,9 @@ uv run python scripts/deck_figures.py                                           
 (cd report/deck && npm ci && node build.js)                                             # report/drbm25_results.pptx
 ```
 
-`WANDB_DIR` holds `<run_id>_history.json` for `hunfj08k` and `yld3obpy` (from `wandb.Api().run(...).scan_history()`)
-and the eval tables of `yk2tdsy3`; `METRICS_DIR` and `DB_DIR` are the `metrics/` and `db/` folders of the dataset.
+`WANDB_DIR` holds each training run's history as `<run_id>_history.json` (from `wandb.Api().run(...).scan_history()`;
+the two run IDs are set in `RUNS` in `scripts/report_data.py`) and the greedy evaluation tables. `METRICS_DIR` and `DB_DIR`
+are the `metrics/` and `db/` folders written by the sampling pipeline above.
 
 ## Running on SDSC Expanse (2x V100 32GB)
 

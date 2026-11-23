@@ -190,7 +190,7 @@ const nr = T.per_run.normal, co = T.per_run.count_once;
     "Every 50 steps: greedy rewrites (always the most likely word) of the 500 validation questions; the best checkpoint is kept (normal step 1549, count-once step 1349)",
     "Model: Qwen2.5-3B-Instruct, all weights trained; same seed and data order for both runs",
   ], { x: 0.6, y: 3.95, w: 12.1, h: 2.7, fontSize: 16 });
-  caption(s, "Actor learning rate 1e-6, critic 1e-5, PPO clip 0.2, one epoch per batch, gradient clip 1.0. 2× RTX PRO 6000; both runs together about 15.6 h of pod time (RunPod billing).", { x: 0.6, y: 6.75, w: 12.1, h: 0.4 });
+  caption(s, "Actor learning rate 1e-6, critic 1e-5, PPO clip 0.2, one epoch per batch, gradient clip 1.0. 2× RTX PRO 6000; both runs together took about 15.6 hours.", { x: 0.6, y: 6.75, w: 12.1, h: 0.4 });
   s.addNotes("PPO in one sentence: sample responses, score them, and make better-than-expected responses more likely, in small steps. The critic is a second network that learns the expected reward so the update knows what counts as better than expected. The two runs were trained alternately on the same two GPUs in 50-step chunks.");
 }
 
@@ -211,7 +211,7 @@ const nr = T.per_run.normal, co = T.per_run.count_once;
     s.addText(q, { isTextBox: true, x: x + 0.25, y: 4.6, w: 3.3, h: 0.85, fontFace: "Calibri", fontSize: 15, italic: true, color: "5F6B73", margin: 0, valign: "top" });
   });
   body(s, "Comparisons pair the two models question by question: average each question's samples, then a bootstrap over questions gives 95% confidence intervals. With 33 behavior metrics tested, p-values are corrected for multiple comparisons.", { x: 0.6, y: 5.85, w: 12.1, h: 0.9, fontSize: 15 });
-  s.addNotes("The untrained model is the same Qwen model with the same prompt, before any training. All samples use the training temperature and the same random seed per question for every model, so differences come from the models, not the sampling. Training logs are W&B runs hunfj08k and yld3obpy; the greedy evaluation is W&B run yk2tdsy3; the samples are in a private Hugging Face dataset.");
+  s.addNotes("The untrained model is the same Qwen model with the same prompt, before any training. All samples use the training temperature and the same random seed per question for every model, so differences come from the models, not the sampling.");
 }
 
 // 3 Headline
@@ -222,7 +222,7 @@ const nr = T.per_run.normal, co = T.per_run.count_once;
   stat(s, fmt(ci.mean_diff, 4), `count-once − normal; 95% CI [${fmt(ci.ci_low, 4)}, ${fmt(ci.ci_high, 4)}]`, 8.5, 1.6, 4.2, HEX.ink);
   stat(s, "+" + fmt(G["trained-normal"].ndcg10_normal - G.original.ndcg10_normal, 3), "trained (normal) vs raw query, greedy; over 32 samples +0.008 [0.001, 0.015]", 8.5, 3.3, 4.2, HEX.normal);
   stat(s, "+" + fmt(G["trained-normal"].ndcg10_normal - G.untrained.ndcg10_normal, 3), "trained (normal) vs untrained model", 8.5, 5.0, 4.2, HEX.untrained);
-  s.addNotes(`Greedy decoding on all 2,305 dev queries. Count-once minus normal is ${fmt(ci.mean_diff, 4)} with a paired bootstrap CI that straddles zero. With 32 samples per query the CI is [${fmt(P.ndcg_normal_mean.ci_low, 4)}, ${fmt(P.ndcg_normal_mean.ci_high, 4)}]. Training mostly undoes the untrained model's damage and adds a little over the raw query.`);
+  s.addNotes(`Greedy decoding on all 2,305 test questions. Count-once minus normal is ${fmt(ci.mean_diff, 4)} with a paired bootstrap CI that straddles zero. With 32 samples per question the CI is [${fmt(P.ndcg_normal_mean.ci_low, 4)}, ${fmt(P.ndcg_normal_mean.ci_high, 4)}]. The trained models score about 14 points above the untrained model and about 1 point above the raw question.`);
 }
 
 // 6b Paper comparison
@@ -299,12 +299,12 @@ const nr = T.per_run.normal, co = T.per_run.count_once;
   const vn = nr.val.points, vc = co.val.points;
   img(s, "deck_val.png", 0.6, 1.4, 8.2, 5.4, "Validation nDCG every 50 steps for both runs");
   bullets(s, [
-    "No validation loss: greedy nDCG every 50 steps; the best value picks the checkpoint",
+    "Greedy nDCG on 500 held-out questions every 50 steps; the best value picks the checkpoint",
     "Normal: mean 0.363 (steps 49 to 299) vs 0.366 (1049 to 1750); no trend",
     "Count-once: 0.347 to 0.355 from step 149 to 899, then mostly 0.366 to 0.372 (dips to 0.346 at 1049 and 0.356 at 1649)",
-    "Single points swing by about 0.02; one 500-query mean has a standard error of about 0.017. The y-axis starts at 0.32",
+    "Single points swing by about 0.02; one 500-question mean has a standard error of about 0.017. The y-axis starts at 0.32",
   ], { x: 9.1, y: 1.6, w: 3.7, h: 5.0, fontSize: 15 });
-  s.addNotes("Per-query nDCG has a standard deviation of about 0.39, so one 500-query mean has a standard error of about 0.017, the size of the point-to-point swings. Checkpoints are scored on the same 500 queries, so differences between them are less noisy than that, but the normal run's best step is still hard to separate from its neighbours. Count-once's rise of about 0.02 after step 900 holds from step 1099 to the end apart from two dips, so it is not one noisy value.");
+  s.addNotes("Per-question nDCG has a standard deviation of about 0.39, so one 500-question mean has a standard error of about 0.017, the size of the point-to-point swings. Checkpoints are scored on the same 500 questions, so differences between them are less noisy than that, but the normal run's best step is still hard to separate from its neighbours. Count-once's rise of about 0.02 after step 900 holds from step 1099 to the end apart from two dips, so it is not one noisy value.");
 }
 
 // 6 Health
@@ -320,7 +320,7 @@ const nr = T.per_run.normal, co = T.per_run.count_once;
     ["Response length (tokens), first → last 50 steps", `${fmt(nr["rollout/response_len_mean"].first50, 0)} → ${fmt(nr["rollout/response_len_mean"].last50, 0)}`, `${fmt(co["rollout/response_len_mean"].first50, 0)} → ${fmt(co["rollout/response_len_mean"].last50, 0)}`],
     ["Optimizer updates with actor gradient clipped to 1.0", "84%", "88%"],
     ["Largest actor gradient norm", fmt(nr["optim/actor_grad_norm"].max, 0), fmt(co["optim/actor_grad_norm"].max, 0)],
-    ["Non-finite activations / skipped steps", "0 / 0", "0 / 0"],
+    ["Non-finite values / skipped steps", "0 / 0", "0 / 0"],
   ];
   s.addTable(rows.map((r, i) => r.map((c) => ({ text: c, options: { bold: i === 0, color: HEX.ink, fill: { color: i === 0 ? HEX.soft : "FFFFFF" } } }))), {
     x: 0.6, y: 4.55, w: 12.1, colW: [5.3, 3.4, 3.4], fontFace: "Calibri", fontSize: 13, border: { type: "solid", color: HEX.grid, pt: 0.5 }, rowH: 0.33,
@@ -340,7 +340,7 @@ const nr = T.per_run.normal, co = T.per_run.count_once;
     "Step 1000: the normal critic fell from 0.26 to 0 and recovered slowly; cause unknown",
     "Normal steps 1500 to 1640: responses halved (about 113 to 57 tokens), KL rose 1.6 to 2.4; the selected checkpoint (1549) is mid-shift",
   ], { x: 9.1, y: 1.5, w: 3.7, h: 5.3, fontSize: 14 });
-  s.addNotes("The critic's value loss is the loss to inspect here; there is no validation loss. A weaker critic makes the better-than-expected signal noisier, yet the normal run reached the same reward. The count-once critic may predict returns better because its policy is more deterministic; that is an inference we did not test. PPO clip fraction, the share of tokens whose update PPO capped, stayed below 2 percent: updates were small.");
+  s.addNotes("A weaker critic makes the better-than-expected signal noisier, yet the normal run reached the same reward. The count-once critic may predict returns better because its policy is more deterministic; that is an inference we did not test. PPO clip fraction, the share of tokens whose update PPO capped, stayed below 2 percent: updates were small.");
 }
 
 // 8 Repetition
@@ -380,7 +380,6 @@ const nr = T.per_run.normal, co = T.per_run.count_once;
   bullets(s, [
     `Only removing terms: ${pct(rc["trained-normal"].compression, 0)} (normal), ${pct(rc["trained-count_once"].compression, 0)} (count-once), ${pct(rc.untrained.compression, 0)} (untrained)`,
     `Trained policies keep about 72% of the query's terms and add almost none; the untrained model keeps ${pct(m.untrained.mean_retention, 0)} and adds about 3`,
-    `${pct(pat.untrained.boolean_syntax_in_rewrite, 0)} of untrained rewrites use AND / OR / parentheses, which this BM25 setup ignores`,
   ], { x: 8.5, y: 1.7, w: 4.3, h: 3.6, fontSize: 15 });
   caption(s, "Types compare the rewrite's analyzed terms with the query's. Compression: only removes terms. Same: same terms. Expansion: only adds. Substitution: adds as many as it removes. Mixed: adds and removes different numbers.", { x: 8.5, y: 5.5, w: 4.3, h: 1.2 });
   s.addNotes("The learned strategy is to strip question words and filler. Our guess, not tested, is that most of the gain over the untrained model comes from no longer expanding the query with Boolean clauses full of extra terms.");
@@ -432,7 +431,6 @@ const nr = T.per_run.normal, co = T.per_run.count_once;
   bullets(s, [
     "Most text differences vanish in BM25's analyzer: normal capitalizes (“Xenon come from” vs “xenon come from”), and stopwords and stems map to the same terms",
     "Normal keeps question words (“how many”, “why”, “what”); count-once often swaps “how many” for “number”",
-    `${pct(pat["trained-normal"].boolean_syntax_in_rewrite, 1)} of normal rewrites use AND, OR or parentheses (“Sea Otters AND endangered AND Alaska”), vs ${pct(pat["trained-count_once"].boolean_syntax_in_rewrite, 1)} for count-once; BM25 ignores them, so retrieval is unchanged`,
     `Count-once rewrites are slightly shorter (${fmt(m["trained-count_once"].mean_n_terms, 2)} vs ${fmt(m["trained-normal"].mean_n_terms, 2)} terms) and add fewer new terms (${fmt(m["trained-count_once"].mean_n_added, 2)} vs ${fmt(m["trained-normal"].mean_n_added, 2)})`,
   ], { x: 0.8, y: 3.8, w: 11.8, h: 3.1, fontSize: 17 });
   s.addNotes("Most wording differences are invisible to BM25 because they are stopwords, casing, or stems that map to the same terms. That is why behavior can differ without moving the score.");
@@ -450,7 +448,7 @@ const nr = T.per_run.normal, co = T.per_run.count_once;
     "Limits: one seed per reward; a 500-question validation set too small to rank late checkpoints.",
     "Next: train with k = 3000 to test the gap; a second seed per reward; a larger entropy bonus to keep diversity, since best-of-16 shows the headroom.",
   ], { x: 0.8, y: 1.6, w: 11.7, h: 5.3, fontSize: 20 });
-  s.addNotes("Close on the main point: measure behavior, not only the score. Data, samples and metrics are in the Hugging Face dataset objones25/drbm25-rewrites; training runs are W&B hunfj08k and yld3obpy.");
+  s.addNotes("Close on the main point: measure behavior, not only the score.");
 }
 
 (async () => {
