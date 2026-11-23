@@ -36,20 +36,20 @@ In reinforcement learning terms the trained models are *policies*; we use the wo
 
 | Source | What it contains | Used for |
 |---|---|---|
-| Training logs (Weights & Biases, W&B, runs `hunfj08k` normal, `yld3obpy` count-once) | per-step reward, nDCG under both scorers, repetition rate, response length, entropy, KL, critic statistics, gradient norms; validation every 50 steps | Training and Validation sections |
-| Greedy test evaluation (W&B run `yk2tdsy3`) | nDCG@10 and query statistics for the four sources on 2,305 test questions, with paired confidence intervals | Test results |
-| Sampled responses (Hugging Face dataset `objones25/drbm25-rewrites`, private) | 221,280 model responses plus the raw questions, with reasoning, rewrites, retrieved passages and scores; computed metrics | Behavior section and examples |
+| Training logs, both runs | per-step reward, nDCG under both scorers, repetition rate, response length, entropy, KL, critic statistics, gradient norms; validation every 50 steps | Training and Validation sections |
+| Greedy test evaluation | nDCG@10 and query statistics for the four sources on 2,305 test questions, with paired confidence intervals | Test results |
+| Sampled responses | 221,280 model responses plus the raw questions, with reasoning, rewrites, retrieved passages and scores; computed metrics | Behavior section and examples |
 
-Training ran on two RTX PRO 6000 GPUs (96 GB each), alternating between the two runs in 50-step chunks; both runs together took about 15.6 hours of pod time, about $84 (from RunPod billing; W&B records only the last chunk of each run).
+Training ran on two RTX PRO 6000 GPUs (96 GB each), alternating between the two runs in 50-step chunks; both runs together took about 15.6 hours and cost about $84.
 
 ## Main findings
 
 - **We reproduce the paper's baselines but not its full gain.** Original query 38.8 and untrained model 25.8, against the paper's 38.8 and 25.9. Our trained models reach 39.7 and 39.6, against the paper's 41.1. We did not test why. Candidates include the training reward (we followed the released code's nDCG cutoff of k = 10; the paper's text says 3000), training length, checkpoint selection and response length.
-- **Retrieval quality is the same.** On the 2,305 dev queries, greedy rewrites score nDCG@10 0.3967 (normal) and 0.3961 (count-once). The paired 95% CI of the difference is [−0.0058, +0.0047]. With 32 sampled rewrites per query the means are 0.3960 and 0.3958, CI [−0.0045, +0.0041].
+- **Retrieval quality is the same.** On the 2,305 test questions, greedy rewrites score nDCG@10 0.3967 (normal) and 0.3961 (count-once). The paired 95% CI of the difference is [−0.0058, +0.0047]. With 32 sampled rewrites per question the means are 0.3960 and 0.3958, CI [−0.0045, +0.0041].
 - **Both beat the raw query by a little and the untrained model by a lot.** Raw query: 0.3877. Untrained model: 0.2575 (greedy). Over 32 samples, normal minus raw query is +0.008, 95% CI [+0.001, +0.015].
 - **The two rewards gave nearly the same signal.** Repetition moved the score little even when it was common: in the first 50 steps 33% to 37% of training rewrites repeated a term, yet standard BM25 scored them only 0.003 to 0.005 higher than count-once BM25. Both policies dropped repetition within about 100 steps. The normal run drifted back into it three times (a 25-step average of up to 37% of rewrites); each time standard BM25 scored those batches *lower* than count-once BM25, and reward did not rise. Greedy rewrites with a repeated term: 4.3% (normal), 3.7% (count-once), 5.2% for raw queries, 41.7% for the untrained model.
 - **The policies still behave differently.** 26 of 33 secondary behavior metrics differ after correcting for multiple comparisons (Benjamini-Yekutieli). Count-once is more deterministic (on average 1.6 distinct rewrites out of 32 samples, against 3.6 for normal), opens its reasoning with the same phrase in 99.8% of samples, and a text classifier tells its reasoning apart from normal's with 99.96% accuracy on held-out questions.
-- **Training was stable but narrowed the policy.** No divergence, no non-finite values, no skipped steps. Entropy fell from 0.43 to 0.02 nats per token (natural-log units), most of it by step 300. Normal's validation nDCG stayed flat after the first 100 steps; count-once's sat on a plateau until step 900, then rose by about 0.02.
+- **Training was stable but narrowed the policy.** No divergence, no non-finite values, no skipped steps. Entropy fell from 0.43 to 0.02, most of it by step 300. Normal's validation nDCG stayed flat after the first 100 steps; count-once's sat on a plateau until step 900, then rose by about 0.02.
 
 ## Training
 
@@ -78,14 +78,14 @@ Count-once had one smaller episode (14% over steps 1570 to 1620). Both selected 
 
 ![Validation nDCG](figures/val_ndcg.png)
 
-There is no validation loss in this setup. Validation is greedy nDCG@10 on 500 held-out training queries every 50 steps, and the best value selects the checkpoint.
+Validation is greedy nDCG@10 on 500 held-out training queries every 50 steps, and the best value selects the checkpoint.
 
 | | step 49 | best | last (1750) | range after step 300 |
 |---|---|---|---|---|
 | normal | 0.353 | 0.374 (step 1549) | 0.365 | 0.346 to 0.374 |
 | count-once | 0.333 | 0.372 (step 1349) | 0.367 | 0.346 to 0.372 |
 
-The two runs behave differently. Normal's mean validation nDCG is 0.363 over steps 49 to 299 and 0.366 over steps 1049 to 1750: no trend after the first few points. Count-once's is 0.348 and 0.366: it stayed between 0.347 and 0.355 from step 149 to 899, then mostly between 0.366 and 0.372 from step 1099 on, with dips to 0.346 (step 1049) and 0.356 (step 1649). The y-axis of the figure starts at 0.32, which makes these swings look larger than they are.
+Normal's mean validation nDCG is 0.363 over steps 49 to 299 and 0.366 over steps 1049 to 1750: no trend after the first few points. Count-once's is 0.348 and 0.366: it stayed between 0.347 and 0.355 from step 149 to 899, then mostly between 0.366 and 0.372 from step 1099 on, with dips to 0.346 (step 1049) and 0.356 (step 1649). The y-axis of the figure starts at 0.32, which makes these swings look larger than they are.
 
 Single points swing by about 0.02. One 500-query mean has a standard error of about 0.017 (per-query standard deviation about 0.39). All checkpoints are scored on the same 500 queries, so differences between checkpoints are less noisy than that, but the normal run's best step (1549) cannot be told apart from its neighbours with this set. The test score of the selected checkpoints (0.397) is higher than their validation score. Validation and test are different query sets, and we did not score the raw query on the validation set, so we cannot say how much of the gap is the query set.
 
@@ -109,7 +109,7 @@ Terms: *entropy* measures how spread out the policy's next-token choices are (0 
 
 What the signals say:
 
-- **Stable.** No non-finite activations, no skipped optimizer steps, and the largest attention score stayed flat (about 1,500 to 1,650).
+- **Stable.** No non-finite values and no skipped optimizer steps.
 - **Gradient spikes were contained.** The count-once actor had five steps with gradient norm above 100 (largest 719 at step 1652; the normal actor never exceeded 20); clipping held each update to norm 1.0 and reward showed no lasting drop.
 - **Entropy collapse is the main cost.** Smoothed entropy was about 0.016 by step 300 in both runs, down from 0.43, which matches the low diversity of the trained policies below.
 - **The critic.** The count-once critic explains 71% of return variance by the end, the normal critic 33%. At step 1000 the normal critic's explained variance fell from 0.26 to about 0 and its value loss rose from 0.071 to 0.104; it recovered slowly over the next 500 steps. We found no change in the logged rewrite or reward statistics at that step, so the cause is not known. A weaker critic makes the "better than expected" signal noisier; the normal run still reached the same reward.
@@ -117,7 +117,7 @@ What the signals say:
 
 ![Critic explained variance](figures/train_explained_var.png)
 
-## Test results (greedy, 2,305 dev queries)
+## Test results (greedy, 2,305 test questions)
 
 | Source | nDCG@10 (standard BM25) | nDCG@10 (count-once BM25) | terms per rewrite | rewrites with a repeat |
 |---|---|---|---|---|
@@ -149,7 +149,7 @@ Where the paper's text and its released code (repository `pat-jj/DeepRetrieval`,
 
 | | paper text | released code | ours |
 |---|---|---|---|
-| nDCG cutoff in the training reward | k = 3000, "to mitigate the risk of sparse or zero-reward signals" (Appendix B.2); but Table 8 gives the sparse reward as "Same as evaluation metric (NDCG)" | k = 10 for training and evaluation (`msmarco.py`, the reward file `main_ppo.py` loads) | k = 10 |
+| nDCG cutoff in the training reward | k = 3000, "to mitigate the risk of sparse or zero-reward signals" (Appendix B.2); but Table 8 gives the sparse reward as "Same as evaluation metric (NDCG)" | k = 10 for training and evaluation (`msmarco.py`) | k = 10 |
 | Maximum response length | 512 tokens for classic retrieval (Appendix B.2) | 350 tokens (`scripts/train/msmarco.sh`) | 350 tokens |
 | Validation during training | not described | the test set, every 50 steps (`msmarco.sh`) | 500 held-out training questions, every 50 steps; test scored once |
 | Training length | not stated for MS-S | `msmarco.sh` is the MS-T (technology) script; it runs 5 epochs, resuming from step 450 of an earlier run | 1,751 steps, about 5.1 passes |
@@ -195,7 +195,7 @@ Let me rewrite the query with reasoning.
 <think>
 ```
 
-The paper prints this prompt as Figure 15 with small differences: grammatical system text ("You first think … and then provide"), and the assistant turn begins "Let me think step by step." instead of "Let me rewrite the query with reasoning." The stray quotation mark after "appropriately." is in the released code.
+The paper prints this prompt as Figure 15 with small differences: grammatical system text ("You first think … and then provide"), and the assistant turn begins "Let me think step by step." instead of "Let me rewrite the query with reasoning."
 
 **What the paper says about Boolean operators.** The paper adapts the output to each domain, "including structured boolean expressions for literature search and sparse retrieval" (Section 2.2), and describes sparse retrieval as retrieving documents "using keyword matching and boolean operations with BM25" (Table 8). It argues that RL is "particularly effective for real search engines, where the ability to formulate precise boolean expressions with appropriate operator usage and term grouping is crucial"; those real engines are PubMed and ClinicalTrials.gov, used for literature search.
 
@@ -217,7 +217,7 @@ The untrained model follows the instruction almost always, and it costs it: on t
 - **Reasoning gets shorter.** The paper observes on literature search that reasoning shortens during training (Figure 4, Appendix D.1). We see the same on MS-S: responses fell from 130 to 46 tokens (normal) and 114 to 70 (count-once).
 - **Exploration.** The paper attributes the benefit of reasoning, compared with no reasoning, to "broader exploration during training". We ran no no-reasoning model, so we cannot test that comparison. We can only add that, with reasoning, entropy was down 96% by step 300 and the trained policies produce 3.6 and 1.6 distinct rewrites out of 32 samples.
 
-## Behavior (32 samples per query)
+## Behavior (32 samples per question)
 
 ### Count-once is more deterministic
 
@@ -238,12 +238,11 @@ Training traded diversity for a better average. A single untrained sample scores
 
 Rewrite types compare the rewrite's analyzed terms with the query's: *compression* only removes terms, *same* keeps the same terms, *expansion* only adds terms, *substitution* adds as many as it removes, and *mixed* adds and removes different numbers.
 
-83% (normal) and 91% (count-once) of rewrites only remove terms from the query. Both keep about 72% to 73% of the query's terms and add almost none (0.11 vs 0.04 new terms per rewrite). The untrained model expands instead: 98% of its rewrites use Boolean syntax such as `AND`, `OR` and parentheses, which this BM25 setup ignores. It keeps 58% of the query's terms and adds about 3.
+83% (normal) and 91% (count-once) of rewrites only remove terms from the query. Both keep about 72% to 73% of the query's terms and add almost none (0.11 vs 0.04 new terms per rewrite). The untrained model expands instead, mostly through Boolean OR clauses (see "The prompt and Boolean operators"): it keeps 58% of the query's terms and adds about 3.
 
 ### The rewrites differ in wording, not in the documents they retrieve
 
 - Normal keeps question words ("how many", "why", "what"); count-once often replaces "how many" with "number". In 25 queries the normal policy's most common rewrite contains "how many" and count-once's contains "number" instead.
-- 11.6% of normal rewrites use "AND", "OR" or parentheses ("Sea Otters AND endangered AND Alaska"), against 0.3% for count-once. The analyzer drops "and" as a stopword, so this changes nothing in retrieval.
 - The two policies' most common rewrites differ as exact strings in 92% of queries, but much of that is capitalization (normal writes "Xenon come from", count-once "xenon come from"). Ignoring case they differ in 64%, and after BM25's analyzer (lowercasing, stopword removal, stemming) their terms differ in only 25%. Their top-10 results are identical in 77% of queries (rank-biased overlap, RBO, of 1; RBO compares two ranked lists, weighting the top ranks most).
 - A classifier separates the rewrites 65% of the time (chance is 50%; permutation p ≤ 0.005, the smallest value 200 permutations can give). The classifier is logistic regression on word and word-pair frequencies (TF-IDF), trained on the first sample of each question and scored by 5-fold cross-validation with folds split by question, so it is always tested on questions it has not seen.
 
@@ -276,11 +275,7 @@ The fibre query is one of the largest losses. Both policies drop "what" and chan
 - We did not test the paper's k = 3000 training reward or its 512-token limit, so we cannot say how much of the 1.4-point gap to the paper they explain.
 - The vocabulary statistics use Lucene's stemmed terms ("mani" is "many").
 - The classifier test on reasoning picks up stock phrasing; it shows the outputs differ, not that the policies reason differently in substance.
-- The sampling job's W&B logging failed, so the behavior numbers come from the metrics files on Hugging Face.
 
 ## Reproducing
 
-- Training data: W&B runs `hunfj08k`, `yld3obpy` (history), `yk2tdsy3` (greedy eval tables).
-- Samples and metrics: Hugging Face dataset `objones25/drbm25-rewrites` (`db/`, `metrics/`).
-- Figures and the numbers in this report: `uv run python scripts/report_data.py --wandb <dir> --metrics <dir> --db <dir>` writes `report/data/*.json` and `report/figures/*.png`.
-- Code: branch `feat/rewrite-sampling-analysis` (sampling `e10c5bb`); training code `f1de00e` (every training chunk of both runs; the normal run's first chunk recorded `b0fcef3`).
+`scripts/report_data.py` computes every number and figure in this report from the training logs, the greedy evaluation tables and the sampled responses, and writes `report/data/*.json` and `report/figures/`. `scripts/deck_figures.py` and `report/deck/build.js` build the slides from those files. The logs and samples are stored privately; the README describes how to regenerate them.

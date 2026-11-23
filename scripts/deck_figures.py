@@ -64,7 +64,7 @@ def bars(labels, values, colors, title, name, size, pct=False, ylim=None):
 def main() -> None:
     wide, half = (8.2, 5.4), (6.0, 3.0)
     curve_pair("reward/mean", "Mean reward per batch (25-step moving average)", "reward", "deck_reward.png", wide)
-    curve_pair("ppo/entropy", "Policy entropy (nats per token)", "entropy", "deck_entropy.png", half)
+    curve_pair("ppo/entropy", "Policy entropy per token", "entropy", "deck_entropy.png", half)
     curve_pair("ppo/kl_ref_mean", "KL divergence from the starting model", "KL", "deck_kl.png", half)
     curve_pair("rewrite/any_repeat_rate", "Training rewrites with a repeated term (25-step average)", "share of batch", "deck_repeat_train.png", wide, fmt=PercentFormatter(1.0, decimals=0))
     curve_pair("ppo/explained_var", "Critic explained variance (25-step average)", "explained variance", "deck_explained_var.png", wide)
