@@ -100,9 +100,17 @@ case $cmd in
     fi
     exit 1 # torchrun collapses worker codes
     ;;
-  pytest) exit "${STUB_PYTEST_RC:-0}" ;;
+  pytest)
+    echo "pytest env: model=${DRBM25_VLLM_TEST_MODEL-UNSET} offline=${HF_HUB_OFFLINE-UNSET} usage_stats_off=${VLLM_NO_USAGE_STATS-UNSET}" >>"$STUB_LOG"
+    exit "${STUB_PYTEST_RC:-0}"
+    ;;
   python)
     if [[ $* == *deadline_from_budget* ]]; then echo 1234567890; fi
+    if [[ $* == *local_files_only* ]]; then
+      if [[ -n ${STUB_NO_SNAPSHOT-} ]]; then exit 1; fi
+      echo /vol/hf/hub/models--Qwen/snapshots/abc
+      exit 0
+    fi
     if [[ $* == *spike_monitor.py* ]]; then exit "${STUB_SPIKE_RC:-0}"; fi
     if [[ $* == *drbm25.publish* ]]; then
       # Writes RUN_DIR/UPLOADED.json and exits 0, unless STUB_PUBLISH_RC_<mode> is set (then exits with it).
@@ -171,6 +179,46 @@ in_lib() {
 calls() { cat "$STUB_LOG"; }
 
 train_calls() { grep '^uv ' "$STUB_LOG" | grep -o 'torchrun.*--run-name [a-z_]* .*--until-step [0-9]*' | sed 's/.*--run-name \([a-z_]*\) .*--until-step \([0-9]*\)/\1@\2/'; }
+
+# ---------------------------------------------------------------- paths
+
+@test "runpod_paths turns off hf_transfer, which the RunPod image enables but the venv does not have" {
+  SNIPPET='printf "[%s]" "${HF_HUB_ENABLE_HF_TRANSFER-UNSET}"'
+  run -0 in_lib HF_HUB_ENABLE_HF_TRANSFER=1
+  [ "$output" = "[UNSET]" ]
+}
+
+# ---------------------------------------------------------------- java
+
+# A fake JDK 21 at $DRBM25_ROOT/jdk/current: bin/java prints a 21 version, lib/libjsig.so exists unless $1 is "nojsig".
+fake_jdk() {
+  local home=$DRBM25_ROOT/jdk/current
+  mkdir -p "$home/bin" "$home/lib"
+  printf '#!/usr/bin/env bash\necho "openjdk version \\"21.0.13\\" 2026-01-20 LTS" >&2\n' >"$home/bin/java"
+  chmod +x "$home/bin/java"
+  if [[ ${1-} != nojsig ]]; then : >"$home/lib/libjsig.so"; fi
+}
+
+@test "install_java21 preloads the JDK's libjsig so a later SIGSEGV handler (tvm_ffi, via vLLM) cannot take the JVM's" {
+  fake_jdk
+  SNIPPET='install_java21; printf "[%s]" "$LD_PRELOAD"'
+  run -0 --separate-stderr in_lib
+  [ "$output" = "[$DRBM25_ROOT/jdk/current/lib/libjsig.so]" ]
+}
+
+@test "jvm_signal_chaining keeps an existing LD_PRELOAD and does not add libjsig twice" {
+  fake_jdk
+  SNIPPET='jdk_env; LD_PRELOAD=/x/other.so; jvm_signal_chaining; jvm_signal_chaining; printf "[%s]" "$LD_PRELOAD"'
+  run -0 --separate-stderr in_lib
+  [ "$output" = "[$DRBM25_ROOT/jdk/current/lib/libjsig.so:/x/other.so]" ]
+}
+
+@test "jvm_signal_chaining fails naming the file when the JDK has no libjsig" {
+  fake_jdk nojsig
+  SNIPPET='jdk_env; jvm_signal_chaining'
+  run -1 --separate-stderr in_lib
+  [[ $stderr == *"$DRBM25_ROOT/jdk/current/lib/libjsig.so"* ]]
+}
 
 # ---------------------------------------------------------------- env file
 
@@ -535,6 +583,19 @@ prev_chunk_args() { grep '^uv .*drbm25.train' "$STUB_LOG" | grep -o -- '--prev-c
   run -0 in_lib
   grep -q 'pytest .*-m gpu tests/rollout/test_vllm_engine.py tests/ppo/test_models_full.py' "$STUB_LOG"
   grep -q 'torchrun --nproc_per_node 2 scripts/memory_check.py --config configs/runpod_a100_full.yaml' "$STUB_LOG"
+}
+
+@test "smoke_stage runs the gpu pytest offline on the cached snapshot, warnings not fatal, vLLM usage stats off" {
+  SNIPPET='runpod_paths; smoke_stage'
+  run -0 in_lib
+  grep -q 'pytest env: model=/vol/hf/hub/models--Qwen/snapshots/abc offline=1 usage_stats_off=1' "$STUB_LOG"
+  grep -q 'pytest .*-W default .*-m gpu' "$STUB_LOG"
+}
+
+@test "smoke_stage fails before the gpu pytest when the model snapshot is not cached" {
+  SNIPPET='runpod_paths; smoke_stage'
+  run -1 in_lib STUB_NO_SNAPSHOT=1
+  ! grep -q 'pytest env' "$STUB_LOG"
 }
 
 memchecks() { grep '^memcheck micro=' "$STUB_LOG" | sed 's/memcheck micro=//' | tr '\n' ' '; }
@@ -1122,6 +1183,33 @@ make_uv_tarball() {
   ! grep -q pip "$STUB_LOG"
 }
 
+# tar as root on a RunPod pod: restoring the archive's owner (uid 1001 for uv) fails on the network volume
+# unless --no-same-owner is passed. This shim behaves that way and delegates to the real tar otherwise.
+make_root_tar_shim() {
+  local real d=$BATS_TEST_TMPDIR/roottar
+  real=$(command -v tar)
+  mkdir -p "$d"
+  cat >"$d/tar" <<EOF
+#!/usr/bin/env bash
+if [[ " \$* " == *" -x"* && " \$* " != *" --no-same-owner "* ]]; then
+  echo "tar: uv-x86_64-unknown-linux-gnu/uv: Cannot change ownership to uid 1001, gid 117: Operation not permitted" >&2
+  exit 2
+fi
+exec "$real" "\$@"
+EOF
+  chmod +x "$d/tar"
+  export PATH="$d:$PATH"
+}
+
+@test "install_uv unpacks without restoring the archive's owner (root on a RunPod network volume)" {
+  make_uv_tarball
+  make_root_tar_shim
+  SNIPPET='install_uv; uv --version'
+  run -0 --separate-stderr in_lib
+  [[ -x $DRBM25_ROOT/bin/uv ]]
+  [[ $output == 'uv 0.13.7'* ]]
+}
+
 @test "install_uv refuses a tarball whose SHA-256 differs from the pin and installs nothing" {
   make_uv_tarball
   SNIPPET='install_uv'
@@ -1189,6 +1277,12 @@ make_uv_tarball() {
   SNIPPET='prompt_var HF_TOKEN "Token" --secret; prompt_var WANDB_ENTITY "Entity" --optional; printf "%s|%s" "$HF_TOKEN" "$WANDB_ENTITY"'
   run -0 --separate-stderr in_lib DRBM25_NONINTERACTIVE=1 HF_TOKEN=hf_a WANDB_ENTITY=
   [[ $output == 'hf_a|' ]]
+}
+
+@test "prompt_var with DRBM25_NONINTERACTIVE=1 treats an unset optional variable as empty (RunPod drops empty env vars)" {
+  SNIPPET='unset WANDB_ENTITY; prompt_var WANDB_ENTITY "Entity" --optional; printf "[%s]" "${WANDB_ENTITY-UNSET}"'
+  run -0 --separate-stderr in_lib DRBM25_NONINTERACTIVE=1
+  [[ $output == '[]' ]]
 }
 
 @test "collect_settings rejects a RunPod secret reference that was never substituted" {

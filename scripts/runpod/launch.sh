@@ -66,6 +66,9 @@ readonly MIN_CUDA=12.8 # the image's CUDA; gpu.minCudaVersion on create, minCuda
 # GPU type ids from https://docs.runpod.io/references/gpu-types (as of 2026-11-20).
 readonly GPU_ID_SXM='NVIDIA A100-SXM4-80GB'
 readonly GPU_ID_PCIE='NVIDIA A100 80GB PCIe'
+# 96 GB Blackwell, opt-in only (--gpu pro6000): untested with this code, so `any` never picks it; the smoke stage
+# (gpu tests + memory check) is what vets it on the pod.
+readonly GPU_ID_PRO6000='NVIDIA RTX PRO 6000 Blackwell Server Edition'
 readonly GPU_COUNT=2
 # Container disk (ephemeral): the image, apt and pip/compile caches. Venv, uv cache, models and runs are on
 # the volume. An estimate, not measured on a pod.
@@ -130,7 +133,8 @@ uploads both runs' best policy, verified, to private repos $HF_REPO_PREFIX-<mode
 
 Launch options:
   --yes              do not ask for confirmation (for scripts); the price is still printed
-  --gpu sxm|pcie|any A100 80GB variant (default any: the cheapest in stock)
+  --gpu sxm|pcie|any|pro6000   A100 80GB variant (default any: the cheapest A100 in stock), or pro6000 for
+                     2x RTX PRO 6000 96GB (opt-in; never chosen by any)
   --cloud secure|community|any   only secure works: network volumes need the Secure Cloud (default secure)
   --volume-gb N      size of a NEW volume in GB (default $DEFAULT_VOLUME_GB); an existing one is reused as is
   --ref REF          branch, tag or full commit sha to run (default: this checkout's HEAD, which must be pushed)
@@ -471,6 +475,7 @@ find_offer() {
     sxm) ids=$(jq -cn --arg a "$GPU_ID_SXM" '[$a]') ;;
     pcie) ids=$(jq -cn --arg a "$GPU_ID_PCIE" '[$a]') ;;
     any) ids=$(jq -cn --arg a "$GPU_ID_SXM" --arg b "$GPU_ID_PCIE" '[$a, $b]') ;;
+    pro6000) ids=$(jq -cn --arg a "$GPU_ID_PRO6000" '[$a]') ;;
   esac
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
   api "$out" GET "/v2/catalog/gpus?include=AVAILABILITY&product=POD&count=$GPU_COUNT&cloud=SECURE&minCudaVersion=$MIN_CUDA" ||
@@ -616,10 +621,10 @@ do_launch() {
   find_offer "$allowed_dcs"
   if [[ -z $OFFER_GPU ]]; then
     if [[ -n $VOLUME_ID ]]; then
-      die "no ${GPU_COUNT}x A100 80GB ($OPT_GPU) is in stock in $VOLUME_DC, where volume $VOLUME_NAME ($VOLUME_ID) lives. A volume is tied to its data center, so try again later (or move the data yourself); no second volume is created"
+      die "no ${GPU_COUNT}x GPU of --gpu $OPT_GPU is in stock in $VOLUME_DC, where volume $VOLUME_NAME ($VOLUME_ID) lives. A volume is tied to its data center, so try again later (or move the data yourself); no second volume is created"
     fi
     types=$(_volume_types_summary)
-    die "no ${GPU_COUNT}x A100 80GB ($OPT_GPU) is in stock on the secure cloud in a data center that offers STANDARD network volumes right now (volume types per data center: $types). HIGH_PERFORMANCE volumes cost more and their price is not published in the docs, so this launcher does not create them: try again later, or create a volume named $VOLUME_NAME yourself in the console and run again"
+    die "no ${GPU_COUNT}x GPU of --gpu $OPT_GPU is in stock on the secure cloud in a data center that offers STANDARD network volumes right now (volume types per data center: $types). HIGH_PERFORMANCE volumes cost more and their price is not published in the docs, so this launcher does not create them: try again later, or create a volume named $VOLUME_NAME yourself in the console and run again"
   fi
 
   hours=$(awk -v b="$BUDGET_USD" -v p="$OFFER_PRICE" 'BEGIN { printf "%.1f", b / p }')
@@ -767,7 +772,7 @@ parse_args() {
     esac
     shift
   done
-  case $OPT_GPU in sxm | pcie | any) ;; *) usage_error "--gpu must be sxm, pcie or any, got '$OPT_GPU'" ;; esac
+  case $OPT_GPU in sxm | pcie | any | pro6000) ;; *) usage_error "--gpu must be sxm, pcie, any or pro6000, got '$OPT_GPU'" ;; esac
   case $cloud in
     secure | any) ;;
     # https://docs.runpod.io/storage/network-volumes: "Network volumes are only available for Pods in the

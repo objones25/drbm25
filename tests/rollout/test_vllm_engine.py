@@ -8,7 +8,7 @@ the A100 pod (Task 17 smoke stage): ``uv run pytest -m gpu tests/rollout/test_vl
 import importlib.util
 import os
 import socket
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -264,6 +264,72 @@ def test_create_without_vllm_says_how_to_install() -> None:
         VLLMEngine.create("m", "main", _cfg(), DIST, tokenizer=TOK, dtype="bfloat16", seed=0)
 
 
+# --------------------------------------------------------------------------- greedy agreement
+# Two bf16 implementations (vLLM's kernels, HF's sdpa) can split at a near-tie: on the RTX PRO 6000 they
+# differed at a 0.144 logit gap, about one bf16 step (0.125) at logit ~28, and an fp32 reference sided with
+# vLLM. 0.5 is four such steps; a real kernel or weight bug gives a far wider gap, or diverges at once.
+GREEDY_TIE_TOL = 0.5
+
+
+def _assert_greedy_agreement(
+    got: Sequence[int], want: Sequence[int], logits_at: Callable[[int], Tensor], *, tol: float
+) -> None:
+    """Greedy tokens must match until the first divergence, which must be a near-tie under HF's logits.
+
+    ``logits_at(k)`` returns HF's next-token logits after the shared prefix ``want[:k]``. Past the first
+    divergence the texts legitimately differ, so nothing after it is compared.
+    """
+    for step, (g, w) in enumerate(zip(got, want, strict=True)):
+        if g == w:
+            continue
+        logits = logits_at(step)
+        gap = abs(float(logits[w]) - float(logits[g]))
+        assert gap <= tol, f"step {step}: vLLM token {g}, HF token {w}, HF logit gap {gap:.3f} > {tol}"
+        return
+
+
+def _logits(n: int, values: Mapping[int, float]) -> Tensor:
+    out = torch.zeros(n)
+    for token, value in values.items():
+        out[token] = value
+    return out
+
+
+def _no_logits(step: int) -> Tensor:
+    raise AssertionError(f"logits were requested for step {step}, but the sequences never diverge")
+
+
+def test_greedy_agreement_accepts_identical_tokens() -> (  # audit: ignore[NO_ASSERT] asserts inside _assert_greedy_agreement
+    None
+):
+    _assert_greedy_agreement([5, 6, 7], [5, 6, 7], _no_logits, tol=0.5)
+
+
+def test_greedy_agreement_accepts_a_near_tie_and_ignores_tokens_after_it() -> (  # audit: ignore[NO_ASSERT] asserts inside _assert_greedy_agreement
+    None
+):
+    # The RTX PRO 6000 smoke failure: tokens 448 vs 11 at a 0.144 logit gap (fp32 reference: 27.700 vs 27.555).
+    logits = _logits(500, {11: 27.555, 448: 27.700})
+    _assert_greedy_agreement([5, 6, 448, 9, 9], [5, 6, 11, 3, 4], lambda _step: logits, tol=0.5)
+
+
+def test_greedy_agreement_rejects_a_divergence_with_a_wide_logit_gap() -> None:
+    logits = _logits(500, {11: 30.0, 448: 27.0})
+    with pytest.raises(AssertionError, match=r"step 2: vLLM token 448, HF token 11, HF logit gap 3\.000 > 0\.5"):
+        _assert_greedy_agreement([5, 6, 448], [5, 6, 11], lambda _step: logits, tol=0.5)
+
+
+def test_greedy_agreement_asks_for_the_logits_of_the_first_divergent_step() -> None:
+    asked: list[int] = []
+
+    def logits_at(step: int) -> Tensor:
+        asked.append(step)
+        return _logits(10, {1: 1.0, 2: 1.0})
+
+    _assert_greedy_agreement([0, 1, 9], [0, 2, 8], logits_at, tol=0.5)
+    assert asked == [1]
+
+
 # --------------------------------------------------------------------------- GPU (A100 pod)
 GPU_MODEL = os.environ.get("DRBM25_VLLM_TEST_MODEL", "Qwen/Qwen2.5-3B-Instruct")
 GPU_PROMPTS = (
@@ -303,7 +369,9 @@ class _StaticActor:
 
 
 @pytest.mark.gpu
-def test_vllm_generate_matches_hf_greedy_on_3_prompts(gpu_engine: tuple[VLLMEngine, Any]) -> None:
+def test_vllm_generate_matches_hf_greedy_on_3_prompts(  # audit: ignore[NO_ASSERT] asserts inside _assert_greedy_agreement
+    gpu_engine: tuple[VLLMEngine, Any],
+) -> None:
     from transformers import AutoModelForCausalLM
 
     from drbm25.prompt import build_prompt
@@ -319,7 +387,14 @@ def test_vllm_generate_matches_hf_greedy_on_3_prompts(gpu_engine: tuple[VLLMEngi
             out = hf.generate(**enc, max_new_tokens=20, do_sample=False, top_k=0, top_p=1.0, repetition_penalty=1.0)
         want = out[0, enc["input_ids"].shape[1] :].tolist()
         n = min(20, len(want))
-        assert got.response_ids[i, :n].tolist() == want[:n], f"prompt {i}"
+        prompt_ids = enc["input_ids"][0].tolist()
+
+        def logits_at(step: int, prompt_ids: list[int] = prompt_ids, want: list[int] = want, model: Any = hf) -> Tensor:
+            ids = torch.tensor([prompt_ids + want[:step]], device="cuda")  # lint: ignore[CUDA_HARDCODE] one-GPU test
+            with torch.no_grad():
+                return model(ids).logits[0, -1].float()
+
+        _assert_greedy_agreement(got.response_ids[i, :n].tolist(), want[:n], logits_at, tol=GREEDY_TIE_TOL)
     del hf
     torch.cuda.empty_cache()
 

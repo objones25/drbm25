@@ -24,6 +24,14 @@ dependencies = [
 vllm = [
     "vllm==0.19.0 ; sys_platform == 'linux'",
 ]
+analysis = [
+    "matplotlib==3.11.2",
+    "pyarrow==26.0.1",
+    "scikit-learn==1.9.1",
+    "scipy==1.18.1",
+    "sentence-transformers==5.7.0",
+    "wandb-workspaces==0.4.13",
+]
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]

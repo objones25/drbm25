@@ -311,7 +311,9 @@ def _log_to_wandb(
                 "report/query_stats": wandb.Table(
                     columns=["source", *_STAT_NAMES],
                     # NaN (no think length for original queries) goes to W&B as a missing value.
-                    data=[[n, *(None if math.isnan(v[key]) else v[key] for key in _STAT_NAMES)] for n, v in report.stats],
+                    data=[
+                        [n, *(None if math.isnan(v[key]) else v[key] for key in _STAT_NAMES)] for n, v in report.stats
+                    ],
                 ),
             }
         )

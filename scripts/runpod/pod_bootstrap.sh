@@ -26,6 +26,8 @@
 #
 # Environment (set by launch.sh in the pod body): DRBM25_REPO_URL, DRBM25_REF, DRBM25_RUNPOD_API_KEY,
 # DRBM25_HARD_DEADLINE_UNIX, TERMINATE_ON_FINISH; RUNPOD_POD_ID and RUNPOD_API_KEY are set by RunPod.
+# DRBM25_ENTRY (default scripts/runpod/run_all.sh) names the script to run, e.g. scripts/runpod/run_sampling.sh;
+# it must be a script directly under scripts/runpod/ in the checkout.
 # Also read: DRBM25_BUDGET_DEADLINE_UNIX, DRBM25_LAUNCH_ID (launch.sh), RESERVE_S (default 3600, as run_all.sh).
 # Test hooks: DRBM25_ROOT (default /workspace/drbm25), DRBM25_START_SH (default /start.sh), DRBM25_SLEEP
 # (command used for terminate backoff), DRBM25_WATCHDOG_ROUNDS (default 300).
@@ -308,7 +310,13 @@ main() {
     return 1
   fi
 
-  log "starting run_all.sh unattended"
+  local entry=${DRBM25_ENTRY:-scripts/runpod/run_all.sh}
+  # Only a script directly under scripts/runpod of the checkout: no path traversal, no arbitrary command.
+  if [[ ! $entry =~ ^scripts/runpod/[a-z_]+\.sh$ || ! -f $ROOT/repo/$entry ]]; then
+    log "error: DRBM25_ENTRY '$entry' is not a script under scripts/runpod/ in the checkout"
+    return 1
+  fi
+  log "starting $entry unattended"
   # The user's key (pods:write) comes in as DRBM25_RUNPOD_API_KEY so RunPod's pod-scoped RUNPOD_API_KEY cannot
   # shadow it; run_all.sh gets it as RUNPOD_API_KEY and the pod-scoped one as its fallback. Started in the
   # background and waited on, so a signal to this process interrupts the wait at once.
@@ -316,12 +324,12 @@ main() {
   (
     cd "$ROOT/repo" || exit 1
     export RUNPOD_API_KEY="${DRBM25_RUNPOD_API_KEY-}" DRBM25_NONINTERACTIVE=1 DRBM25_POD_START_UNIX="$pod_start_unix"
-    exec bash scripts/runpod/run_all.sh
+    exec bash "$entry"
   ) </dev/null &
   RUN_ALL_PID=$!
   wait "$RUN_ALL_PID" || rc=$?
   RUN_ALL_PID=''
-  log "run_all.sh exited with status $rc"
+  log "$entry exited with status $rc"
   mark_launch_done
   return "$rc"
 }

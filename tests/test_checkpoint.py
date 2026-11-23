@@ -289,9 +289,7 @@ def test_crash_between_move_aside_and_swap_leaves_loadable_checkpoint(
     assert load_checkpoint(found).train_state.step == 25
 
 
-def test_crash_while_deleting_old_copy_keeps_new_checkpoint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_crash_while_deleting_old_copy_keeps_new_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _save(tmp_path, 50)
     monkeypatch.setattr(shutil, "rmtree", _partial_rmtree)
     with pytest.raises(OSError, match="simulated crash"):

@@ -22,9 +22,7 @@ def offline_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_open_run_offline_records_config_and_job_type(cfg: Config) -> None:
-    with open_run(
-        cfg, run_name="t", reward_mode="normal", resume_id=None, extra_config={"git_sha": "abc123"}
-    ) as run:
+    with open_run(cfg, run_name="t", reward_mode="normal", resume_id=None, extra_config={"git_sha": "abc123"}) as run:
         assert run.config["ppo"]["batch_size"] == cfg.ppo.batch_size
         assert run.config["meta"]["git_sha"] == "abc123"
         assert run.config["retrieval"]["index_dir"] == str(cfg.retrieval.index_dir)
@@ -50,8 +48,9 @@ def test_open_run_uses_count_once_as_job_type(cfg: Config) -> None:
     ],
 )
 def test_open_run_rejects_secret_like_config_key(cfg: Config, extra: dict[str, object], path: str) -> None:
-    with pytest.raises(ValueError, match=rf"secret-like key '{path}'"), open_run(
-        cfg, run_name="t", reward_mode="normal", resume_id=None, extra_config=extra
+    with (
+        pytest.raises(ValueError, match=rf"secret-like key '{path}'"),
+        open_run(cfg, run_name="t", reward_mode="normal", resume_id=None, extra_config=extra),
     ):
         pytest.fail("block must not run")
 
@@ -63,8 +62,9 @@ def test_open_run_accepts_token_count_fields(cfg: Config) -> None:
 
 
 def test_open_run_marks_failed_on_exception(cfg: Config) -> None:
-    with pytest.raises(RuntimeError, match="boom"), open_run(
-        cfg, run_name="t", reward_mode="normal", resume_id=None, extra_config={}
+    with (
+        pytest.raises(RuntimeError, match="boom"),
+        open_run(cfg, run_name="t", reward_mode="normal", resume_id=None, extra_config={}),
     ):
         raise RuntimeError("boom")
     assert wandb.run is None

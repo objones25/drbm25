@@ -106,9 +106,7 @@ def test_score_rewrites_records_the_think_length_in_characters(searcher: Bm25Sea
         '  weigh the terms \n</think>\n<answer>\n{"query": "solar"}\n</answer>',
         "no tags at all",
     ]
-    records = score_rewrites(
-        [_example("q1"), _example("q2")], _TextEngine(texts), searcher, k=K, source="untrained"
-    )
+    records = score_rewrites([_example("q1"), _example("q2")], _TextEngine(texts), searcher, k=K, source="untrained")
     assert [r.think_chars for r in records] == [len("weigh the terms"), None]  # stripped; none on a format error
 
 
@@ -378,7 +376,9 @@ def _full_best(run_dir: Path) -> tuple[Path, PreTrainedModel]:
 def test_lora_best_rewrites_equal_the_live_actor(tmp_path: Path) -> None:
     cfg = load_config(SMOKE)
     best, live = _lora_best(tmp_path / "run")
-    want = HFGenerateEngine(live, build_tiny_tokenizer(), cfg.rollout, torch.device("cpu")).generate(_PROMPTS, greedy=True)
+    want = HFGenerateEngine(live, build_tiny_tokenizer(), cfg.rollout, torch.device("cpu")).generate(
+        _PROMPTS, greedy=True
+    )
     engine, source = run_eval_module._build_engine(cfg, best)
     got = engine.generate(_PROMPTS, greedy=True)
     assert source == "trained-normal"

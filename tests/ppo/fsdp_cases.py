@@ -119,9 +119,7 @@ class EchoW4Engine:
     def generate(self, prompts: Sequence[str], *, greedy: bool) -> RolloutBatch:
         del greedy
         self.seen += len(prompts)
-        texts = tuple(
-            f'</think>\n<answer>{{"query": "{"w4" if "w4" in p else "zz"}"}}</answer>' for p in prompts
-        )
+        texts = tuple(f'</think>\n<answer>{{"query": "{"w4" if "w4" in p else "zz"}"}}</answer>' for p in prompts)
         z = torch.zeros(len(prompts), 1, dtype=torch.long)
         return RolloutBatch(z, z, z, z, texts, torch.zeros(len(prompts), dtype=torch.bool))
 

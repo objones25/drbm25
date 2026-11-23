@@ -95,6 +95,11 @@ runpod_paths() {
   export UV_PYTHON_PREFERENCE=only-managed
   # The cache is on the network volume and the venv is not: hardlinks cannot cross filesystems.
   export UV_LINK_MODE=copy
+  # The runpod/pytorch image sets HF_HUB_ENABLE_HF_TRANSFER=1; the venv has no hf_transfer, so huggingface_hub
+  # would refuse every download (dataset and model).
+  unset HF_HUB_ENABLE_HF_TRANSFER
+  # vLLM's usage-stats thread phones home; under the test suite's network guard it raises in a thread.
+  export VLLM_NO_USAGE_STATS=1
   DRBM25_DONE_DIR="$DRBM25_ROOT/.done"
   DRBM25_LOG_DIR="$DRBM25_ROOT/logs"
   DRBM25_ENV_FILE="$DRBM25_ROOT/.env"
@@ -184,6 +189,13 @@ _prompt_var_body() {
     shift
   done
   if [[ -n ${!name-} ]] || { ((optional)) && [[ -n ${!name+set} ]]; }; then
+    return 0
+  fi
+  # shellcheck disable=SC2310 # a predicate: its status is the answer
+  if noninteractive && ((optional)); then
+    # RunPod drops empty pod env vars, so an optional answer skipped at launch arrives unset: treat it as empty.
+    printf -v "$name" '%s' ''
+    export "${name?}"
     return 0
   fi
   # shellcheck disable=SC2310 # a predicate: its status is the answer
@@ -609,7 +621,8 @@ _install_jdk_tarball() (
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
     --max-time 900 --output "$tarball" "$JDK_URL"
   verify_sha256 "$tarball" "$JDK_SHA256"
-  tar -xzf "$tarball" -C "$staging"
+  # --no-same-owner: as root on a pod, restoring the archive's uid fails on the network volume.
+  tar --no-same-owner -xzf "$tarball" -C "$staging"
   [[ -x $staging/$JDK_RELEASE/bin/java ]] || {
     _common_log "error: tarball did not contain $JDK_RELEASE/bin/java"
     exit 1
@@ -634,6 +647,23 @@ install_java21() {
     jdk_env
   fi
   require_java21
+  jvm_signal_chaining
+}
+
+# The JVM (pyserini, in-process via pyjnius) raises SIGSEGV on purpose and handles it itself. tvm_ffi, loaded by
+# vLLM, replaces the SIGSEGV handler from a library constructor, so the JVM's first routine SIGSEGV killed training
+# ("!!!!!!! Segfault encountered !!!!!!!"). libjsig is the JDK's signal chaining: preloaded, it keeps the JVM's
+# handler first and passes other signals on to tvm_ffi's. Exported, so every later Python process gets it.
+jvm_signal_chaining() {
+  local jsig=$JAVA_HOME/lib/libjsig.so
+  if [[ ! -f $jsig ]]; then
+    _runpod_log "error: $jsig not found; without it a SIGSEGV handler loaded after the JVM (tvm_ffi, via vLLM) kills training"
+    return 1
+  fi
+  case ":${LD_PRELOAD-}:" in
+    *":$jsig:"*) ;;
+    *) export LD_PRELOAD="$jsig${LD_PRELOAD:+:$LD_PRELOAD}" ;;
+  esac
 }
 
 _install_uv_tarball() (
@@ -651,7 +681,8 @@ _install_uv_tarball() (
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
     --max-time 300 --output "$tarball" "$UV_URL"
   verify_sha256 "$tarball" "$UV_SHA256"
-  tar -xzf "$tarball" -C "$staging"
+  # --no-same-owner: as root on a pod, restoring the archive's uid fails on the network volume.
+  tar --no-same-owner -xzf "$tarball" -C "$staging"
   [[ -x $staging/uv-x86_64-unknown-linux-gnu/uv ]] || {
     _common_log "error: tarball did not contain uv-x86_64-unknown-linux-gnu/uv"
     exit 1
@@ -706,6 +737,21 @@ print(f"model cached: {cfg.model.name}@{cfg.model.revision} -> {path}")
 PY
 }
 
+# Prints the configured model's snapshot dir from the HF cache, offline; fails when it is not cached.
+_model_snapshot_dir() {
+  HF_HUB_OFFLINE=1 _uv python -c '
+import sys
+from pathlib import Path
+
+from huggingface_hub import snapshot_download
+
+from drbm25.config import load_config
+
+cfg = load_config(Path(sys.argv[1]))
+print(snapshot_download(cfg.model.name, revision=cfg.model.revision, local_files_only=True))
+' "$RUNPOD_CONFIG"
+}
+
 # Prints "yes" when either run has a complete training checkpoint, else "no".
 _training_started() {
   local mode have
@@ -721,13 +767,22 @@ _training_started() {
 }
 
 smoke_stage() {
-  local micro saved='' rc tried='' started
+  local micro saved='' rc tried='' started snapshot
   local candidates=("${MICRO_BATCH_CANDIDATES[@]}")
   runpod_set_args
-  _runpod_log "GPU smoke: the gpu-marked tests (vLLM engine), then the 2-GPU memory check"
-  # --no-cov: the repo's coverage gate would fail a two-file run.
+  # The cache holds the pinned commit only (no refs/main), and the tests' network guard blocks resolving a
+  # repo name online, so the gpu tests load the snapshot directory offline.
   # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
-  if ! _uv_timeout "$SMOKE_TIMEOUT_S" pytest -p no:randomly --no-cov -m gpu tests/rollout/test_vllm_engine.py tests/ppo/test_models_full.py; then
+  if ! snapshot=$(_model_snapshot_dir); then
+    _runpod_log "error: the model snapshot is not in the HF cache ($HF_HOME); the model snapshot stage should have put it there"
+    return 1
+  fi
+  _runpod_log "GPU smoke: the gpu-marked tests (vLLM engine) on $snapshot, then the 2-GPU memory check"
+  # --no-cov: the repo's coverage gate would fail a two-file run. -W default: the suite's filterwarnings=error
+  # is for our code; a warning from real vLLM/torch (never run under it on CPU) must not fail the smoke.
+  # shellcheck disable=SC2310 # status is checked explicitly here, not left to set -e
+  if ! DRBM25_VLLM_TEST_MODEL=$snapshot HF_HUB_OFFLINE=1 _uv_timeout "$SMOKE_TIMEOUT_S" \
+    pytest -p no:randomly --no-cov -W default -m gpu tests/rollout/test_vllm_engine.py tests/ppo/test_models_full.py; then
     _runpod_log "error: GPU pytest failed"
     return 1
   fi

@@ -23,9 +23,7 @@ def test_should_stop_boundary_is_not_stop() -> None:
     assert should_stop(now_unix=0, deadline_unix=1000, mean_chunk_s=500, reserve_s=500) is False
 
 
-@pytest.mark.parametrize(
-    ("budget", "price"), [(100.0, 0.0), (100.0, -1.0), (0.0, 2.0), (-5.0, 2.0)]
-)
+@pytest.mark.parametrize(("budget", "price"), [(100.0, 0.0), (100.0, -1.0), (0.0, 2.0), (-5.0, 2.0)])
 def test_budget_rejects_nonpositive_inputs(budget: float, price: float) -> None:
     with pytest.raises(ValueError, match="positive"):
         deadline_from_budget(budget_usd=budget, price_per_hour=price, start_unix=0.0)
