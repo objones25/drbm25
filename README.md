@@ -1,6 +1,24 @@
 # drbm25
 
-PPO training of an LLM query rewriter with a BM25 reward (CS279 DeepRetrieval reproduction).
+PPO training of an LLM query rewriter with a BM25 reward: a CS291A class project that reproduces and extends the MS MARCO-Science
+BM25 result of DeepRetrieval (Jiang et al., 2025, [arXiv:2503.00223](https://arxiv.org/abs/2503.00223)).
+
+## Results
+
+Our baselines match the paper's (raw query nDCG@10 38.8 in both; untrained model 25.8 vs 25.9); our trained models reach
+39.7 and 39.6 against the paper's 41.1. We followed the released code, which trains with an nDCG cutoff of 10 where the paper's
+text says 3000; see the report's "Comparison with the paper" for this and other candidate causes, none tested. For the reproduction and an
+ablation, two Qwen2.5-3B-Instruct policies were trained for 1,751 PPO steps each, one with the standard BM25 reward and
+one with a count-once reward that collapses repeated query terms. On the 2,305 MS MARCO-Science dev queries
+the two reach nDCG@10 0.397 and 0.396 (raw query 0.388, untrained model 0.258); the difference is −0.0006, 95% CI
+[−0.0058, +0.0047]. Repetition did not pay under standard BM25 after the first steps (when the normal run drifted back into it, standard BM25
+scored those rewrites lower than count-once BM25), so the two rewards trained nearly the same thing, but the policies
+still differ in determinism, reasoning template and wording.
+
+- Write-up: [report/REPORT.md](report/REPORT.md); slides: `report/drbm25_results.pptx` (30-minute talk).
+- Training runs (W&B project `drbm25`): `hunfj08k` (normal), `yld3obpy` (count-once), `yk2tdsy3` (eval report).
+- Models: `objones25/drbm25-qwen2.5-3b-normal` and `objones25/drbm25-qwen2.5-3b-count_once` (private).
+- Sampled rewrites with reasoning and metrics: dataset `objones25/drbm25-rewrites` (private).
 
 ## Setup
 
@@ -8,6 +26,7 @@ PPO training of an LLM query rewriter with a BM25 reward (CS279 DeepRetrieval re
 java -version          # Java 21 is required by pyserini 2.x
 uv sync                # creates .venv from uv.lock (Python 3.12)
 uv sync --extra vllm   # Linux only: adds vllm==0.19.0
+uv sync --extra analysis  # behavior analysis: pyarrow, scipy, scikit-learn, matplotlib, sentence-transformers, wandb-workspaces
 uv run pytest          # default run deselects gpu and integration tests
 uv run ruff check .
 uv run pyright
@@ -158,6 +177,50 @@ base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct", revisi
 model = PeftModel.from_pretrained(base, "<user>/drbm25-qwen2.5-1.5b-lora-normal")
 tokenizer = AutoTokenizer.from_pretrained("<user>/drbm25-qwen2.5-1.5b-lora-normal")
 ```
+
+## Rewrite sampling and behavior analysis
+
+Samples every dev query N times from each policy and measures how the policies behave, not only how they
+score. Four modules, run in this order (all take `--help`):
+
+```bash
+# 1. Sample: one row per response (reasoning, rewrite, analyzed terms, top-10 docs, nDCG under both scorers).
+#    SOURCE is original | untrained | trained-normal | trained-count_once. Shards are resumable.
+uv run python -m drbm25.eval.sample --config CONFIG --source SOURCE --n 32 --out-dir samples/db \
+  [--model REPO] [--limit N] [--shard-size 128] [--base-seed 1234] [--set key=value ...]
+# 2. Metrics: per-sample, per-query and cross-policy tables, paired query-level comparisons, vocabulary statistics.
+uv run python -m drbm25.analysis.pipeline --db samples/db --index-dir INDEX --out samples/metrics \
+  [--no-embed] [--embed-device DEV] [--n-resamples 10000] [--c2st-permutations 200]
+# 3. Upload to a private Hugging Face dataset repo; every file is downloaded back and hash-checked.
+uv run python -m drbm25.analysis.hub --db samples/db --metrics samples/metrics --repo OWNER/NAME
+# 4. W&B run with tables and figures, plus a W&B Report.
+uv run python -m drbm25.analysis.report --metrics samples/metrics --db samples/db --config CONFIG [--no-report]
+```
+
+Sampling uses the training prompt, tokenizer and rollout settings (temperature 0.6, top-p 1, no top-k), and the
+same seed per query for every source; each row records the seed its sample used. Comparisons treat the query as
+the unit: per-query means first, then a paired bootstrap over queries and a Wilcoxon test; nDCG of normal vs
+count-once is the primary comparison and every other metric is Benjamini-Yekutieli corrected.
+
+On RunPod, `scripts/runpod/run_sampling.sh` runs all four steps on one GPU against the `drbm25` volume: a pilot
+(`PILOT_N` samples, default 8, on the first `PILOT_LIMIT` queries, default 64), the metrics on the pilot as a
+smoke test, the full sampling (`SAMPLE_N`, default 32), metrics, upload (`SAMPLE_HUB_REPO`, default
+`objones25/drbm25-rewrites`) and report. A failed report does not fail the run. Its failure marker is
+`/workspace/drbm25/samples/FAILED`, so it never blocks a training launch. `launch.sh` has no mode for it yet:
+create the pod the way `launch.sh` does (same image, volume and secrets, `pod_bootstrap.sh` as the command) and
+set `DRBM25_ENTRY=scripts/runpod/run_sampling.sh`; the bootstrap only accepts a script directly under
+`scripts/runpod/`. The 2026-11-22 run took about 2.3 hours on one RTX PRO 4500 (about $1.70).
+
+To rebuild the write-up and slides from the W&B runs and the dataset:
+
+```bash
+uv run python scripts/report_data.py --wandb WANDB_DIR --metrics METRICS_DIR --db DB_DIR  # report/data, report/figures
+uv run python scripts/deck_figures.py                                                    # report/figures/deck_*.png
+(cd report/deck && npm ci && node build.js)                                             # report/drbm25_results.pptx
+```
+
+`WANDB_DIR` holds `<run_id>_history.json` for `hunfj08k` and `yld3obpy` (from `wandb.Api().run(...).scan_history()`)
+and the eval tables of `yk2tdsy3`; `METRICS_DIR` and `DB_DIR` are the `metrics/` and `db/` folders of the dataset.
 
 ## Running on SDSC Expanse (2x V100 32GB)
 
