@@ -1,0 +1,2561 @@
+{
+ "means": {
+  "original": {
+   "n_samples": 1,
+   "ndcg_normal_mean": 0.3877260964168962,
+   "ndcg_normal_std": 0.0,
+   "ndcg_count_once_mean": 0.38772920605576416,
+   "ndcg_count_once_std": 0.0,
+   "distinct_fraction": 1.0,
+   "vendi_jaccard": 1.0,
+   "mean_is_format_error": 0.0,
+   "mean_retention": 1.0,
+   "mean_jaccard": 1.0,
+   "mean_n_added": 0.0,
+   "mean_n_dropped": 0.0,
+   "mean_n_kept": 5.154880694143167,
+   "mean_n_terms": 5.216052060737527,
+   "mean_n_unique": 5.154880694143167,
+   "mean_duplicate_rate": 0.00839788421814976,
+   "mean_max_multiplicity": 1.0533622559652929,
+   "mean_has_repeat": 0.051626898047722344,
+   "mean_rewrite_chars": 41.676355748373105,
+   "mean_idf_mean": 4.753769646482967,
+   "mean_idf_max": 7.509762082850932,
+   "mean_rbo_vs_original": 1.0,
+   "mean_jaccard10_vs_original": 1.0,
+   "mean_embed_sim": 1.0
+  },
+  "untrained": {
+   "n_samples": 32,
+   "ndcg_normal_mean": 0.26318978952413846,
+   "ndcg_normal_std": 0.19325142015359023,
+   "ndcg_count_once_mean": 0.25821022660867926,
+   "ndcg_count_once_std": 0.19048884282767103,
+   "distinct_fraction": 0.9796637744034707,
+   "vendi_jaccard": 10.916285743166531,
+   "best_of_2": 0.35707013032688006,
+   "best_of_4": 0.44486573550716924,
+   "best_of_8": 0.5223239018132071,
+   "best_of_16": 0.5899550345377719,
+   "pairwise_rbo": 0.28782465565989074,
+   "mean_is_format_error": 0.004284164859002169,
+   "mean_hit_max_tokens": 0.0008134490238611713,
+   "mean_n_response_tokens": 157.4397234273319,
+   "mean_mean_logprob": -0.6690217136390963,
+   "mean_think_chars": 601.6740807151353,
+   "mean_think_words": 99.55208828983277,
+   "mean_retention": 0.58098114842825,
+   "mean_jaccard": 0.3955973535766716,
+   "mean_n_added": 2.9423954820624414,
+   "mean_n_dropped": 2.1972038365919553,
+   "mean_n_kept": 2.957676857551212,
+   "mean_n_terms": 6.994249620600148,
+   "mean_n_unique": 5.900072339613653,
+   "mean_duplicate_rate": 0.12061526081037137,
+   "mean_max_multiplicity": 1.6520987027903125,
+   "mean_has_repeat": 0.457928531673166,
+   "mean_rewrite_chars": 71.58995035960258,
+   "mean_idf_mean": 5.809559583560794,
+   "mean_idf_max": 8.258166945908433,
+   "mean_added_idf_mean": 5.976987793909878,
+   "mean_rbo_vs_original": 0.32927632750083563,
+   "mean_jaccard10_vs_original": 0.25966814534087856,
+   "mean_reasoning_overlap": 0.8866397779405703,
+   "mean_embed_sim": 0.7679855020741121
+  },
+  "trained-normal": {
+   "n_samples": 32,
+   "ndcg_normal_mean": 0.3960131731466846,
+   "ndcg_normal_std": 0.02212457711701037,
+   "ndcg_count_once_mean": 0.3960884831691151,
+   "ndcg_count_once_std": 0.02187238605211076,
+   "distinct_fraction": 0.11193058568329718,
+   "vendi_jaccard": 1.1789191945656885,
+   "best_of_2": 0.4044284004969824,
+   "best_of_4": 0.4105529956487329,
+   "best_of_8": 0.4159889604608116,
+   "best_of_16": 0.4214267032771376,
+   "pairwise_rbo": 0.947903063858633,
+   "mean_is_format_error": 0.0006778741865509761,
+   "mean_hit_max_tokens": 4.067245119305857e-05,
+   "mean_n_response_tokens": 66.45215563991323,
+   "mean_mean_logprob": -0.10466064990504519,
+   "mean_think_chars": 183.84728552935414,
+   "mean_think_words": 30.63997253516199,
+   "mean_retention": 0.7335744330951631,
+   "mean_jaccard": 0.7241050754713139,
+   "mean_n_added": 0.11054072493177525,
+   "mean_n_dropped": 1.2753792346831672,
+   "mean_n_kept": 3.8795014594599997,
+   "mean_n_terms": 4.0398878040125155,
+   "mean_n_unique": 3.990042184391775,
+   "mean_duplicate_rate": 0.00766237594963837,
+   "mean_max_multiplicity": 1.044137918969981,
+   "mean_has_repeat": 0.042849958015534255,
+   "mean_rewrite_chars": 33.43569189816434,
+   "mean_idf_mean": 5.469722848886123,
+   "mean_idf_max": 7.458137947401126,
+   "mean_added_idf_mean": 5.4573351828908025,
+   "mean_rbo_vs_original": 0.7094539803904903,
+   "mean_jaccard10_vs_original": 0.6190114161984256,
+   "mean_reasoning_overlap": 0.9753592467360295,
+   "mean_embed_sim": 0.9364912047515627
+  },
+  "trained-count_once": {
+   "n_samples": 32,
+   "ndcg_normal_mean": 0.39581480303530514,
+   "ndcg_normal_std": 0.006434851031836344,
+   "ndcg_count_once_mean": 0.3960473686897622,
+   "ndcg_count_once_std": 0.006404602032524373,
+   "distinct_fraction": 0.04978308026030369,
+   "vendi_jaccard": 1.0359608685111337,
+   "best_of_2": 0.398239774704408,
+   "best_of_4": 0.4000926972642818,
+   "best_of_8": 0.4016858559926381,
+   "best_of_16": 0.4030663908773351,
+   "pairwise_rbo": 0.9865708531247757,
+   "mean_is_format_error": 0.00014913232104121475,
+   "mean_hit_max_tokens": 9.490238611713666e-05,
+   "mean_n_response_tokens": 70.99330260303688,
+   "mean_mean_logprob": -0.01286016716602654,
+   "mean_think_chars": 253.76188466517388,
+   "mean_think_words": 41.866548876915544,
+   "mean_retention": 0.7187321193469423,
+   "mean_jaccard": 0.7158738363957367,
+   "mean_n_added": 0.037287516119035954,
+   "mean_n_dropped": 1.3813121020222519,
+   "mean_n_kept": 3.7735685921209154,
+   "mean_n_terms": 3.8521452062736787,
+   "mean_n_unique": 3.810856108239951,
+   "mean_duplicate_rate": 0.0067024819889510414,
+   "mean_max_multiplicity": 1.0373031978168077,
+   "mean_has_repeat": 0.03670579385627318,
+   "mean_rewrite_chars": 31.27613451772844,
+   "mean_idf_mean": 5.519180533802239,
+   "mean_idf_max": 7.44102439644377,
+   "mean_added_idf_mean": 4.763872126743957,
+   "mean_rbo_vs_original": 0.7043969577178438,
+   "mean_jaccard10_vs_original": 0.6105447091131083,
+   "mean_reasoning_overlap": 0.9709849723657802,
+   "mean_embed_sim": 0.9392511676157752
+  }
+ },
+ "variance": {
+  "untrained": {
+   "tau2": 0.07396416519205123,
+   "sigma2": 0.056086844420669205,
+   "icc": 0.5687319568860673,
+   "k": 32
+  },
+  "trained-normal": {
+   "tau2": 0.14939040648084265,
+   "sigma2": 0.0047078421856635265,
+   "icc": 0.9694490870181655,
+   "k": 32
+  },
+  "trained-count_once": {
+   "tau2": 0.15257688148962126,
+   "sigma2": 0.0014351572071081742,
+   "icc": 0.9906815258128346,
+   "k": 32
+  }
+ },
+ "rewrite_class": {
+  "untrained": {
+   "same": 0.01757801862643647,
+   "compression": 0.11544850498338871,
+   "expansion": 0.05476281248298023,
+   "substitution": 0.15748052938293122,
+   "mixed": 0.6547301345242634
+  },
+  "trained-normal": {
+   "same": 0.08850902184235518,
+   "compression": 0.8332247998914666,
+   "expansion": 0.005413105413105413,
+   "substitution": 0.01769095102428436,
+   "mixed": 0.0551621218287885
+  },
+  "trained-count_once": {
+   "same": 0.05434649961355408,
+   "compression": 0.9095174171853178,
+   "expansion": 8.135703534963186e-05,
+   "substitution": 0.0010847604713284248,
+   "mixed": 0.03496996569445009
+  }
+ },
+ "pair_comparisons": [
+  {
+   "metric": "best_of_16",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.4214267032771376,
+   "mean_b": 0.40306639087733515,
+   "mean_diff": -0.018360312399802504,
+   "ci_low": -0.022998399105704472,
+   "ci_high": -0.013803232327167344,
+   "wilcoxon_p": 1.6915382542829534e-17,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.2444245313186625e-16
+  },
+  {
+   "metric": "best_of_2",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.40442840049698237,
+   "mean_b": 0.398239774704408,
+   "mean_diff": -0.0061886257925743956,
+   "ci_low": -0.010338005244171715,
+   "ci_high": -0.0020840668548598056,
+   "wilcoxon_p": 0.004034927381218255,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 0.024837634934744553
+  },
+  {
+   "metric": "best_of_4",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.4105529956487329,
+   "mean_b": 0.4000926972642818,
+   "mean_diff": -0.010460298384451042,
+   "ci_low": -0.014630140189440581,
+   "ci_high": -0.00642547733658456,
+   "wilcoxon_p": 9.992070874775588e-08,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 6.551915245528905e-07
+  },
+  {
+   "metric": "best_of_8",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.4159889604608116,
+   "mean_b": 0.4016858559926382,
+   "mean_diff": -0.014303104468173441,
+   "ci_low": -0.01861338090702794,
+   "ci_high": -0.010123904701230816,
+   "wilcoxon_p": 5.877708729951085e-13,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 4.122970257260735e-12
+  },
+  {
+   "metric": "distinct_fraction",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.11193058568329718,
+   "mean_b": 0.04978308026030369,
+   "mean_diff": -0.06214750542299349,
+   "ci_low": -0.06569956616052061,
+   "ci_high": -0.058636117136659435,
+   "wilcoxon_p": 1.913087593081535e-228,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.9234645967938798e-227
+  },
+  {
+   "metric": "mean_added_idf_mean",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 4.781025451570052,
+   "mean_b": 4.706091841534386,
+   "mean_diff": -0.07493361003566576,
+   "ci_low": -0.39811253659752416,
+   "ci_high": 0.300931179850057,
+   "wilcoxon_p": 0.21480501982742073,
+   "n_queries": 81,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.0
+  },
+  {
+   "metric": "mean_duplicate_rate",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.007662375949638369,
+   "mean_b": 0.0067024819889510414,
+   "mean_diff": -0.0009598939606873285,
+   "ci_low": -0.001731939527389056,
+   "ci_high": -0.00017687576402767598,
+   "wilcoxon_p": 3.0339102203408248e-05,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 0.0001906479256288549
+  },
+  {
+   "metric": "mean_embed_sim",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.9364912047515628,
+   "mean_b": 0.9392511676157749,
+   "mean_diff": 0.002759962864212474,
+   "ci_low": 0.001022787228241716,
+   "ci_high": 0.004522261478231312,
+   "wilcoxon_p": 0.04903020129853003,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 0.2957769107252178
+  },
+  {
+   "metric": "mean_has_repeat",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.04284995801553425,
+   "mean_b": 0.03670579385627318,
+   "mean_diff": -0.006144164159261074,
+   "ci_low": -0.010145447746833671,
+   "ci_high": -0.002211061594709959,
+   "wilcoxon_p": 2.820514648264595e-06,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.8100938727225404e-05
+  },
+  {
+   "metric": "mean_hit_max_tokens",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 4.067245119305857e-05,
+   "mean_b": 9.490238611713666e-05,
+   "mean_diff": 5.422993492407809e-05,
+   "ci_low": -2.7114967462039044e-05,
+   "ci_high": 0.00013557483731019523,
+   "wilcoxon_p": 0.2059032107320684,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.0
+  },
+  {
+   "metric": "mean_idf_max",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 7.458137947401125,
+   "mean_b": 7.441024396443771,
+   "mean_diff": -0.01711355095735576,
+   "ci_low": -0.03320565325001887,
+   "ci_high": -0.0011213465214260385,
+   "wilcoxon_p": 1.6419191082471192e-08,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.1005501566974379e-07
+  },
+  {
+   "metric": "mean_idf_mean",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 5.469722848886124,
+   "mean_b": 5.519180533802239,
+   "mean_diff": 0.04945768491611607,
+   "ci_low": 0.03586451082565649,
+   "ci_high": 0.06321718900609002,
+   "wilcoxon_p": 8.69137168493699e-22,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 6.608961361248348e-21
+  },
+  {
+   "metric": "mean_is_format_error",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.0006778741865509761,
+   "mean_b": 0.00014913232104121475,
+   "mean_diff": -0.0005287418655097614,
+   "ci_low": -0.0012879609544468548,
+   "ci_high": 0.0,
+   "wilcoxon_p": 0.10232135670918849,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 0.6131704173985472
+  },
+  {
+   "metric": "mean_jaccard",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.7241050754713139,
+   "mean_b": 0.7158738363957365,
+   "mean_diff": -0.008231239075577206,
+   "ci_low": -0.01261489252122064,
+   "ci_high": -0.003949699434631449,
+   "wilcoxon_p": 0.0023141869262233595,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 0.014342915219578091
+  },
+  {
+   "metric": "mean_jaccard10_vs_original",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.6190114161984256,
+   "mean_b": 0.6105447091131083,
+   "mean_diff": -0.00846670708531729,
+   "ci_low": -0.014580107403163586,
+   "ci_high": -0.0024566266244261045,
+   "wilcoxon_p": 0.20893217973909417,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.0
+  },
+  {
+   "metric": "mean_max_multiplicity",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 1.044137918969981,
+   "mean_b": 1.0373031978168077,
+   "mean_diff": -0.006834721153173326,
+   "ci_low": -0.011090896368343713,
+   "ci_high": -0.002617414369183409,
+   "wilcoxon_p": 6.546870382642125e-07,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 4.231531307115209e-06
+  },
+  {
+   "metric": "mean_mean_logprob",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": -0.10466064990504519,
+   "mean_b": -0.01286016716602654,
+   "mean_diff": 0.09180048273901864,
+   "ci_low": 0.08954746392687643,
+   "ci_high": 0.09406182973552227,
+   "wilcoxon_p": 0.0,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 0.0
+  },
+  {
+   "metric": "mean_n_added",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.11054072493177523,
+   "mean_b": 0.037287516119035954,
+   "mean_diff": -0.07325320881273928,
+   "ci_low": -0.088833136427022,
+   "ci_high": -0.05818930120855285,
+   "wilcoxon_p": 2.731173868854684e-39,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 2.167885540009792e-38
+  },
+  {
+   "metric": "mean_n_dropped",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 1.2753792346831672,
+   "mean_b": 1.3813121020222516,
+   "mean_diff": 0.10593286733908454,
+   "ci_low": 0.08179785198226656,
+   "ci_high": 0.13029708851474953,
+   "wilcoxon_p": 1.523310034321764e-16,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.1027324157657702e-15
+  },
+  {
+   "metric": "mean_n_kept",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 3.87950145946,
+   "mean_b": 3.7735685921209154,
+   "mean_diff": -0.10593286733908454,
+   "ci_low": -0.13029708851474953,
+   "ci_high": -0.08179785198226658,
+   "wilcoxon_p": 1.523310034321764e-16,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.1027324157657702e-15
+  },
+  {
+   "metric": "mean_n_response_tokens",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 66.45215563991323,
+   "mean_b": 70.99330260303688,
+   "mean_diff": 4.541146963123644,
+   "ci_low": 3.814624796637744,
+   "ci_high": 5.259465835140997,
+   "wilcoxon_p": 1.5783174461581168e-20,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.1901589377687275e-19
+  },
+  {
+   "metric": "mean_n_terms",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 4.0398878040125155,
+   "mean_b": 3.852145206273679,
+   "mean_diff": -0.18774259773883664,
+   "ci_low": -0.21425856651788835,
+   "ci_high": -0.1609250749097834,
+   "wilcoxon_p": 5.028181205086726e-54,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 4.1742290269943515e-53
+  },
+  {
+   "metric": "mean_n_unique",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 3.990042184391775,
+   "mean_b": 3.8108561082399515,
+   "mean_diff": -0.17918607615182383,
+   "ci_low": -0.20417420242010456,
+   "ci_high": -0.1537973730969541,
+   "wilcoxon_p": 1.0999367427627686e-52,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 8.966781398801436e-52
+  },
+  {
+   "metric": "mean_rbo_vs_original",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.7094539803904903,
+   "mean_b": 0.7043969577178438,
+   "mean_diff": -0.005057022672646495,
+   "ci_low": -0.010755686365523823,
+   "ci_high": 0.0006376011718722865,
+   "wilcoxon_p": 0.6345763358086685,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.0
+  },
+  {
+   "metric": "mean_reasoning_overlap",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.9753592467360295,
+   "mean_b": 0.9709849723657801,
+   "mean_diff": -0.004374274370249297,
+   "ci_low": -0.008660504462758917,
+   "ci_high": -0.0001383908977402932,
+   "wilcoxon_p": 0.9744960703611545,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.0
+  },
+  {
+   "metric": "mean_retention",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.733574433095163,
+   "mean_b": 0.7187321193469423,
+   "mean_diff": -0.014842313748220856,
+   "ci_low": -0.018695404456279326,
+   "ci_high": -0.010986310448426751,
+   "wilcoxon_p": 4.3302658990192467e-13,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 3.0612334248596417e-12
+  },
+  {
+   "metric": "mean_rewrite_chars",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 33.43569189816434,
+   "mean_b": 31.276134517728444,
+   "mean_diff": -2.1595573804359054,
+   "ci_low": -2.410434772988161,
+   "ci_high": -1.9117411245339222,
+   "wilcoxon_p": 1.0529065382102226e-84,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 8.904261301922033e-84
+  },
+  {
+   "metric": "mean_think_chars",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 183.84728552935414,
+   "mean_b": 253.76188466517388,
+   "mean_diff": 69.91459913581974,
+   "ci_low": 66.56391268980478,
+   "ci_high": 73.2313466408054,
+   "wilcoxon_p": 3.891958827529255e-241,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 4.002003061108185e-240
+  },
+  {
+   "metric": "mean_think_words",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 30.639972535161988,
+   "mean_b": 41.866548876915544,
+   "mean_diff": 11.226576341753551,
+   "ci_low": 10.651704195385207,
+   "ci_high": 11.797684414579106,
+   "wilcoxon_p": 6.979144292507286e-216,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 6.939890793274565e-215
+  },
+  {
+   "metric": "ndcg_count_once_mean",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.3960884831691151,
+   "mean_b": 0.39604736868976215,
+   "mean_diff": -4.1114479352941346e-05,
+   "ci_low": -0.004387074816574815,
+   "ci_high": 0.004270327320098762,
+   "wilcoxon_p": 0.12805947764845604,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": true,
+   "q_by": null
+  },
+  {
+   "metric": "ndcg_count_once_std",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.02187238605211076,
+   "mean_b": 0.006404602032524373,
+   "mean_diff": -0.015467784019586386,
+   "ci_low": -0.018365098174756664,
+   "ci_high": -0.012643738479769443,
+   "wilcoxon_p": 2.2770956557251112e-33,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 1.7762951780986057e-32
+  },
+  {
+   "metric": "ndcg_normal_mean",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.3960131731466846,
+   "mean_b": 0.39581480303530514,
+   "mean_diff": -0.00019837011137945195,
+   "ci_low": -0.004513153916892501,
+   "ci_high": 0.004093393894600193,
+   "wilcoxon_p": 0.16246147523631616,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": true,
+   "q_by": null
+  },
+  {
+   "metric": "ndcg_normal_std",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.02212457711701037,
+   "mean_b": 0.006434851031836344,
+   "mean_diff": -0.015689726085174025,
+   "ci_low": -0.018608974481836717,
+   "ci_high": -0.012808068103125405,
+   "wilcoxon_p": 1.1072099279967428e-33,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 8.71212267986129e-33
+  },
+  {
+   "metric": "pairwise_rbo",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 0.9479030638586331,
+   "mean_b": 0.9865708531247755,
+   "mean_diff": 0.0386677892661427,
+   "ci_low": 0.033622607251688544,
+   "ci_high": 0.04394038209641641,
+   "wilcoxon_p": 4.6700382210856584e-52,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 3.773064797178224e-51
+  },
+  {
+   "metric": "vendi_jaccard",
+   "a": "trained-normal",
+   "b": "trained-count_once",
+   "mean_a": 1.1789191945656883,
+   "mean_b": 1.0359608685111337,
+   "mean_diff": -0.14295832605455466,
+   "ci_low": -0.16141320496787212,
+   "ci_high": -0.12554461987444981,
+   "wilcoxon_p": 2.3726588513402945e-87,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 2.025448870446441e-86
+  }
+ ],
+ "n_pair_metrics": 33,
+ "n_pair_sig": 26,
+ "untrained_vs_trained": [
+  {
+   "metric": "distinct_fraction",
+   "a": "untrained",
+   "b": "trained-normal",
+   "mean_a": 0.9796637744034707,
+   "mean_b": 0.11193058568329718,
+   "mean_diff": -0.8677331887201736,
+   "ci_low": -0.8716919739696313,
+   "ci_high": -0.8637879609544469,
+   "wilcoxon_p": 0.0,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 0.0
+  },
+  {
+   "metric": "distinct_fraction",
+   "a": "untrained",
+   "b": "trained-count_once",
+   "mean_a": 0.9796637744034707,
+   "mean_b": 0.04978308026030369,
+   "mean_diff": -0.929880694143167,
+   "ci_low": -0.9320905639913232,
+   "ci_high": -0.9276437093275488,
+   "wilcoxon_p": 0.0,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 0.0
+  },
+  {
+   "metric": "ndcg_normal_mean",
+   "a": "untrained",
+   "b": "trained-normal",
+   "mean_a": 0.26318978952413846,
+   "mean_b": 0.3960131731466846,
+   "mean_diff": 0.1328233836225461,
+   "ci_low": 0.1233205087421642,
+   "ci_high": 0.1426588010688709,
+   "wilcoxon_p": 9.070255357705911e-125,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 8.461349441414534e-124
+  },
+  {
+   "metric": "ndcg_normal_mean",
+   "a": "untrained",
+   "b": "trained-count_once",
+   "mean_a": 0.26318978952413846,
+   "mean_b": 0.39581480303530514,
+   "mean_diff": 0.13262501351116668,
+   "ci_low": 0.1229634636096425,
+   "ci_high": 0.14242941793324085,
+   "wilcoxon_p": 5.4511572450779195e-123,
+   "n_queries": 2305,
+   "n_dropped_nan": 0,
+   "primary": false,
+   "q_by": 5.033319345053024e-122
+  }
+ ],
+ "c2st": {
+  "rewrite": {
+   "accuracy": 0.6531453362255965,
+   "p_value": 0.004975124378109453,
+   "top_features_a": [
+    "and",
+    "that",
+    "does",
+    "causes",
+    "to",
+    "happens",
+    "occurs",
+    "called",
+    "how",
+    "why",
+    "and is",
+    "is",
+    "used for",
+    "is a",
+    "makes",
+    "has",
+    "for",
+    "do",
+    "what",
+    "which"
+   ],
+   "top_features_b": [
+    "a",
+    "number",
+    "cause",
+    "an",
+    "the",
+    "kind of",
+    "kind",
+    "occur",
+    "happen",
+    "number of",
+    "make",
+    "molecule is",
+    "the earth",
+    "be found",
+    "determine",
+    "affect",
+    "be",
+    "rock is",
+    "provide",
+    "difference"
+   ]
+  },
+  "think": {
+   "accuracy": 0.9995661605206074,
+   "p_value": 0.004975124378109453,
+   "top_features_a": [
+    "be",
+    "can be",
+    "can",
+    "query can",
+    "user",
+    "the user",
+    "user query",
+    "broken down",
+    "be broken",
+    "down into",
+    "key",
+    "broken",
+    "key terms",
+    "into key",
+    "into",
+    "down",
+    "is the",
+    "in",
+    "a corpus",
+    "corpus with"
+   ],
+   "top_features_b": [
+    "is",
+    "for",
+    "the",
+    "query",
+    "the query",
+    "not",
+    "terms",
+    "looking for",
+    "looking",
+    "clear",
+    "query is",
+    "boolean",
+    "that",
+    "use",
+    "the terms",
+    "is looking",
+    "does not",
+    "does",
+    "operators",
+    "boolean operators"
+   ]
+  }
+ },
+ "js": {
+  "untrained|trained-normal": {
+   "rewrite_1": 0.12595057040797478,
+   "rewrite_2": 0.30755626337689423,
+   "rewrite_3": 0.2702958325698727,
+   "think_1": 0.2523387260383777
+  },
+  "untrained|trained-count_once": {
+   "rewrite_1": 0.12809730150176168,
+   "rewrite_2": 0.3082727466038519,
+   "rewrite_3": 0.2620976854586676,
+   "think_1": 0.4449024233296009
+  },
+  "trained-normal|trained-count_once": {
+   "rewrite_1": 0.016751258844714133,
+   "rewrite_2": 0.08222788678397083,
+   "rewrite_3": 0.13482588390784217,
+   "think_1": 0.5177531959118574
+  }
+ },
+ "fightin": {
+  "untrained|trained-normal": {
+   "rewrite_1": {
+    "a": [
+     [
+      "definit",
+      26.87485393939993
+     ],
+     [
+      "format",
+      25.985399668718596
+     ],
+     [
+      "biologi",
+      23.722701954213022
+     ],
+     [
+      "composit",
+      21.68926014776816
+     ],
+     [
+      "physic",
+      21.116081447289325
+     ],
+     [
+      "mechan",
+      20.47156598241425
+     ],
+     [
+      "biolog",
+      17.115662722448846
+     ],
+     [
+      "ecolog",
+      16.696212348912585
+     ],
+     [
+      "genet",
+      16.613040165168094
+     ],
+     [
+      "what",
+      16.15953396591136
+     ],
+     [
+      "astronomi",
+      16.041930409241907
+     ],
+     [
+      "impact",
+      15.857032078700488
+     ],
+     [
+      "chemistri",
+      15.670509893576428
+     ],
+     [
+      "marin",
+      15.496363042837988
+     ],
+     [
+      "environment",
+      15.289920465791164
+     ]
+    ],
+    "b": [
+     [
+      "type",
+      -41.6755134911734
+     ],
+     [
+      "between",
+      -41.41667025631857
+     ],
+     [
+      "form",
+      -40.49384636998606
+     ],
+     [
+      "us",
+      -38.199700969221766
+     ],
+     [
+      "from",
+      -37.656767693071906
+     ],
+     [
+      "make",
+      -37.29629179709176
+     ],
+     [
+      "have",
+      -36.59161755103244
+     ],
+     [
+      "do",
+      -36.414351645323066
+     ],
+     [
+      "occur",
+      -33.43874443212022
+     ],
+     [
+      "made",
+      -31.00868885581972
+     ],
+     [
+      "found",
+      -30.02286117376615
+     ],
+     [
+      "mean",
+      -29.967342079363373
+     ],
+     [
+      "most",
+      -28.97492775061506
+     ],
+     [
+      "differ",
+      -28.707021224098597
+     ],
+     [
+      "up",
+      -27.217455155909487
+     ]
+    ]
+   },
+   "rewrite_2": {
+    "a": [
+     [
+      "chemic reaction",
+      9.526380995588713
+     ],
+     [
+      "climat chang",
+      9.404385161081022
+     ],
+     [
+      "spars retriev",
+      8.188421955924587
+     ],
+     [
+      "coval bond",
+      6.817767936084933
+     ],
+     [
+      "atom number",
+      6.207314608941676
+     ],
+     [
+      "molecular biologi",
+      6.1874675624340965
+     ],
+     [
+      "plate tecton",
+      6.1032802896846245
+     ],
+     [
+      "rock format",
+      6.010201788359303
+     ],
+     [
+      "igneou rock",
+      5.952354014800215
+     ],
+     [
+      "volcan activ",
+      5.694366125775566
+     ],
+     [
+      "what doe",
+      5.648162569856204
+     ],
+     [
+      "atp product",
+      5.60364469919596
+     ],
+     [
+      "physic properti",
+      5.541472090110185
+     ],
+     [
+      "environment factor",
+      5.389088832993284
+     ],
+     [
+      "how do",
+      5.311713748127605
+     ]
+    ],
+    "b": [
+     [
+      "differ between",
+      -34.67537445314609
+     ],
+     [
+      "come from",
+      -25.015336107887865
+     ],
+     [
+      "make up",
+      -22.96188236383338
+     ],
+     [
+      "how mani",
+      -19.629024691081995
+     ],
+     [
+      "why do",
+      -16.34670056792116
+     ],
+     [
+      "type rock",
+      -15.665945483103625
+     ],
+     [
+      "happen when",
+      -15.039614241808506
+     ],
+     [
+      "type bond",
+      -14.857375450013542
+     ],
+     [
+      "made up",
+      -14.311923292558658
+     ],
+     [
+      "rock form",
+      -13.644222882336827
+     ],
+     [
+      "differ from",
+      -12.868019590045296
+     ],
+     [
+      "us make",
+      -12.703899713940308
+     ],
+     [
+      "approxim how",
+      -12.414020575415089
+     ],
+     [
+      "type soil",
+      -11.901223134396046
+     ],
+     [
+      "process occur",
+      -11.668481712230424
+     ]
+    ]
+   },
+   "rewrite_3": {
+    "a": [
+     [
+      "corpu spars retriev",
+      4.232550955701421
+     ],
+     [
+      "carbon dioxid water",
+      3.343728624726322
+     ],
+     [
+      "base pair dna",
+      3.240284062832735
+     ],
+     [
+      "cell wall plant",
+      3.1785421359934207
+     ],
+     [
+      "metamorph rock format",
+      3.084541255423461
+     ],
+     [
+      "red blood cell",
+      3.0737683238180695
+     ],
+     [
+      "tecton plate movement",
+      2.8884437314752005
+     ],
+     [
+      "oxygen carbon dioxid",
+      2.8473308582643138
+     ],
+     [
+      "bacteria cell wall",
+      2.636989161729427
+     ],
+     [
+      "carbon dioxid nitrogen",
+      2.572623458440371
+     ],
+     [
+      "pair dna replic",
+      2.5184699901474823
+     ],
+     [
+      "heat human bodi",
+      2.3932110436504757
+     ],
+     [
+      "specif heat human",
+      2.353530634567167
+     ],
+     [
+      "continent drift theori",
+      2.353530634567167
+     ],
+     [
+      "volcano low viscos",
+      2.318989522185832
+     ]
+    ],
+    "b": [
+     [
+      "cellular respir occur",
+      -9.417344767682255
+     ],
+     [
+      "earth surfac cover",
+      -9.319723430228672
+     ],
+     [
+      "approxim how mani",
+      -9.14414355513312
+     ],
+     [
+      "two differ between",
+      -8.980450073773204
+     ],
+     [
+      "factor control viscos",
+      -8.105493897137519
+     ],
+     [
+      "all organ compound",
+      -8.104052655575023
+     ],
+     [
+      "approxim how much",
+      -8.09840426552784
+     ],
+     [
+      "how much earth",
+      -8.088127843052238
+     ],
+     [
+      "much earth surfac",
+      -8.088127843052238
+     ],
+     [
+      "control viscos magma",
+      -8.072100048411384
+     ],
+     [
+      "siberian tiger live",
+      -8.072100048411384
+     ],
+     [
+      "relationship between temperatur",
+      -8.047114423055685
+     ],
+     [
+      "type plate boundari",
+      -8.032426472575127
+     ],
+     [
+      "bond between two",
+      -7.973051116975174
+     ],
+     [
+      "differ between chemic",
+      -7.973051116975174
+     ]
+    ]
+   },
+   "think_1": {
+    "a": [
+     [
+      "we",
+      182.44963140697098
+     ],
+     [
+      "specif",
+      110.42947478257021
+     ],
+     [
+      "more",
+      104.35591288272505
+     ],
+     [
+      "us",
+      103.76950288193893
+     ],
+     [
+      "group",
+      94.72444404811974
+     ],
+     [
+      "includ",
+      86.48665800546648
+     ],
+     [
+      "what",
+      82.95373560981898
+     ],
+     [
+      "about",
+      81.35392456299725
+     ],
+     [
+      "make",
+      76.30170812459619
+     ],
+     [
+      "relat",
+      73.34687556121962
+     ],
+     [
+      "also",
+      71.50585696429816
+     ],
+     [
+      "result",
+      62.3720861959608
+     ],
+     [
+      "context",
+      62.310541453847144
+     ],
+     [
+      "ensur",
+      58.80998581422031
+     ],
+     [
+      "concept",
+      58.39559730575455
+     ]
+    ],
+    "b": [
+     [
+      "kei",
+      -256.64745864999577
+     ],
+     [
+      "down",
+      -235.03181810748373
+     ],
+     [
+      "broken",
+      -224.7272515143994
+     ],
+     [
+      "creat",
+      -127.04477727574131
+     ],
+     [
+      "separ",
+      -120.06864998386399
+     ],
+     [
+      "user",
+      -114.1549061675926
+     ],
+     [
+      "most",
+      -104.52054655859143
+     ],
+     [
+      "can",
+      -103.85866318505005
+     ],
+     [
+      "typic",
+      -89.72718814560746
+     ],
+     [
+      "term",
+      -73.01225910784737
+     ],
+     [
+      "rewritten",
+      -70.27323989020928
+     ],
+     [
+      "water",
+      -65.84175736799108
+     ],
+     [
+      "found",
+      -63.64895655047766
+     ],
+     [
+      "form",
+      -58.15603958056393
+     ],
+     [
+      "approxim",
+      -52.59049129511284
+     ]
+    ]
+   }
+  },
+  "untrained|trained-count_once": {
+   "rewrite_1": {
+    "a": [
+     [
+      "what",
+      26.67659764238068
+     ],
+     [
+      "definit",
+      26.313342518244585
+     ],
+     [
+      "format",
+      25.728422816698213
+     ],
+     [
+      "biologi",
+      23.362436050575727
+     ],
+     [
+      "composit",
+      21.118836029618002
+     ],
+     [
+      "how",
+      20.653275504088676
+     ],
+     [
+      "physic",
+      20.333703901687404
+     ],
+     [
+      "mechan",
+      20.025927802357547
+     ],
+     [
+      "biolog",
+      16.74401528207588
+     ],
+     [
+      "genet",
+      16.60132318727206
+     ],
+     [
+      "ecolog",
+      16.38559433591011
+     ],
+     [
+      "astronomi",
+      15.67677451609777
+     ],
+     [
+      "impact",
+      15.522246711858998
+     ],
+     [
+      "marin",
+      15.0574838295521
+     ],
+     [
+      "environment",
+      14.888602169622805
+     ]
+    ],
+    "b": [
+     [
+      "form",
+      -41.96800699025804
+     ],
+     [
+      "between",
+      -41.89025747436894
+     ],
+     [
+      "us",
+      -38.751134246158145
+     ],
+     [
+      "make",
+      -38.202896547955106
+     ],
+     [
+      "from",
+      -36.903951962128225
+     ],
+     [
+      "have",
+      -32.396699866680486
+     ],
+     [
+      "number",
+      -32.02347024803083
+     ],
+     [
+      "made",
+      -31.980192726284823
+     ],
+     [
+      "type",
+      -31.629520349528285
+     ],
+     [
+      "found",
+      -30.88438958752535
+     ],
+     [
+      "differ",
+      -30.87343564675427
+     ],
+     [
+      "occur",
+      -30.743529370833492
+     ],
+     [
+      "most",
+      -29.36919921066551
+     ],
+     [
+      "produc",
+      -28.27287658246164
+     ],
+     [
+      "kind",
+      -27.918598562809194
+     ]
+    ]
+   },
+   "rewrite_2": {
+    "a": [
+     [
+      "how mani",
+      9.656417228419997
+     ],
+     [
+      "climat chang",
+      8.833524682935115
+     ],
+     [
+      "chemic reaction",
+      8.623855809686516
+     ],
+     [
+      "spars retriev",
+      8.10391377089574
+     ],
+     [
+      "atom number",
+      7.705617799331517
+     ],
+     [
+      "coval bond",
+      6.355888059097592
+     ],
+     [
+      "molecular biologi",
+      5.854630246286803
+     ],
+     [
+      "cell wall",
+      5.78835619696747
+     ],
+     [
+      "plate tecton",
+      5.7707966889918
+     ],
+     [
+      "cell cell",
+      5.42378152891847
+     ],
+     [
+      "volcan activ",
+      5.363659571639398
+     ],
+     [
+      "physic properti",
+      5.211456057846777
+     ],
+     [
+      "igneou rock",
+      4.99634507398018
+     ],
+     [
+      "definit explan",
+      4.555053900699881
+     ],
+     [
+      "marin biologi",
+      4.423575321414994
+     ]
+    ],
+    "b": [
+     [
+      "differ between",
+      -35.563016761504926
+     ],
+     [
+      "come from",
+      -22.640539596227054
+     ],
+     [
+      "make up",
+      -22.521632140716257
+     ],
+     [
+      "made up",
+      -14.843470458956219
+     ],
+     [
+      "rock form",
+      -14.372082908360117
+     ],
+     [
+      "type rock",
+      -13.855368087205848
+     ],
+     [
+      "differ from",
+      -13.32975280479313
+     ],
+     [
+      "us make",
+      -12.079791777407845
+     ],
+     [
+      "type cell",
+      -11.919589183507306
+     ],
+     [
+      "each other",
+      -11.890637021847922
+     ],
+     [
+      "process occur",
+      -11.88415848070858
+     ],
+     [
+      "type bond",
+      -11.863334071902123
+     ],
+     [
+      "dna molecul",
+      -11.66574705184363
+     ],
+     [
+      "factor affect",
+      -11.472025685025992
+     ],
+     [
+      "take place",
+      -11.07825837475471
+     ]
+    ]
+   },
+   "rewrite_3": {
+    "a": [
+     [
+      "corpu spars retriev",
+      4.163587421329617
+     ],
+     [
+      "cell cell wall",
+      3.110829180540266
+     ],
+     [
+      "southern hemispher australia",
+      2.476838390241864
+     ],
+     [
+      "oxygen carbon dioxid",
+      2.3793083034431923
+     ],
+     [
+      "giant terrestri planet",
+      2.087373681797859
+     ],
+     [
+      "ga giant terrestri",
+      2.087373681797859
+     ],
+     [
+      "how mani atp",
+      2.039885924292791
+     ],
+     [
+      "anim reproduc sexual",
+      1.9882210445805781
+     ],
+     [
+      "how mani moon",
+      1.9658790887291904
+     ],
+     [
+      "approxim how mani",
+      1.964708494053719
+     ],
+     [
+      "papain dna isol",
+      1.8926488217863708
+     ],
+     [
+      "angl right angl",
+      1.8755536744178678
+     ],
+     [
+      "rock metamorph rock",
+      1.8642272612935922
+     ],
+     [
+      "plant cell cell",
+      1.8517564662142825
+     ],
+     [
+      "retriev spars retriev",
+      1.826559536274952
+     ]
+    ],
+    "b": [
+     [
+      "cellular respir occur",
+      -9.865581461445156
+     ],
+     [
+      "earth surfac cover",
+      -9.804746039926398
+     ],
+     [
+      "two differ between",
+      -9.219499441900942
+     ],
+     [
+      "all organ compound",
+      -8.417028698657054
+     ],
+     [
+      "factor control viscos",
+      -8.40918794162039
+     ],
+     [
+      "us diatomac earth",
+      -8.406647363037486
+     ],
+     [
+      "from each other",
+      -8.405489545539911
+     ],
+     [
+      "caus global warm",
+      -8.388763200141407
+     ],
+     [
+      "relationship between temperatur",
+      -8.38517019912128
+     ],
+     [
+      "metal react water",
+      -8.357946863383072
+     ],
+     [
+      "control viscos magma",
+      -8.355519331246626
+     ],
+     [
+      "siberian tiger live",
+      -8.355519331246626
+     ],
+     [
+      "type plate boundari",
+      -8.304703084317765
+     ],
+     [
+      "electron share between",
+      -8.293759879466371
+     ],
+     [
+      "differ between dna",
+      -8.293759879466371
+     ]
+    ]
+   },
+   "think_1": {
+    "a": [
+     [
+      "we",
+      188.61166181215967
+     ],
+     [
+      "can",
+      147.4898842679976
+     ],
+     [
+      "relev",
+      124.13505324382614
+     ],
+     [
+      "more",
+      109.6433177514939
+     ],
+     [
+      "literatur",
+      102.82094124726292
+     ],
+     [
+      "retriev",
+      99.36103771381256
+     ],
+     [
+      "need",
+      92.40574371619985
+     ],
+     [
+      "find",
+      89.95093327559267
+     ],
+     [
+      "what",
+      87.55988522988119
+     ],
+     [
+      "spars",
+      83.82902703278893
+     ],
+     [
+      "make",
+      81.36794232241037
+     ],
+     [
+      "about",
+      78.59569470287424
+     ],
+     [
+      "includ",
+      74.15760190115428
+     ],
+     [
+      "relat",
+      69.63554184360042
+     ],
+     [
+      "down",
+      69.15004873297278
+     ]
+    ],
+    "b": [
+     [
+      "look",
+      -307.26874939969355
+     ],
+     [
+      "parenthes",
+      -296.525928702945
+     ],
+     [
+      "term",
+      -295.5618511904277
+     ],
+     [
+      "doe",
+      -295.25393332294095
+     ],
+     [
+      "between",
+      -289.8642861498288
+     ],
+     [
+      "clear",
+      -265.3208560775274
+     ],
+     [
+      "queri",
+      -257.43129907878074
+     ],
+     [
+      "relationship",
+      -251.8602636959918
+     ],
+     [
+      "group",
+      -251.70391440166338
+     ],
+     [
+      "requir",
+      -230.09831059444238
+     ],
+     [
+      "straightforward",
+      -227.96949797108417
+     ],
+     [
+      "boolean",
+      -214.57490073127803
+     ],
+     [
+      "oper",
+      -202.88228653545832
+     ],
+     [
+      "us",
+      -127.68835191335363
+     ],
+     [
+      "unambigu",
+      -77.357582345512
+     ]
+    ]
+   }
+  },
+  "trained-normal|trained-count_once": {
+   "rewrite_1": {
+    "a": [
+     [
+      "how",
+      26.12970154046954
+     ],
+     [
+      "why",
+      20.798411943302387
+     ],
+     [
+      "call",
+      20.036798473652915
+     ],
+     [
+      "mani",
+      19.98730838891733
+     ],
+     [
+      "what",
+      18.56214974906892
+     ],
+     [
+      "ha",
+      16.28778168951711
+     ],
+     [
+      "do",
+      15.80941527667805
+     ],
+     [
+      "happen",
+      11.785365195929739
+     ],
+     [
+      "which",
+      11.674848179133809
+     ],
+     [
+      "when",
+      10.271363875139185
+     ],
+     [
+      "type",
+      9.041051889520165
+     ],
+     [
+      "doe",
+      8.568391713999869
+     ],
+     [
+      "describ",
+      7.281893584525528
+     ],
+     [
+      "belong",
+      7.152979557013586
+     ],
+     [
+      "hi",
+      6.66152402260916
+     ]
+    ],
+    "b": [
+     [
+      "number",
+      -28.276553276355983
+     ],
+     [
+      "kind",
+      -21.9731209243512
+     ],
+     [
+      "big",
+      -8.331177842594203
+     ],
+     [
+      "mai",
+      -5.6728146144865885
+     ],
+     [
+      "your",
+      -5.643571633503217
+     ],
+     [
+      "j",
+      -5.597691037173188
+     ],
+     [
+      "old",
+      -5.256326437951667
+     ],
+     [
+      "while",
+      -5.059730155155548
+     ],
+     [
+      "long",
+      -5.05874900293299
+     ],
+     [
+      "kcl",
+      -4.012453899913864
+     ],
+     [
+      "qubec",
+      -4.002777654597145
+     ],
+     [
+      "ar",
+      -3.9579840513045492
+     ],
+     [
+      "i",
+      -3.957963532169298
+     ],
+     [
+      "meat",
+      -3.9579130342824906
+     ],
+     [
+      "win",
+      -3.9442684026709234
+     ]
+    ]
+   },
+   "rewrite_2": {
+    "a": [
+     [
+      "how mani",
+      19.769037817441777
+     ],
+     [
+      "happen when",
+      11.112174987411866
+     ],
+     [
+      "how much",
+      5.282782204612184
+     ],
+     [
+      "earth from",
+      5.2000210711680515
+     ],
+     [
+      "type soil",
+      5.082049963346181
+     ],
+     [
+      "type plant",
+      5.068211388826085
+     ],
+     [
+      "molecul do",
+      4.641399306495311
+     ],
+     [
+      "known father",
+      4.624377684429656
+     ],
+     [
+      "scientist known",
+      4.624377684429656
+     ],
+     [
+      "why do",
+      4.603532283984994
+     ],
+     [
+      "do plant",
+      4.5282054440726
+     ],
+     [
+      "process call",
+      4.504133089770246
+     ],
+     [
+      "much water",
+      4.463958364665437
+     ],
+     [
+      "mean quizlet",
+      4.142347087859832
+     ],
+     [
+      "come from",
+      4.022308347806536
+     ]
+    ],
+    "b": [
+     [
+      "number bond",
+      -5.63795710273775
+     ],
+     [
+      "number atom",
+      -5.532236690762222
+     ],
+     [
+      "number neutron",
+      -5.420076702820097
+     ],
+     [
+      "moon affect",
+      -5.039312289880398
+     ],
+     [
+      "degre you",
+      -4.466179402392285
+     ],
+     [
+      "you need",
+      -4.466140743713529
+     ],
+     [
+      "number allel",
+      -4.281363993805573
+     ],
+     [
+      "number speci",
+      -4.275628334603337
+     ],
+     [
+      "uv light",
+      -4.043421582398971
+     ],
+     [
+      "light biologi",
+      -4.043010484116154
+     ],
+     [
+      "chlorid kcl",
+      -4.042687400503377
+     ],
+     [
+      "surviv reproduc",
+      -4.042408133426059
+     ],
+     [
+      "environ surviv",
+      -4.042361378388999
+     ],
+     [
+      "number valenc",
+      -4.042079581218094
+     ],
+     [
+      "which organ",
+      -4.042032403473573
+     ]
+    ]
+   },
+   "rewrite_3": {
+    "a": [
+     [
+      "scientist known father",
+      4.517934374187042
+     ],
+     [
+      "how much water",
+      4.432625797252131
+     ],
+     [
+      "southern hemispher australia",
+      3.7766676315035745
+     ],
+     [
+      "base pair have",
+      3.773731745204434
+     ],
+     [
+      "organ inherit from",
+      3.773508784754685
+     ],
+     [
+      "burmes python get",
+      3.773285058615407
+     ],
+     [
+      "temperatur kept constant",
+      3.7730605650612157
+     ],
+     [
+      "pressur temperatur kept",
+      3.7730605650612157
+     ],
+     [
+      "ha maximum densiti",
+      3.7730605650612157
+     ],
+     [
+      "can organ insid",
+      3.7729480299629685
+     ],
+     [
+      "materi can organ",
+      3.7729480299629685
+     ],
+     [
+      "wai materi can",
+      3.7729480299629685
+     ],
+     [
+      "travel ha maximum",
+      3.7729480299629685
+     ],
+     [
+      "wave travel ha",
+      3.7729480299629685
+     ],
+     [
+      "coral reef form",
+      3.7490183613347727
+     ]
+    ],
+    "b": [
+     [
+      "moon affect ocean",
+      -5.129534791394174
+     ],
+     [
+      "degre you need",
+      -4.583817017232552
+     ],
+     [
+      "cell plant cell",
+      -4.57955345016848
+     ],
+     [
+      "radiat uv light",
+      -4.098629770571247
+     ],
+     [
+      "uv light biologi",
+      -4.098629770571247
+     ],
+     [
+      "potassium chlorid kcl",
+      -4.0981473427025135
+     ],
+     [
+      "environ surviv reproduc",
+      -4.097449129124773
+     ],
+     [
+      "compound ionic compound",
+      -4.097449129124773
+     ],
+     [
+      "most often why",
+      -4.097237580657917
+     ],
+     [
+      "organ characterist suit",
+      -4.097166849808553
+     ],
+     [
+      "characterist suit environ",
+      -4.097166849808553
+     ],
+     [
+      "suit environ surviv",
+      -4.097166849808553
+     ],
+     [
+      "number proton lithium",
+      -4.097166849808553
+     ],
+     [
+      "process which organ",
+      -4.097096011449166
+     ],
+     [
+      "which organ characterist",
+      -4.097096011449166
+     ]
+    ]
+   },
+   "think_1": {
+    "a": [
+     [
+      "can",
+      170.49703398193162
+     ],
+     [
+      "down",
+      112.47385094644807
+     ],
+     [
+      "relev",
+      108.7973629594622
+     ],
+     [
+      "spars",
+      84.36991200083467
+     ],
+     [
+      "retriev",
+      84.21751820396523
+     ],
+     [
+      "literatur",
+      80.81762315615327
+     ],
+     [
+      "need",
+      80.24957057353025
+     ],
+     [
+      "find",
+      79.82081902375836
+     ],
+     [
+      "creat",
+      72.08809650014203
+     ],
+     [
+      "most",
+      69.08236535888435
+     ],
+     [
+      "we",
+      65.31803425002285
+     ],
+     [
+      "corpu",
+      58.66148256886847
+     ],
+     [
+      "water",
+      56.83956153603473
+     ],
+     [
+      "broken",
+      56.156937997676046
+     ],
+     [
+      "includ",
+      55.65950122249506
+     ]
+    ],
+    "b": [
+     [
+      "queri",
+      -192.6249426652447
+     ],
+     [
+      "between",
+      -174.493317886729
+     ],
+     [
+      "us",
+      -169.614606339458
+     ],
+     [
+      "term",
+      -157.25197393812218
+     ],
+     [
+      "group",
+      -151.7969851537927
+     ],
+     [
+      "doe",
+      -135.43155093649688
+     ],
+     [
+      "requir",
+      -118.37189051307122
+     ],
+     [
+      "relationship",
+      -107.16630612328785
+     ],
+     [
+      "look",
+      -70.6098968327601
+     ],
+     [
+      "oper",
+      -58.57862576176966
+     ],
+     [
+      "clear",
+      -45.07154352557645
+     ],
+     [
+      "how",
+      -43.5763940026581
+     ],
+     [
+      "ani",
+      -43.21243172623543
+     ],
+     [
+      "someth",
+      -42.17170735165478
+     ],
+     [
+      "boolean",
+      -35.73058262026821
+     ]
+    ]
+   }
+  }
+ },
+ "cross_policy": {
+  "n": 2305,
+  "same_modal_rewrite": 0.08069414316702819,
+  "rbo_modal_mean": 0.9098146844904369,
+  "rbo_modal_median": 1.0,
+  "rbo_modal_eq1": 0.7748373101952277,
+  "jaccard10_modal_mean": 0.8897000984803111
+ },
+ "greedy_eval": {
+  "ndcg": [
+   {
+    "source": "original",
+    "ndcg10_normal": 0.38772609641689626,
+    "ndcg10_count_once": 0.3877292060557642
+   },
+   {
+    "source": "untrained",
+    "ndcg10_normal": 0.2575191608211928,
+    "ndcg10_count_once": 0.25791135812302174
+   },
+   {
+    "source": "trained-normal",
+    "ndcg10_normal": 0.3966837266025103,
+    "ndcg10_count_once": 0.3970491035465968
+   },
+   {
+    "source": "trained-count_once",
+    "ndcg10_normal": 0.39612855348608955,
+    "ndcg10_count_once": 0.39648039246331374
+   }
+  ],
+  "paired_ci": [
+   {
+    "comparison": "trained-count_once - trained-normal",
+    "scorer": "nDCG@10 normal",
+    "mean_diff": -0.0005551731164207176,
+    "ci_low": -0.005787960195943648,
+    "ci_high": 0.004714027713690336
+   },
+   {
+    "comparison": "trained-count_once - trained-normal",
+    "scorer": "nDCG@10 count_once",
+    "mean_diff": -0.0005687110832829427,
+    "ci_low": -0.00585165792652621,
+    "ci_high": 0.004680867978839348
+   },
+   {
+    "comparison": "trained-normal: normal - count_once",
+    "scorer": "nDCG@10",
+    "mean_diff": -0.00036537694408644286,
+    "ci_low": -0.001376626135348991,
+    "ci_high": 0.0006028296705181214
+   },
+   {
+    "comparison": "trained-count_once: normal - count_once",
+    "scorer": "nDCG@10",
+    "mean_diff": -0.00035183897722421804,
+    "ci_low": -0.0013615512962027916,
+    "ci_high": 0.0005656702809428879
+   },
+   {
+    "comparison": "untrained - original",
+    "scorer": "nDCG@10 normal",
+    "mean_diff": -0.1302069355957034,
+    "ci_low": -0.14402057884544336,
+    "ci_high": -0.11640273678729784
+   },
+   {
+    "comparison": "untrained - original",
+    "scorer": "nDCG@10 count_once",
+    "mean_diff": -0.1298178479327424,
+    "ci_low": -0.14362191788751869,
+    "ci_high": -0.11604871939050179
+   }
+  ],
+  "query_stats": [
+   {
+    "source": "original",
+    "mean_n_terms": 5.216052060737527,
+    "mean_n_unique_terms": 5.154880694143167,
+    "repeat_ratio": 0.011727522249022706,
+    "any_repeat_rate": 0.051626898047722344,
+    "format_error_rate": 0.0,
+    "mean_think_chars": null
+   },
+   {
+    "source": "untrained",
+    "mean_n_terms": 6.628734622144113,
+    "mean_n_unique_terms": 5.645869947275923,
+    "repeat_ratio": 0.14827334791542388,
+    "any_repeat_rate": 0.4165202108963093,
+    "format_error_rate": 0.012581344902386117,
+    "mean_think_chars": 579.2855887521969
+   },
+   {
+    "source": "trained-normal",
+    "mean_n_terms": 4.035590277777778,
+    "mean_n_unique_terms": 3.986545138888889,
+    "repeat_ratio": 0.01215315121531512,
+    "any_repeat_rate": 0.04296875,
+    "format_error_rate": 0.0004338394793926247,
+    "mean_think_chars": 182.80642361111111
+   },
+   {
+    "source": "trained-count_once",
+    "mean_n_terms": 3.8529284164859003,
+    "mean_n_unique_terms": 3.8108459869848157,
+    "repeat_ratio": 0.010922193446683931,
+    "any_repeat_rate": 0.03731019522776573,
+    "format_error_rate": 0.0,
+    "mean_think_chars": 253.2299349240781
+   }
+  ]
+ },
+ "think_len_median": {
+  "count_once": 245,
+  "normal": 182,
+  "untrained": 579
+ },
+ "patterns": {
+  "untrained": {
+   "boolean_syntax_in_rewrite": 0.9838259219088937,
+   "think_has_digit": 0.07205802603036876,
+   "think_starts_broken_down": 0.0,
+   "think_mentions_no_boolean_needed": 0.00014913232104121475,
+   "think_starts_query_is_looking_for": 4.067245119305857e-05,
+   "n": 73760
+  },
+  "trained-normal": {
+   "boolean_syntax_in_rewrite": 0.11552331887201735,
+   "think_has_digit": 0.1051382863340564,
+   "think_starts_broken_down": 0.6460818872017353,
+   "think_mentions_no_boolean_needed": 0.0,
+   "think_starts_query_is_looking_for": 0.0,
+   "n": 73760
+  },
+  "trained-count_once": {
+   "boolean_syntax_in_rewrite": 0.0029148590021691972,
+   "think_has_digit": 0.0039587852494577,
+   "think_starts_broken_down": 0.0,
+   "think_mentions_no_boolean_needed": 0.9769658351409979,
+   "think_starts_query_is_looking_for": 0.9982104121475054,
+   "n": 73760
+  }
+ }
+}

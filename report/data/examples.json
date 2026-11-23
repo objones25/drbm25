@@ -1,0 +1,530 @@
+{
+ "how_many_vs_number": [
+  {
+   "qid": "dev-1286",
+   "query": "how many galaxies exist?",
+   "original_ndcg": 0.0,
+   "untrained": {
+    "modal_rewrite": "number of spiral galaxies in the local group AND (time period: 100 years OR time period: 1000 years) AND limit: 1000",
+    "modal_count": 1,
+    "distinct": 32,
+    "mean_ndcg": 0.073832384603401,
+    "think_sample0": "The user query \"how many galaxies exist? \" is very broad and could lead to a lengthy and possibly unmanageable list of results. To narrow down the search and make it more targeted for sparse retrieval, we need to include specific information or parameters.\n- We can add a Boolean operator to limit the search to a specific time period or type of galaxies.\n- We can also include a maximum limit to the number of galaxies we are interested in, as the total number of galaxies is not known and could be too large.",
+    "rewrite_sample0": "number of spiral galaxies in the local group AND (time period: 100 years OR time period: 1000 years) AND limit: 1000",
+    "ndcg_sample0": 0.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "how many galaxies exist",
+    "modal_count": 20,
+    "distinct": 5,
+    "mean_ndcg": 0.0,
+    "think_sample0": "The user query can be broken down into key terms: \"Galaxies\" and \"exist\". The number of galaxies is a known quantity, but the exact number can vary depending on the criteria used. A common estimate is that there are about 100 billion galaxies in the observable universe.",
+    "rewrite_sample0": "how many galaxies exist",
+    "ndcg_sample0": 0.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "number of galaxies exist",
+    "modal_count": 30,
+    "distinct": 2,
+    "mean_ndcg": 0.0,
+    "think_sample0": "The query is looking for the number of galaxies that exist. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "number of galaxies exist",
+    "ndcg_sample0": 0.0
+   }
+  },
+  {
+   "qid": "dev-1565",
+   "query": "model of glucose and how many atp",
+   "original_ndcg": 0.0,
+   "untrained": {
+    "modal_rewrite": "(model of glucose) AND (how many ATP)",
+    "modal_count": 2,
+    "distinct": 31,
+    "mean_ndcg": 0.0,
+    "think_sample0": "The user's query \"model of glucose and how many atp\" seems to be asking for a model of glucose and a count of ATP molecules. However, \"model of glucose\" and \"how many atp\" appear to be two separate concepts. \nTo find relevant literature on both aspects, we should use the OR operator to group these two concepts together. We also need to ensure that the model of glucose and the count of ATP are considered separately, hence the use of AND operator. \nThe query can be rephrased to: \"model of glucose AND (how many ATOMS OR how many ATP)\"\nThe word \"ATP\" is likely referring to \"ATOMS\" as it is commonly used in chemistry context.",
+    "rewrite_sample0": "model of glucose AND (how many ATOMS OR how many ATP)",
+    "ndcg_sample0": 0.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "model of Glucose and how many ATP",
+    "modal_count": 29,
+    "distinct": 4,
+    "mean_ndcg": 0.0,
+    "think_sample0": "The user query can be broken down into key terms: \"model\" and \"Glucose and how many ATP\". A possible model could be the glycolysis pathway, and the number of ATP produced can be 4.",
+    "rewrite_sample0": "model of Glucose and how many ATP",
+    "ndcg_sample0": 0.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "model of glucose and number atp",
+    "modal_count": 28,
+    "distinct": 4,
+    "mean_ndcg": 0.0,
+    "think_sample0": "The query is looking for a model of glucose and how many atp. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "model of glucose and number atp",
+    "ndcg_sample0": 0.0
+   }
+  },
+  {
+   "qid": "dev-638",
+   "query": "how many chromosomes do carp have",
+   "original_ndcg": 1.0,
+   "untrained": {
+    "modal_rewrite": "(chromosome count OR number of chromosomes) AND (carp OR fish)",
+    "modal_count": 1,
+    "distinct": 32,
+    "mean_ndcg": 0.643891553221988,
+    "think_sample0": "The user query \"How many chromosomes do carp have?\" is a straightforward numerical question. To find relevant literature in a corpus with sparse retrieval, we need to rephrase the query to incorporate more specific terms and use Boolean operators to enhance search quality. Since we don't have specific terms in the original query, we can use a more general and comprehensive search term. By adding \"chromosome count\" and using broader terms related to fish, we can improve the retrieval. We'll use the OR operator to group these terms together.",
+    "rewrite_sample0": "(chromosome count OR number of chromosomes) AND (carp OR fish)",
+    "ndcg_sample0": 1.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "how many chromosomes do Carp have",
+    "modal_count": 9,
+    "distinct": 14,
+    "mean_ndcg": 0.9149888146234035,
+    "think_sample0": "The user query can be broken down into key terms: \"Chromosomes\" and \"Carp have X Chromosomes\". The number of chromosomes in Carp is 20.",
+    "rewrite_sample0": "Chromosomes do Carp have 20",
+    "ndcg_sample0": 1.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "number of chromosomes carp",
+    "modal_count": 30,
+    "distinct": 2,
+    "mean_ndcg": 1.0,
+    "think_sample0": "The query is looking for the number of chromosomes that are found in a carp. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "number chromosomes carp",
+    "ndcg_sample0": 1.0
+   }
+  },
+  {
+   "qid": "dev-642",
+   "query": "how many billion years is one gyr",
+   "original_ndcg": 1.0,
+   "untrained": {
+    "modal_rewrite": "what is a gigayear and how many billion years is it",
+    "modal_count": 1,
+    "distinct": 32,
+    "mean_ndcg": 0.8415836424397936,
+    "think_sample0": "The user query is asking about a unit of time called \"gyr\" and how many billion years it represents. However, \"gyr\" is likely an abbreviation for \"gigayear\", which is a unit of time equal to 1 billion years. The user might be seeking a definition or confirmation of this. The query could benefit from being rephrased to clarify the intent behind the question, such as whether they need a definition or a conversion. The query could be rewritten to include the term \"gigayear\" to ensure it is clear and precise.",
+    "rewrite_sample0": "what is a gigayear and how many billion years is it",
+    "ndcg_sample0": 1.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "how many billion years is one Gyr",
+    "modal_count": 12,
+    "distinct": 12,
+    "mean_ndcg": 1.0,
+    "think_sample0": "The user query can be broken down into key terms: \"one billion years\" and \"one Gyr\". The term \"Gyr\" stands for Gigayear, which is equal to 1 billion years.",
+    "rewrite_sample0": "one billion years is one Gyr",
+    "ndcg_sample0": 1.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "number of billion years is one gyr",
+    "modal_count": 29,
+    "distinct": 2,
+    "mean_ndcg": 1.0,
+    "think_sample0": "The query is looking for the number of billion years is one gyr. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "number of billion years is one gyr",
+    "ndcg_sample0": 1.0
+   }
+  }
+ ],
+ "how_many_vs_number_count": 25,
+ "untrained_repeat": [
+  {
+   "qid": "dev-1504",
+   "query": "where do aquatic animals live",
+   "original_ndcg": 1.0,
+   "untrained": {
+    "modal_rewrite": "aquatic animals AND (fish OR mammals OR amphibians) AND (oceans OR lakes OR rivers)",
+    "modal_count": 2,
+    "distinct": 31,
+    "mean_ndcg": 0.21799228380915286,
+    "think_sample0": "The user query \"where do aquatic animals live\" seems to be asking for information about the habitats of aquatic animals. For document retrieval purposes, we should aim to make the query more specific and to include key terms that are likely to appear in relevant literature. We should also consider including synonyms or broader terms. \nFirst, we can use \"aquatic animals\" as the main subject. Then, we can include \"habitats\" to specify the type of information we are looking for. \nTo make the query more inclusive and to show usage of Boolean operators and grouping, we can add \"AND\" to connect \"aquatic animals\" and \"habitats\" and \"OR\" to include a range of aquatic environments. We might also consider synonyms for \"aquatic animals\" like \"marine animals\" or \"freshwater animals\".",
+    "rewrite_sample0": "aquatic animals AND (habitats OR marine animals OR freshwater animals)",
+    "ndcg_sample0": 0.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "Aquatic animals live",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 1.0,
+    "think_sample0": "The user query can be broken down into key terms: \"Aquatic animals\" and \"live\". The most relevant terms for finding relevant literature in a corpus with sparse retrieval would be \"Aquatic animals\" and \"live\".",
+    "rewrite_sample0": "Aquatic animals live",
+    "ndcg_sample0": 1.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "aquatic animals live",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 1.0,
+    "think_sample0": "The query is looking for the habitats of aquatic animals. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "aquatic animals live",
+    "ndcg_sample0": 1.0
+   }
+  },
+  {
+   "qid": "dev-1554",
+   "query": "what is an ionizable group",
+   "original_ndcg": 1.0,
+   "untrained": {
+    "modal_rewrite": "ionizable group AND (carboxyl group OR amino group OR sulfonic acid group)",
+    "modal_count": 1,
+    "distinct": 32,
+    "mean_ndcg": 0.3112686957814609,
+    "think_sample0": "The user query is \"what is an ionizable group\". To find relevant literature in a corpus with sparse retrieval, we need to refine the query by specifying more about the context or the exact nature of the ionizable group being referred to. This will help in making the search more specific and improving the chances of retrieving relevant literature.",
+    "rewrite_sample0": "ionizable group AND (carboxyl group OR amino group OR sulfonic acid group)",
+    "ndcg_sample0": 0.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "Ionizable group",
+    "modal_count": 22,
+    "distinct": 2,
+    "mean_ndcg": 1.0,
+    "think_sample0": "The user query can be broken down into key terms: \"Ionizable\" and \"group\". An ionizable group is a functional group that can form ions when dissolved in water. Common examples include -OH, -NO2, -CN, -COOH, etc.",
+    "rewrite_sample0": "Ionizable group",
+    "ndcg_sample0": 1.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "an ionizable group",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 1.0,
+    "think_sample0": "The query is looking for an ionizable group. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "an ionizable group",
+    "ndcg_sample0": 1.0
+   }
+  },
+  {
+   "qid": "dev-1735",
+   "query": "where do xenon come from",
+   "original_ndcg": 1.0,
+   "untrained": {
+    "modal_rewrite": "xenon AND (origin OR source)",
+    "modal_count": 2,
+    "distinct": 31,
+    "mean_ndcg": 0.010416666666666666,
+    "think_sample0": "The user query is \"where do xenon come from\". This query is likely looking for information about the origin or production of xenon gas. To find relevant literature in a corpus with sparse retrieval, we should add Boolean operators and possibly some related terms to enhance the query's specificity and improve retrieval. The query could be rephrased as \"how to find xenon sources AND xenon production AND xenon mining OR xenon extraction\". We use the AND operator to connect the related terms, and the OR operator to include alternative terms. We also use parentheses to group the terms logically, e.g., (xenon sources AND (xenon production OR xenon mining OR xenon extraction)).",
+    "rewrite_sample0": "(xenon sources AND (xenon production OR xenon mining OR xenon extraction))",
+    "ndcg_sample0": 0.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "Xenon come from",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 1.0,
+    "think_sample0": "The user query can be broken down into key terms: \"Xenon\" and \"come from\". In the context of chemistry, Xenon is an element and can be produced through various methods such as mining, extraction from minerals, or synthesis in laboratories.",
+    "rewrite_sample0": "Xenon come from",
+    "ndcg_sample0": 1.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "xenon come from",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 1.0,
+    "think_sample0": "The query is looking for where xenon come from. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "xenon come from",
+    "ndcg_sample0": 1.0
+   }
+  }
+ ],
+ "biggest_losses": [
+  {
+   "qid": "dev-1571",
+   "query": "what food is fibre found in",
+   "original_ndcg": 1.0,
+   "untrained": {
+    "modal_rewrite": "fiber AND food AND (whole grains OR fruits OR vegetables OR legumes)",
+    "modal_count": 1,
+    "distinct": 32,
+    "mean_ndcg": 0.078125,
+    "think_sample0": "The user query \"what food is fibre found in\" is vague and could be interpreted in multiple ways. We should clarify the scope of the query to make it more specific and relevant. The user might be asking about fiber in general foods or specific types of fiber. We should use the Boolean operator AND to connect the concept of \"fiber\" with \"food\" and add some more specific terms for relevance.",
+    "rewrite_sample0": "fiber AND food AND (whole grains OR fruits OR vegetables OR legumes)",
+    "ndcg_sample0": 0.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "Food is Fiber found in",
+    "modal_count": 15,
+    "distinct": 4,
+    "mean_ndcg": 0.0,
+    "think_sample0": "The user query can be broken down into key terms: \"Food\" and \"is Fiber found in\". The relevant terms for finding relevant literature in a corpus with sparse retrieval could be \"Food\" and \"Fiber\".",
+    "rewrite_sample0": "Food is Fiber found in",
+    "ndcg_sample0": 0.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "food is fiber found",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 0.0,
+    "think_sample0": "The query is looking for a food that is a good source of fiber. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "food is fiber found",
+    "ndcg_sample0": 0.0
+   }
+  },
+  {
+   "qid": "dev-1758",
+   "query": "where can a animal cell be found",
+   "original_ndcg": 1.0,
+   "untrained": {
+    "modal_rewrite": "(animal cell) AND (location OR environment)",
+    "modal_count": 1,
+    "distinct": 32,
+    "mean_ndcg": 0.04238147459712569,
+    "think_sample0": "The user's query \"where can a animal cell be found\" seems to be asking about locations where animal cells exist. To retrieve relevant literature, we should include both the term \"animal cell\" and the locations where such cells are found. We can use the Boolean operator AND to connect these terms. Also, we can group these terms using parentheses to ensure that both parts of the query are considered together.",
+    "rewrite_sample0": "(animal cell) AND (location OR environment)",
+    "ndcg_sample0": 0.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "Animal cell found",
+    "modal_count": 10,
+    "distinct": 8,
+    "mean_ndcg": 0.0,
+    "think_sample0": "The user query can be broken down into key terms: \"Animal Cell\" and \"found\". A more precise query would be \"Animal Cell found\". The most relevant corpus would be a biology or zoology database.",
+    "rewrite_sample0": "Animal Cell found",
+    "ndcg_sample0": 0.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "a animal cell be found",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 0.0,
+    "think_sample0": "The query is looking for a place where a animal cell can be found. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "a animal cell be found",
+    "ndcg_sample0": 0.0
+   }
+  },
+  {
+   "qid": "dev-2233",
+   "query": "what is organic matter in soil made of",
+   "original_ndcg": 1.0,
+   "untrained": {
+    "modal_rewrite": "(organic matter AND soil) OR (humus) OR (carbohydrates AND lipids AND proteins AND amino acids)",
+    "modal_count": 1,
+    "distinct": 32,
+    "mean_ndcg": 0.0809404631869334,
+    "think_sample0": "The user query is \"what is organic matter in soil made of\". For relevance in a corpus with sparse retrieval, we need to incorporate more targeted terms that are likely to be used in scientific literature discussing soil organic matter. We can use Boolean operators AND and OR to connect our terms and parentheses to control the grouping of the search terms. \n\"organic matter in soil\" is a good start, but we can also include specific compounds and constituents commonly found in soil organic matter such as carbohydrates, lipids, proteins, and amino acids. We might want to include \"humus\" as well, as it is a common term used in soil science to describe organic matter.",
+    "rewrite_sample0": "(organic matter AND soil) OR (humus) OR (carbohydrates AND lipids AND proteins AND amino acids)",
+    "ndcg_sample0": 0.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "Organic matter in Soil made of",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 0.0,
+    "think_sample0": "The user query can be broken down into key terms: \"Organic matter\" and \"made of\". Organic matter in soil is primarily composed of plant and animal remains, as well as microorganisms.",
+    "rewrite_sample0": "Organic matter in Soil made of",
+    "ndcg_sample0": 0.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "organic matter in soil made of",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 0.0,
+    "think_sample0": "The query is looking for organic matter in soil made of. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "organic matter in soil made of",
+    "ndcg_sample0": 0.0
+   }
+  }
+ ],
+ "biggest_gains": [
+  {
+   "qid": "dev-2159",
+   "query": "what are some plants found in qubec canada",
+   "original_ndcg": 0.0,
+   "untrained": {
+    "modal_rewrite": "plants AND (Quebec OR Canada)",
+    "modal_count": 3,
+    "distinct": 30,
+    "mean_ndcg": 0.691698854031166,
+    "think_sample0": "The user query is \"what are some plants found in qubec canada\". We need to focus on making the query more specific and searchable. \nFirst, we can break down the query into two parts: \"plants found in qubec\" and \"plants found in canada\". \nWe can add the term \"plants\" back to the query to ensure it's included. Furthermore, we should use the Boolean operator \"AND\" to include both parts of the query. \nLastly, we can use the Boolean operator \"OR\" to ensure that we include plants found both in Quebec and Canada, which might be a more relevant search. \nPutting this together, we get: \"plants found in qubec canada AND plants OR plants found in qubec OR plants found in canada\". \nWe can remove the word \"qubec\" as it's not commonly used and might cause issues with search results.",
+    "rewrite_sample0": "plants found in canada AND plants OR plants found in qubec",
+    "ndcg_sample0": 0.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "Plants found in Quebec Canada",
+    "modal_count": 14,
+    "distinct": 6,
+    "mean_ndcg": 0.90625,
+    "think_sample0": "The user query can be broken down into key terms: \"some\" and \"Plants found in Quebec Canada\". To find relevant literature in a corpus with sparse retrieval, we need to create a search string using these terms. A possible search string could be \"Plants AND Quebec AND Canada\".",
+    "rewrite_sample0": "Plants AND Quebec AND Canada",
+    "ndcg_sample0": 1.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "some plants found in qubec canada",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 0.0,
+    "think_sample0": "The query is looking for some plants found in Quebec, Canada. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "some plants found in qubec canada",
+    "ndcg_sample0": 0.0
+   }
+  },
+  {
+   "qid": "dev-1976",
+   "query": "what shape is a vertice",
+   "original_ndcg": 0.0,
+   "untrained": {
+    "modal_rewrite": "(vertices IN graph) AND (shape OR properties)",
+    "modal_count": 1,
+    "distinct": 32,
+    "mean_ndcg": 0.5666643900394174,
+    "think_sample0": "The user query \"what shape is a vertice\" is likely looking for information about the shape (or properties) of a vertex. However, a vertex is a point where two or more lines meet, not a shape. The query may be asking about the geometric properties of a vertex or the shape of a vertex in a specific context (like in a graph). To find relevant literature, we should consider searching for information about vertices in a graph, which are often used in computer science and mathematics. We need to use Boolean operators to group the terms appropriately.",
+    "rewrite_sample0": "(vertices IN graph) AND (shape OR properties)",
+    "ndcg_sample0": 0.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "Shape of a Vertex",
+    "modal_count": 30,
+    "distinct": 2,
+    "mean_ndcg": 0.9375,
+    "think_sample0": "The shape of a vertex is a point.",
+    "rewrite_sample0": "Shape of a Vertex",
+    "ndcg_sample0": 1.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "shape a vertex",
+    "modal_count": 25,
+    "distinct": 4,
+    "mean_ndcg": 0.84375,
+    "think_sample0": "The query is looking for the shape of a vertex. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "shape a vertex",
+    "ndcg_sample0": 1.0
+   }
+  },
+  {
+   "qid": "dev-663",
+   "query": "how far are the crust and mantle",
+   "original_ndcg": 0.0,
+   "untrained": {
+    "modal_rewrite": "how far are the crust and mantle AND located",
+    "modal_count": 1,
+    "distinct": 32,
+    "mean_ndcg": 0.29479881736156777,
+    "think_sample0": "The user query \"how far are the crust and mantle\" seems to be asking for a comparison or description of the distance between the crust and mantle. However, without more specific terms, the search might return a wide range of unrelated results. To narrow down the search and make it more specific, we can use Boolean operators to group the terms appropriately. The query should be rephrased to ask specifically about the location or depth of the crust and mantle. Using \"AND\" to connect the terms \"crust\" and \"mantle\" will help us find relevant literature that discusses both concepts together. The query can be rephrased as \"how far are the crust and mantle AND located\" or \"how deep are the crust and mantle AND located\".",
+    "rewrite_sample0": "how far are the crust and mantle AND located",
+    "ndcg_sample0": 0.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "distance between Crust and Mantle",
+    "modal_count": 31,
+    "distinct": 2,
+    "mean_ndcg": 1.0,
+    "think_sample0": "The user query can be broken down into key terms: \"Crust\" and \"Mantle\". The distance between the Crust and Mantle is approximately 35-40 kilometers.",
+    "rewrite_sample0": "distance between Crust and Mantle",
+    "ndcg_sample0": 1.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "distance are the crust and mantle",
+    "modal_count": 18,
+    "distinct": 3,
+    "mean_ndcg": 0.6875,
+    "think_sample0": "The query is looking for the distance between the crust and the mantle. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "far are the crust and mantle",
+    "ndcg_sample0": 0.0
+   }
+  }
+ ],
+ "delta_counts": {
+  "better": 481,
+  "worse": 282,
+  "same": 1542
+ },
+ "diversity_contrast": [
+  {
+   "qid": "dev-1146",
+   "query": "what does pfcs stand for in chemistry",
+   "original_ndcg": 0.0,
+   "untrained": {
+    "modal_rewrite": "\"pfcs\" AND \"chemistry\"",
+    "modal_count": 1,
+    "distinct": 32,
+    "mean_ndcg": 0.09449121919643219,
+    "think_sample0": "The user is looking for information about \"pfcs\" in the context of chemistry. However, without more context, it's unclear what specific information the user is seeking (e. g., what \"pfcs\" stands for, what chemicals are referred to as \"pfcs\", etc.). To find relevant literature, we need to make the query more specific. The query could be asking for the meaning of the acronym \"pfcs\" in chemistry, or it could be inquiring about a specific type of chemical. We should also consider adding Boolean operators to make the query more searchable. For now, I will assume the user is looking for the meaning of \"pfcs\" in chemistry, so I'll search for the acronym \"pfcs\" and the term \"chemistry\".",
+    "rewrite_sample0": "\"pfcs\" AND \"chemistry\"",
+    "ndcg_sample0": 0.31546487678572877
+   },
+   "trained-normal": {
+    "modal_rewrite": "PFCS stands for in Chemistry",
+    "modal_count": 3,
+    "distinct": 26,
+    "mean_ndcg": 0.08319947224408648,
+    "think_sample0": "The user query can be broken down into key terms: \"PFCS\" and \"stand for\" in Chemistry. The most relevant term for PFCS in Chemistry is \"PolyfluoroCarbon\".",
+    "rewrite_sample0": "PFCS stands for PolyfluoroCarbon in Chemistry",
+    "ndcg_sample0": 0.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "pfcs in chemistry",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 0.31546487678572877,
+    "think_sample0": "The query is looking for pfcs in chemistry. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "pfcs in chemistry",
+    "ndcg_sample0": 0.31546487678572877
+   }
+  },
+  {
+   "qid": "dev-332",
+   "query": "what does the partition function show in boltzmann",
+   "original_ndcg": 1.0,
+   "untrained": {
+    "modal_rewrite": "(partition function AND Boltzmann) OR show",
+    "modal_count": 1,
+    "distinct": 32,
+    "mean_ndcg": 0.8773326046170823,
+    "think_sample0": "The query is asking about the partition function in the context of Boltzmann. We need to break down the query into relevant terms and use appropriate Boolean operators to make the search more effective in a corpus with sparse retrieval. The key terms are \"partition function\" and \"Boltzmann\". We should include \"Boltzmann\" in the query to ensure it's clear what context we're talking about. Additionally, we can use \"show\" as a proxy for the information the partition function provides. To make the query more specific and searchable, we might group these terms with parentheses.",
+    "rewrite_sample0": "(partition function AND Boltzmann) OR show",
+    "ndcg_sample0": 1.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "partition function shows in Boltzmann",
+    "modal_count": 5,
+    "distinct": 22,
+    "mean_ndcg": 0.8805739931919724,
+    "think_sample0": "The partition function shows the total number of microstates available to a system at a given energy level. In Boltzmann statistics, it helps calculate the probability of the system being in a particular energy state.",
+    "rewrite_sample0": "Partition function shows the total number of microstates available to a system at a given energy level",
+    "ndcg_sample0": 1.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "partition function show in boltzmann",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 1.0,
+    "think_sample0": "The query is looking for the partition function show in boltzmann. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "partition function show in boltzmann",
+    "ndcg_sample0": 1.0
+   }
+  },
+  {
+   "qid": "dev-165",
+   "query": "a _______ is a pictorial representation of the chromosomes in a cell",
+   "original_ndcg": 1.0,
+   "untrained": {
+    "modal_rewrite": "chromosome AND (map OR diagram)",
+    "modal_count": 1,
+    "distinct": 32,
+    "mean_ndcg": 0.6734663854206501,
+    "think_sample0": "The user's query is asking for a type of representation related to chromosomes in a cell. The answer seems to be a \"chromosome map\" or \"chromosome diagram\". The query lacks the necessary specificity, which could lead to sparse retrieval. To improve the query, I will add the term \"chromosome\" and use a more specific Boolean operator (AND) to group the key terms together.",
+    "rewrite_sample0": "chromosome AND (map OR diagram)",
+    "ndcg_sample0": 0.0
+   },
+   "trained-normal": {
+    "modal_rewrite": "karyotype is a pictorial representation of the chromosomes in a cell",
+    "modal_count": 5,
+    "distinct": 18,
+    "mean_ndcg": 0.6875,
+    "think_sample0": "The user query can be simplified to \"is a pictorial representation of the chromosomes in a cell\". A common term for this is \"karyotype\".",
+    "rewrite_sample0": "karyotype is a pictorial representation of the chromosomes in a cell",
+    "ndcg_sample0": 1.0
+   },
+   "trained-count_once": {
+    "modal_rewrite": "a pictorial representation of the chromosomes in a cell",
+    "modal_count": 32,
+    "distinct": 1,
+    "mean_ndcg": 1.0,
+    "think_sample0": "The query is looking for a pictorial representation of the chromosomes in a cell. This is a straightforward query that does not require the use of Boolean operators or parentheses for grouping terms, as the relationship between the terms is clear and unambiguous.",
+    "rewrite_sample0": "a pictorial representation of the chromosomes in a cell",
+    "ndcg_sample0": 1.0
+   }
+  }
+ ]
+}
